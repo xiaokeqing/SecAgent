@@ -1,0 +1,78 @@
+# ============================================================
+# SecAgent 容器编排
+# ------------------------------------------------------------
+# 使用方式：
+#   1. cp .env.example .env     并填入真实凭据
+#   2. docker compose up -d
+#   3. docker compose logs -f   （看到 Started Main 即成功）
+#
+# 设计要点：
+#   · 端口只绑定 127.0.0.1，不直接暴露公网；对外由反向代理/隧道接入
+#   · 强制凭据校验（SECAGENT_STRICT_CREDENTIALS=true）：带着默认口令起不来
+#   · 限制内存上限，避免单容器拖垮整机
+#   · data/ 与 uploads/ 挂载卷持久化，换机时打包带走即可
+# ============================================================
+
+services:
+  secagent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # 若已由 CI 构建并推送镜像，改用下面这行、并删掉上面的 build：
+    # image: registry.cn-hangzhou.aliyuncs.com/你的命名空间/secagent:latest
+    image: secagent:local
+    container_name: secagent
+    restart: unless-stopped
+
+    # ⚠️ 只绑本机回环地址：外网无法直连 9900，
+    #    对外访问统一走反向代理或隧道（见 Cloudflare Tunnel / Tailscale Funnel）
+    ports:
+      - "127.0.0.1:9900:9900"
+
+    env_file:
+      - .env
+
+    environment:
+      # ---------- 凭据 ----------
+      # 对外部署必须为 true：检测到默认/弱口令将直接拒绝启动（fail-closed）
+      SECAGENT_STRICT_CREDENTIALS: "true"
+
+      # ---------- 首次部署：构建安全知识库 ----------
+      # 默认 false。若 data/vector-store.json 不存在，首次启动前先设为 true
+      # 跑一次（会调用 Embedding API，产生少量费用，几分钟），
+      # 生成后改回 false，之后重启不再重复花钱。
+      VECTOR_KB_AUTO_INDEX: "${VECTOR_KB_AUTO_INDEX:-false}"
+
+      # ---------- 对外 Demo 的调参 ----------
+      # 用 SPRING_APPLICATION_JSON 显式覆盖，避免依赖环境变量与
+      # 嵌套配置项之间的名称转换规则。
+      SPRING_APPLICATION_JSON: >-
+        {"app":{"quota":{"daily-limit":${DAILY_QUOTA:-50}},
+                 "ratelimit":{"requests-per-minute":${RATE_LIMIT_PER_MINUTE:-30}},
+                 "cors":{"allowed-origins":"${CORS_ALLOWED_ORIGINS:-http://localhost:9900}"}},
+         "vector":{"kb":{"auto-index":${VECTOR_KB_AUTO_INDEX:-false}}}}
+
+      TZ: Asia/Shanghai
+
+    volumes:
+      # 运行数据持久化：向量库、审计留痕、封禁记录、评测结果
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+
+    # 内存硬上限：超过时本容器被 OOM Kill，而不是拖垮整台机器
+    mem_limit: 1536m
+    memswap_limit: 2g
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9900/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # 低配机器上 Spring 上下文初始化需要 40~90 秒，给少了会被误判为不健康
+      start_period: 120s
