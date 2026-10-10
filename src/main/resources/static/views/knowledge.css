@@ -1,0 +1,188 @@
+/* ============================================================
+   知识库视图（验收项7）：类别卡片 + 检索 + 提交/待审核/已通过
+   复用 shell.css 的设计令牌与 .sa-card/.sa-btn 等通用类
+   ============================================================ */
+
+.kb-page {
+    padding: 18px 20px;
+    box-sizing: border-box;
+}
+
+/* ---------------- 类别卡片 ---------------- */
+.kb-cat-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(168px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.kb-cat-card {
+    background: var(--sa-panel);
+    border: 1px solid var(--sa-border);
+    border-radius: var(--sa-radius);
+    box-shadow: var(--sa-shadow);
+    padding: 12px 14px;
+    cursor: pointer;
+    transition: border-color .15s, transform .15s;
+}
+.kb-cat-card:hover { border-color: var(--sa-accent); transform: translateY(-1px); }
+.kb-cat-card.active {
+    border-color: var(--sa-accent);
+    box-shadow: 0 0 0 2px var(--sa-accent-weak);
+}
+.kb-cat-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--sa-text);
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.kb-cat-sub { font-size: 12px; color: var(--sa-muted); }
+.kb-cat-sub b { color: var(--sa-accent); font-size: 13px; }
+
+/* ---------------- 主布局 ---------------- */
+.kb-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: 16px;
+    align-items: start;
+}
+@media (max-width: 1100px) {
+    .kb-layout { grid-template-columns: 1fr; }
+}
+
+.kb-main { min-width: 0; }
+.kb-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+
+/* ---------------- 搜索栏 ---------------- */
+.kb-search-bar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.kb-search-input { flex: 1; }
+.kb-search-cat { width: 150px; flex: 0 0 auto; }
+
+/* ---------------- 结果列表 ---------------- */
+.kb-results { display: flex; flex-direction: column; gap: 10px; }
+
+.kb-empty {
+    color: var(--sa-muted);
+    font-size: 13px;
+    padding: 18px 4px;
+    text-align: center;
+}
+.kb-err { color: var(--sa-critical); }
+
+.kb-result {
+    border: 1px solid var(--sa-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: var(--sa-panel-2);
+}
+.kb-result-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+.kb-result-title {
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--sa-text);
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.kb-tag-cat {
+    flex: 0 0 auto;
+    display: inline-block;
+    background: var(--sa-accent-weak);
+    color: var(--sa-accent);
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 9px;
+    white-space: nowrap;
+}
+.kb-result-snippet {
+    font-size: 13px;
+    color: var(--sa-text);
+    line-height: 1.55;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    margin-bottom: 6px;
+    max-height: 4.6em;
+    overflow: hidden;
+}
+.kb-result-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--sa-muted);
+}
+.kb-origin { color: var(--sa-low); }
+
+/* ---------------- 提交表单 ---------------- */
+.kb-form-row {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+    align-items: center;
+}
+.kb-form-row .sa-select { flex: 1; }
+
+.kb-alert {
+    margin-top: 10px;
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+.kb-alert-block { background: #fdeceb; color: var(--sa-critical); border: 1px solid #f3b8b3; }
+.kb-alert-warn  { background: #fef7e0; color: #b7791f; border: 1px solid #ecd28a; }
+
+/* ---------------- 待审核 / 已通过 ---------------- */
+.kb-pending, .kb-approved { display: flex; flex-direction: column; gap: 10px; }
+
+.kb-pend-item {
+    border: 1px solid var(--sa-border);
+    border-left: 3px solid var(--sa-high);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: #fffdf7;
+}
+.kb-appr-item {
+    border: 1px solid var(--sa-border);
+    border-left: 3px solid var(--sa-ok);
+    border-radius: 8px;
+    padding: 10px 12px;
+    background: #f6fdf9;
+}
+.kb-pend-content {
+    font-size: 13px;
+    color: var(--sa-text);
+    line-height: 1.55;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    max-height: 6em;
+    overflow: auto;
+    margin-bottom: 6px;
+}
+.kb-pend-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: center;
+    font-size: 12px;
+    color: var(--sa-muted);
+    margin-bottom: 8px;
+}
+.kb-pend-actions { display: flex; gap: 8px; }

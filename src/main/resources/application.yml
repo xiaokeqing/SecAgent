@@ -1,0 +1,191 @@
+server:
+  port: 9900
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+spring:
+  main:
+    allow-bean-definition-overriding: true
+  # 文件上传大小限制（安全加固：限制单文件大小，防止超大文件耗尽资源）
+  servlet:
+    multipart:
+      max-file-size: 10MB
+      max-request-size: 12MB
+  # Spring AI Alibaba DashScope 配置
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY:sk-placeholder}  # 无真实密钥时用占位保证可启动；生产请用环境变量注入真实 Key
+      chat:
+        options:
+          timeout: 180000  # 超时时间180秒（3分钟）
+      retry:
+        max-attempts: 3
+        backoff:
+          initial-interval: 2000
+          multiplier: 2
+          max-interval: 10000
+
+    # Spring AI MCP 客户端配置
+    # 本地演示默认关闭（不需要腾讯云凭证）；如需对接真实 MCP 服务，改为 true 并配置自己的 SSE 端点
+    mcp:
+      client:
+        enabled: false
+        name: tencent-mcp-server
+        version: 1.0.0
+        request-timeout: 60s
+        type: ASYNC
+        sse:
+          connections:
+            tencent-cls:
+              url: https://mcp-api.tencent-cloud.com
+              sse-endpoint: /sse/your-endpoint  # 启用 MCP 时替换为你自己的 SSE 端点
+
+# ===== 向量存储配置 =====
+# memory：内存向量库 + 本地 JSON 持久化，免安装任何中间件（默认，推荐本地演示）
+# milvus：对接 Milvus 生产级向量库（需先 docker compose -f vector-database.yml up -d）
+vector:
+  store: memory
+  memory:
+    file: data/vector-store.json   # 内存向量库持久化文件，重启不重复调用 Embedding
+  kb:
+    auto-index: false             # 未配置真实 Key 时关闭启动期自动索引，避免无效嵌入调用；配好 Key 后改为 true 或在界面重建
+
+file:
+  upload:
+    path: ./uploads
+    allowed-extensions: txt,md
+    sensitive-scan: true          # 入库前敏感信息扫描（DLP）：拦截含密钥/私钥的文档
+    sensitive-strict: false       # true 时连硬编码口令也拦截；false 仅拦截高危凭据
+  kb:
+    path: security-docs           # 内置安全知识库目录（启动自动向量化）
+
+milvus:
+  host: localhost
+  port: 19530
+  username: ""
+  password: ""
+  database: default
+  timeout: 10000
+
+# 阿里云 DashScope Embedding API 配置
+dashscope:
+  api:
+    key: ${DASHSCOPE_API_KEY:sk-placeholder}  # 占位仅用于本地启动，真实 Key 经环境变量 DASHSCOPE_API_KEY 注入
+  embedding:
+    model: text-embedding-v4  # 阿里云文本向量化模型（1024 维）
+
+# 文档分片配置
+document:
+  chunk:
+    max-size: 800
+    overlap: 100
+
+# RAG 配置
+rag:
+  top-k: 3
+  min-score: 0.30   # 相似度阈值：低于该值视为知识库未命中（剔除低分噪声；Milvus 距离度量时设 0 关闭）
+  model: "qwen-plus"  # 知识库问答使用的对话模型（qwen-plus 性价比高，可按需改为 qwen-max / qwen-turbo）
+
+# 安全告警源配置（本地演示用 Mock，返回模拟安全告警）
+prometheus:
+  base-url: http://localhost:9090
+  timeout: 10
+  mock-enabled: true   # 本地演示：返回模拟的安全告警；对接真实告警系统时改为 false
+
+# 安全日志源配置（本地演示用 Mock，返回模拟攻击日志）
+cls:
+  mock-enabled: true   # 本地演示：返回模拟的主机/Web/防火墙日志；对接真实日志服务时改为 false
+
+# ===== 安全加固配置 =====
+app:
+  # 接口鉴权：默认关闭方便本地演示；改为 true 后所有 /api/** 需携带 X-API-Token 头
+  auth:
+    enabled: true   # 默认开启鉴权：登录会话 Token 或系统级 API Token 任一通过即可
+    token: ${SECAGENT_API_TOKEN:secagent-demo-token}  # 生产环境务必通过环境变量注入强随机 Token
+    white-list: /api/health
+  # 登录账号配置（生产环境请通过环境变量 SECAGENT_PASSWORD 注入密码）
+  security:
+    login:
+      username: ${SECAGENT_USERNAME:admin}
+      password: ${SECAGENT_PASSWORD:admin123}
+      ttl-minutes: 120
+    # ===== 凭据强度校验（fail-closed，见 CredentialGuard）=====
+    # false —— 本地开发：检测到默认/弱口令只打印告警日志，保持开箱即用
+    # true  —— 对外部署：检测到默认/弱口令【直接抛出异常拒绝启动】
+    #          宁可起不来，也不带着公开的默认口令对外提供服务。
+    # 容器化部署（docker-compose）会默认置为 true，请在 .env 中注入强随机凭据。
+    enforce-strong-credentials: ${SECAGENT_STRICT_CREDENTIALS:false}
+  # 接口限流（按客户端 IP，固定窗口）
+  ratelimit:
+    enabled: true
+    requests-per-minute: 60
+    login-per-minute: 10
+  # 每日模型调用配额，防止成本失控
+  quota:
+    enabled: true
+    daily-limit: 200
+  # 自动处置护栏（阶段3 封禁 IP 动作使用）
+  response:
+    whitelist: 127.0.0.1,0.0.0.0,255.255.255.255,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+    default-duration-minutes: 60
+    max-duration-minutes: 1440
+  # 跨域：默认只允许本机来源，不再使用通配符 "*"
+  cors:
+    allowed-origins: http://localhost:9900,http://127.0.0.1:9900
+  # 会话治理：过期时间与最大会话数
+  session:
+    ttl-minutes: 120
+    max: 1000
+
+# ===== Wazuh 主机安全平台对接 =====
+# Wazuh 仅作为"真实数据源 + 执行封禁的手"；研判/编排/护栏均在 SecAgent 内。
+# enabled=true 但连不上服务时，自动降级为内置样本（MOCK），保证开箱可演示。
+integration:
+  wazuh:
+    enabled: true                          # 总开关；false 时直接使用内置样本
+    base-url: ${WAZUH_URL:https://localhost:55000}
+    username: ${WAZUH_USER:wazuh}
+    password: ${WAZUH_PASS:wazuh}
+    verify-ssl: false                      # 本地自签证书默认不校验
+    timeout: 10
+    active-response-enabled: true          # 是否允许真实下发 active-response；false 时只模拟
+  # ===== Suricata 网络告警对接（读取 eve.json） =====
+  suricata:
+    enabled: true
+    eve-json: ${SURICATA_EVE:/var/log/suricata/eve.json}
+    timeout: 5
+
+# ===== 人在回路分级自动响应 =====
+response:
+  auto-block-enabled: true                 # 封 IP 默认开启（白名单保护，封禁前过 ResponseGuard）
+  auto-lock-account: false                 # 锁账号默认关闭（高危，建议人工确认）
+  auto-kill-process: false                 # 杀进程默认关闭（高危，建议人工确认）
+  high-risk-require-approval: true         # 高危动作（锁账号/杀进程/长封禁）强制人工确认门
+  audit-file: data/response-audit.json     # 全部处置动作留痕（可审计）
+  blocks-file: data/blocked-ips.json       # 生效中的封禁 IP 记录（带到期时间，到期自动解封）
+  unblock:
+    enabled: true                          # 到期自动解封总开关；false 时调度器不扫描
+    interval-ms: 60000                     # 调度扫描周期（毫秒，默认 60s）
+    initial-delay-ms: 10000                # 启动后首次扫描延迟（毫秒）
+
+# ===== 知识库多类别与"待审核" =====
+knowledge:
+  categories: CVE/CNVD漏洞库,应急响应手册,红日渗透笔记,Web安全,设备安全
+  pending-file: data/kb-pending.json       # 待审核知识
+  approved-file: data/kb-approved.json     # 审核通过、已入库知识
+  auto-write: true                         # 允许对话/取证中自动写入候选知识（仍需审核才入库）
+
+# ===== 历史安全事件归档与导出 =====
+events:
+  store-file: data/security-events.json
+
+# ===== 多模型评测 / 红队回归 =====
+eval:
+  runs-file: data/eval-runs.json
+
+logging:
+  level:
+    org.example: info

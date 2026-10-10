@@ -1,0 +1,22 @@
+/* 用户权限（RBAC 可视化与管理） */
+#view-rbac { padding: 20px; overflow: auto; height: 100%; box-sizing: border-box; }
+.rbac-header h2 { font-size: 20px; margin: 0 0 16px; color: #e8eef7; }
+.rbac-grid { display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
+@media (max-width: 1100px) { .rbac-grid { grid-template-columns: 1fr; } }
+.rbac-card { background: #16202e; border: 1px solid #24344d; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+.rbac-card h3 { margin: 0 0 12px; font-size: 14px; color: #cdd9ea; }
+.rbac-field { margin-bottom: 10px; }
+.rbac-field label { display: block; font-size: 12px; color: #8ba0bd; margin-bottom: 4px; }
+.rbac-field input, .rbac-field select { width: 100%; box-sizing: border-box; background: #0f1722; border: 1px solid #24344d; color: #e8eef7; border-radius: 6px; padding: 8px; font-size: 13px; }
+.rbac-btn { font-size: 12px; padding: 8px 14px; border-radius: 6px; border: 1px solid #2ecc71; background: #2ecc71; color: #fff; cursor: pointer; }
+.rbac-btn:hover { background: #38d97f; }
+
+table.rbac-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.rbac-table th, table.rbac-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #24344d; color: #cdd9ea; }
+table.rbac-table th { color: #8ba0bd; font-weight: 600; }
+.role-badge { font-size: 11px; padding: 2px 10px; border-radius: 10px; }
+.role-admin { background: #3d2030; color: #ff8aa0; }
+.role-analyst { background: #233247; color: #9fd0ff; }
+.perm-yes { color: #5fd98a; }
+.perm-no { color: #ff8aa0; }
+.rbac-note { font-size: 12px; color: #7d8da6; margin-top: 8px; }

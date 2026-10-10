@@ -1,0 +1,23 @@
+# 统一换行符，避免 Windows 与 Linux 之间来回改动整个文件
+* text=auto eol=lf
+
+# Windows 专用脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件不做换行转换、不参与 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.jar binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+
+# 生成物在 diff 中折叠
+*.min.js -diff
+*.min.css -diff
