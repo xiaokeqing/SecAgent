@@ -1,0 +1,21 @@
+[Unit]
+Description=Cloudflare Tunnel for SecAgent demo
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 快速隧道（quick tunnel）：不需要 Cloudflare 账号和域名，
+# 但每次重启会分配新的 trycloudflare.com 地址。
+# 想要固定地址，需要买域名并改用 named tunnel。
+#
+# 注意：这里用 shell 重定向写日志，而不是 StandardOutput=append:。
+# append: 需要 systemd 240+，而 RHEL 8 / Alibaba Cloud Linux 3 是 systemd 239，
+# 用 append: 会导致服务静默启动失败（systemd 不报错，服务就是 inactive）。
+ExecStart=/bin/sh -c 'exec /usr/local/bin/cloudflared tunnel --url http://localhost:9900 --no-autoupdate >> /var/log/cloudflared.log 2>&1'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
