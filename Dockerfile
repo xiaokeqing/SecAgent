@@ -15,6 +15,22 @@
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /build
 
+# 配置 Maven 镜像源。
+# 容器里不会继承宿主机的 ~/.m2/settings.xml，如果不配，Spring AI 这一整套
+# 依赖会从 Maven Central 拉取，在国内基本慢到不可用。
+# 如果构建环境本身能直连 Central，删掉这段即可。
+RUN mkdir -p /root/.m2 && printf '%s\n' \
+    '<settings>' \
+    '  <mirrors>' \
+    '    <mirror>' \
+    '      <id>aliyun-public</id>' \
+    '      <name>Aliyun Public</name>' \
+    '      <url>https://maven.aliyun.com/repository/public</url>' \
+    '      <mirrorOf>central</mirrorOf>' \
+    '    </mirror>' \
+    '  </mirrors>' \
+    '</settings>' > /root/.m2/settings.xml
+
 # 依赖单独一层：只要 pom.xml 没变就命中缓存，避免每次重新下载
 COPY pom.xml .
 RUN mvn -B -q dependency:go-offline
