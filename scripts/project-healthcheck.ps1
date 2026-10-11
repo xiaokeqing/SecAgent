@@ -147,6 +147,19 @@ else {
     if ($n -ge 13) { OK ("保护白名单 {0} 条" -f $n) } else { BAD ("保护白名单只有 {0} 条 —— 线上可能是旧版本" -f $n) }
   } else { WARN "读不到白名单条数" }
 
+  # 【今天新增】容器出网 ——"服务健康"不等于"功能可用"
+  if ($h1['EGRESS'] -eq '200' -or $h1['EGRESS'] -eq '404') {
+    OK ("容器出网正常（dashscope HTTP {0}）—— 外面的模型 API 调得到" -f $h1['EGRESS'])
+  } else {
+    BAD ("容器出不了网（HTTP {0}）—— 线上所有依赖外部 API 的功能都是坏的，而不是'看起来正常'" -f $h1['EGRESS'])
+  }
+  # Wazuh 对接模式：MOCK 意味着数据是假的，而页面上看不出来
+  if ($h1['WAZUH_LOG'] -match 'REAL') {
+    OK "Wazuh 对接 = REAL（接的是真实数据源）"
+  } elseif ($h1['WAZUH_LOG'] -match 'MOCK') {
+    WARN "Wazuh 对接 = MOCK（数据是内置样本）—— 检查隧道 sidecar 是否在跑"
+  } else { WARN ("读不到 Wazuh 对接模式: {0}" -f $h1['WAZUH_LOG']) }
+  if ([int]$h1['TUNNEL'] -ge 1) { OK "Wazuh 隧道 sidecar 在跑" } else { WARN "Wazuh 隧道 sidecar 不在" }
   if ($h1['SG']) { OK ("StorageGuard: {0}" -f $h1['SG']) } else { BAD "StorageGuard 无日志 —— 可能没生效" }
   if ($h1['CG']) { OK ("CredentialGuard: {0}" -f $h1['CG']) } else { WARN "CredentialGuard 无日志" }
   if ([int]$h1['WRITEFAIL'] -eq 0) { OK "无写回失败" } else { WARN ("{0} 次写回失败（含历史）" -f $h1['WRITEFAIL']) }

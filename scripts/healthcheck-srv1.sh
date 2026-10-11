@@ -53,3 +53,23 @@ echo "CRON=$(crontab -l 2>/dev/null | grep -c backup.sh)"
 
 # --- 隧道 ---
 echo "TUNNEL=$(systemctl is-active cloudflared 2>/dev/null)"
+# --- 【今天新增】容器出网能力 ---
+# 为什么必须单独查这一项：
+#   今天发现服务器 1 的 firewalld 破坏了 docker 容器的出网能力，
+#   而【所有常规检查都是绿的】：容器 healthy、健康接口 ok、
+#   向量库有数据、域名 200 —— 看起来一切正常。
+#   但容器实际上调不到 dashscope，也就是说【线上 AI 功能全是坏的】。
+#   之所以一直没暴露：靶场是纯规则的不调模型，KB 是启动时预索引好的。
+#
+#   教训："服务健康"不等于"功能可用"。健康接口只能证明进程活着、
+#   数据在内存里，证明不了它能不能调通外部依赖。
+#   所以这一项要直接测真实的出网请求。
+EG=$(docker exec secagent sh -c 'curl -s -o /dev/null -w "%{http_code}" --max-time 12 https://dashscope.aliyuncs.com/ 2>/dev/null' 2>/dev/null)
+echo "EGRESS=${EG:-000}"
+
+# --- Wazuh 对接模式（REAL / MOCK / OFF）---
+# 同样重要：连不上 Wazuh 时系统会【自动降级为 MOCK】，
+# 页面照常显示，只是数据变成假的了 —— 从外部完全看不出来。
+WM=$(docker logs secagent 2>&1 | grep -oE '（(REAL|MOCK) 模式）|降级为内置样本（MOCK）' | tail -1)
+echo "WAZUH_LOG=${WM:-未知}"
+'TUNNEL=''$(docker ps --format '{{.Names}}' | grep -c wazuh-tunnel)''
