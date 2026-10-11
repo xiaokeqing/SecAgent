@@ -81,6 +81,44 @@ public class SshBlockExecutor {
     @Value("${integration.block.ssh.timeout:15}")
     private int timeoutSeconds;
 
+    /**
+     * 启动自检 —— 把配置的实际绑定值打出来。
+     *
+     * <h3>为什么加这一段</h3>
+     * 这个功能连续几轮"代码看着对、运行起来不生效"，
+     * 而我一直在猜原因（改一处 → 部署 → 失败，循环了五次，每次 5 分钟）。
+     * 猜的成本远高于【把实际值打出来】。
+     * 所以这里在启动时直接打印：
+     *   · 配置有没有绑定上（host 是不是空）
+     *   · 密钥文件在不在、能不能读
+     *   · 最终判据 isEnabled() 的结果
+     * 一次部署就能定位，不用再猜。
+     */
+    @jakarta.annotation.PostConstruct
+    public void selfCheck() {
+        logger.info("=== SSH 直连封禁自检 ===");
+        logger.info("  enabled 配置值 = {}", enabled);
+        logger.info("  host          = [{}]", host == null ? "null" : host);
+        logger.info("  port / user   = {} / {}", port, user);
+        logger.info("  key 路径       = {}", keyPath);
+        logger.info("  known_hosts    = {}", knownHosts);
+        try {
+            java.nio.file.Path kp = java.nio.file.Paths.get(keyPath);
+            boolean exists = java.nio.file.Files.exists(kp);
+            boolean readable = exists && java.nio.file.Files.isReadable(kp);
+            logger.info("  密钥文件存在   = {}   可读 = {}", exists, readable);
+        } catch (Exception e) {
+            logger.warn("  检查密钥文件失败: {}", e.getMessage());
+        }
+        try {
+            java.nio.file.Path kh = java.nio.file.Paths.get(knownHosts);
+            logger.info("  known_hosts 存在 = {}", java.nio.file.Files.exists(kh));
+        } catch (Exception ignored) {
+        }
+        logger.info("  >>> isEnabled() 最终结果 = {}", isEnabled());
+        logger.info("=== 自检结束 ===");
+    }
+
     public boolean isEnabled() {
         return enabled && host != null && !host.isBlank();
     }

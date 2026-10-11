@@ -76,6 +76,8 @@ public class ResponseActionService {
         try {
             // 1) 首选：SSH 直连可用就能处置（不依赖 Wazuh API）
             org.example.integration.wazuh.SshBlockExecutor ssh = sshBlockProvider.getIfAvailable();
+            logger.info("处置通道判定: sshBean={} enabled={}",
+                    ssh != null, ssh == null ? "n/a" : ssh.isEnabled());
             if (ssh != null && ssh.isEnabled()) {
                 return true;
             }
