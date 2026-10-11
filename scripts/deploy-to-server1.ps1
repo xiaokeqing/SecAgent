@@ -24,7 +24,16 @@
 #     2) 最后【强制校验】线上版本号与本地 HEAD 一致，不一致就报错退出
 # ============================================================
 
-$ErrorActionPreference = 'Stop'
+# 注意：这里刻意【不用】$ErrorActionPreference = 'Stop'。
+# 原因：docker / mvn / scp 这些原生命令会把【进度信息写到 stderr】，
+# 而 PowerShell 在 Stop 模式下会把原生 stderr 当成终止性错误 ——
+# `docker build` 的第一行 "#0 building with ..." 就让脚本直接挂掉了，
+# 看起来像构建失败，实际只是它在正常打印进度。
+#
+# 所以改成 Continue + 每一步显式检查 $LASTEXITCODE。
+# 这样"失败"的判断来自退出码（可靠），而不是来自"有没有输出到 stderr"（不可靠）。
+$ErrorActionPreference = 'Continue'
+$PSNativeCommandUseErrorActionPreference = $false
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 $Repo   = 'F:\7AAA\AI\SecAgent\sec-agent'
