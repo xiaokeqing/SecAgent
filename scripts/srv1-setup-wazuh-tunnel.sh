@@ -33,22 +33,32 @@ warn() { echo -e "\033[1;33m  [!] $*\033[0m"; }
 
 log "1/5 找 docker 网桥网关 IP（隧道要绑这个地址）"
 # SecAgent 所在的 compose 网络
-NET=$(docker network ls --format '{{.Name}}' | grep -E 'secagent.*default|secagent_default' | head -1)
-if [ -z "$NET" ]; then
-  # 退回到容器实际使用的网络
-  NET=$(docker inspect secagent --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
-fi
-echo "  容器网络: ${NET:-未知}"
-GW=""
-if [ -n "$NET" ]; then
-  GW=$(docker network inspect "$NET" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null)
-fi
+# 【不要猜这个 IP】
+# 第一版猜的是 compose 网络的网关（172.18.0.1），结果绑上去了、容器却够不着 ——
+# 因为 extra_hosts 里的 host-gateway 解析到的是【docker0 默认网桥】的网关
+# （172.17.0.1），和 compose 网络的网关不是同一个 IP。
+# 表现是容器访问 "No route to host"，SecAgent 直接降级 MOCK。
+#
+# 正确做法：直接问容器"host.docker.internal 解析成什么"，绑到那个地址。
+# 这样两边永远一致，也不依赖我对 docker 网络模型的记忆。
+# 【不要猜，也不要信 host-gateway】
+#
+# 踩过的三个坑，都在这一个 IP 上：
+#   1) 猜 compose 网络网关（172.18.0.1）—— 容器报 No route to host
+#   2) 用 extra_hosts 的 host-gateway —— 它解析成 docker0 默认网桥
+#      （172.17.0.1），而容器在 172.18.0.0/16 上，
+#      两个 docker 网络之间【没有路由】—— 还是 No route to host
+#   3) 绑到 docker0 网关（172.17.0.1）—— 同上
+#
+# 真正可用的地址是【容器自己的默认网关】：容器的所有出网流量都经过它，
+# 所以一定可达。这里直接从容器里读出来，不依赖任何假设。
+GW=$(docker exec secagent sh -c "ip route | awk '/^default/{print \$3}'" 2>/dev/null | head -1)
 if [ -z "$GW" ]; then
-  GW=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null)
-  warn "没找到 compose 网络，退回默认网桥"
+  # 容器里没有 ip 命令时，用 /proc/net/route 解析
+  GW=$(docker exec secagent sh -c "awk '\$2==\"00000000\"{printf \"%d.%d.%d.%d\", strtonum(\"0x\"substr(\$3,7,2)), strtonum(\"0x\"substr(\$3,5,2)), strtonum(\"0x\"substr(\$3,3,2)), strtonum(\"0x\"substr(\$3,1,2))}' /proc/net/route" 2>/dev/null | head -1)
 fi
-echo "  网桥网关: ${GW:-没找到}"
-[ -n "$GW" ] || { echo "  [X] 拿不到网关 IP，无法继续"; exit 1; }
+echo "  容器自己的默认网关: ${GW:-没找到}"
+[ -n "$GW" ] || { echo "  [X] 拿不到容器网关，无法继续"; exit 1; }
 
 log "2/5 先做一次临时隧道，验证链路真的通"
 pkill -f 'secagent-wazuh-tunnel' 2>/dev/null || true

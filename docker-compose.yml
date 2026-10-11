@@ -87,7 +87,11 @@ services:
     # 写死的话某天会静默失效 —— 而"连不上 Wazuh"在这个系统里
     # 会【自动降级成 MOCK】，页面照常显示，只是数据变成假的了。
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      # 【不能写 host-gateway】它会解析成 docker0 默认网桥的网关（172.17.0.1），
+      # 而本容器在 compose 自建网络上（172.18.0.0/16）——
+      # 两个 docker 网络之间没有路由，容器会报 "No route to host"。
+      # 必须指向【容器自己的网关】，由部署脚本探测后注入。
+      - "host.docker.internal:${WAZUH_HOST_IP:-172.17.0.1}"
     memswap_limit: 2g
 
     logging:

@@ -125,6 +125,16 @@ else
   warn "BUILD_SHA=$BUILD_SHA（取自服务器 git，可能不是当次部署的版本）"
 fi
 export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# 容器自己的默认网关 —— compose 的 extra_hosts 需要它来指向宿主机的隧道。
+# 不能用 docker 的 host-gateway：那是 docker0 的网关（172.17.0.1），
+# 而容器在 compose 自建网络上，两个网络之间没有路由。
+if [[ -f /root/wazuh-host-ip.txt ]]; then
+  export WAZUH_HOST_IP="$(tr -d '[:space:]' < /root/wazuh-host-ip.txt)"
+  ok "WAZUH_HOST_IP=$WAZUH_HOST_IP（容器默认网关）"
+else
+  warn "没有 /root/wazuh-host-ip.txt，compose 会用默认值（可能连不上 Wazuh）"
+fi
 chown -R 999:999 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || warn "chown 数据目录失败"
 chmod 750 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || true
 log "4/5 启动服务"

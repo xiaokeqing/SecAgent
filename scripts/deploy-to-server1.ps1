@@ -96,6 +96,18 @@ if ($LASTEXITCODE -ne 0) { Bad "compose 上传失败"; exit 1 }
 OK "docker-compose.yml 已上传"
 
 # 版本号取自【本地 HEAD】—— 服务器上的 git 可能是旧的
+# 探测【容器自己的默认网关】并写进文件，供 compose 的 extra_hosts 使用。
+# 为什么要探测而不是写死：docker0 网关（172.17.0.1）和 compose 网络网关
+# （172.18.0.1）是两回事，容器只能到达后者。写死一定会错。
+$gw = (ssh @SSH "root@$Ip" "docker exec secagent sh -c `"ip route | awk '/^default/{print `$3}'`" 2>/dev/null" 2>&1 | Out-String).Trim()
+if ($gw -match '^\d+\.\d+\.\d+\.\d+$') {
+  Write-Host "  检测到容器默认网关: $gw"
+  $gwFile = Join-Path $env:TEMP 'wazuh-host-ip.txt'
+  [System.IO.File]::WriteAllText($gwFile, $gw, (New-Object System.Text.UTF8Encoding($false)))
+  scp @SSH $gwFile "root@${Ip}:/root/wazuh-host-ip.txt" 2>&1 | Out-Null
+} else {
+  Write-Host "  [!!] 探测容器网关失败，compose 会退回默认值" -ForegroundColor Yellow
+}
 $shaFile = Join-Path $env:TEMP 'build-sha.txt'
 [System.IO.File]::WriteAllText($shaFile, $sha, (New-Object System.Text.UTF8Encoding($false)))
 scp @SSH $shaFile "root@${Ip}:/root/build-sha.txt" 2>&1 | Out-Null
