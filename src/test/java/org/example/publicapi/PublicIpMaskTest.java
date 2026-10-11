@@ -34,6 +34,19 @@ class PublicIpMaskTest {
     }
 
     @Test
+    @DisplayName("内网/保留地址写成「内部地址」，连用了哪个网段都不说")
+    void hidesPrivateRangesEntirely() {
+        // 只做掩码是不够的：10.0.***.*** 仍然暴露了「内网用 10/8」这个事实，
+        // 而公开页不需要让任何人知道内网拓扑。
+        assertEquals("内部地址", PublicIpMask.mask("10.0.0.10"));
+        assertEquals("内部地址", PublicIpMask.mask("192.168.1.5"));
+        assertEquals("内部地址", PublicIpMask.mask("172.20.3.4"));
+        assertEquals("内部地址", PublicIpMask.mask("127.0.0.1"));
+        assertEquals("内部地址", PublicIpMask.mask("169.254.1.1"));
+        assertEquals("内部地址", PublicIpMask.mask("100.100.100.200"));
+    }
+
+    @Test
     @DisplayName("认不出来的输入不原样透出")
     void unknownInputBecomesStars() {
         assertEquals("***", PublicIpMask.mask("not-an-ip"));

@@ -59,8 +59,46 @@ public final class PublicIpMask {
         }
         String[] parts = host.split("\\.");
         if (parts.length == 4) {
+            // 内网/保留地址直接写成「内部地址」。
+            // 为什么不能只做掩码：10.0.0.10 掩码后是 10.0.***.***，
+            // 虽然主机位被隐去，但「这是内网地址」这件事本身就已经透出去了 ——
+            // 而公开页不需要让任何人知道内网用的是哪个段。
+            if (isPrivateOrReserved(parts)) {
+                return "内部地址";
+            }
             return parts[0] + "." + parts[1] + ".***.***";
         }
         return "***";
+    }
+
+    /**
+     * 内网 / 保留网段判定。
+     *
+     * <p>只用于公开页脱敏（决定"显示成内部地址还是一段掩码"），
+     * <b>不承担任何安全判定职责</b> —— 护栏用的白名单在 Security 侧，和这里无关。
+     */
+    private static boolean isPrivateOrReserved(String[] p) {
+        int a;
+        int b;
+        try {
+            a = Integer.parseInt(p[0]);
+            b = Integer.parseInt(p[1]);
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        if (a == 0 || a == 10 || a == 127) {
+            return true;                       // 0.0.0.0/8、10/8、环回
+        }
+        if (a == 192 && b == 168) {
+            return true;                       // 192.168/16
+        }
+        if (a == 172 && b >= 16 && b <= 31) {
+            return true;                       // 172.16/12
+        }
+        if (a == 169 && b == 254) {
+            return true;                       // 链路本地
+        }
+        // 运营商级 NAT（含云厂商元数据 100.100.100.200）
+        return a == 100 && b >= 64 && b <= 127;
     }
 }
