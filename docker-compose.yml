@@ -49,6 +49,16 @@ services:
       BUILD_SHA: "${BUILD_SHA:-unknown}"
       BUILD_TIME: "${BUILD_TIME:-unknown}"
 
+      # ===== 接真实 Wazuh（B3）=====
+      # 为什么是 host.docker.internal 而不是 127.0.0.1：
+      #   SecAgent 跑在容器里，容器内的 127.0.0.1 是容器自己。
+      #   而隧道建在宿主机的 docker 网桥网关上（172.18.0.1），
+      #   host.docker.internal 通过 host-gateway 正好指向那里。
+      #   这样"容器能访问、公网访问不到"，也不用暴露任何端口。
+      WAZUH_URL: "${WAZUH_URL:-https://host.docker.internal:55000}"
+      WAZUH_USER: "${WAZUH_USER:-wazuh-wui}"
+      WAZUH_PASS: "${WAZUH_PASS:-}"
+
       # ---------- 对外 Demo 的调参 ----------
       # 用 SPRING_APPLICATION_JSON 显式覆盖，避免依赖环境变量与
       # 嵌套配置项之间的名称转换规则。
@@ -71,6 +81,13 @@ services:
 
     # 内存硬上限：超过时本容器被 OOM Kill，而不是拖垮整台机器
     mem_limit: 1536m
+    # host-gateway 让容器能访问宿主机上的服务（这里是 SSH 隧道）。
+    # 用 host.docker.internal 这个名字而不是写死 IP：
+    # docker 网桥的网关 IP（172.18.0.1）在网络重建后会变，
+    # 写死的话某天会静默失效 —— 而"连不上 Wazuh"在这个系统里
+    # 会【自动降级成 MOCK】，页面照常显示，只是数据变成假的了。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     memswap_limit: 2g
 
     logging:
