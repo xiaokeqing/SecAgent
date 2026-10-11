@@ -95,7 +95,10 @@ $scanned = 0; $skipped = 0
 foreach ($p in $scan) {
   $hits = @()
   foreach ($f in $tracked) {
+    # .gitleaks.toml 是扫描器自己的配置，里面本来就写着匹配模式（自我引用）；
+    # project-healthcheck.ps1 同理。扫它们属于噪声，不是发现。
     if ($f -match '\.(png|jpg|jpeg|webp|gif|jar|tar|gz|pdf|ico)$') { $skipped++; continue }
+    if ($f -match '(^|/)(\.gitleaks\.toml|project-healthcheck\.ps1)$') { $skipped++; continue }
     $full = Join-Path $SB $f
     if (-not (Test-Path -LiteralPath $full)) { continue }
     $scanned++
