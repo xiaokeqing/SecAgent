@@ -105,4 +105,24 @@ class ApiTokenInterceptorWhitelistTest {
         ReflectionTestUtils.setField(interceptor, "enabled", false);
         assertTrue(preHandle("GET", "/api/response/audit"), "关闭鉴权时应全部放行");
     }
+
+    @Test
+    @DisplayName("显式 /** 通配只放行该前缀之下，且必须带路径边界")
+    void wildcardEntriesRespectBoundary() throws Exception {
+        // 公网只读端点（/api/public/**）走的是这条路径。
+        // 它必须是"显式写出来的通配"，而不是把精确匹配又改回前缀匹配 —— 两者差别在下面两条断言。
+        ReflectionTestUtils.setField(interceptor, "whiteList", "/api/health,/api/public/**");
+
+        assertTrue(preHandle("GET", "/api/public/overview"), "/api/public/** 应放行其子路径");
+        assertTrue(preHandle("GET", "/api/public/alerts/agg-abc123"), "多层子路径同样应放行");
+        assertTrue(preHandle("GET", "/api/public"), "前缀本身（不带斜杠）应放行");
+
+        assertFalse(preHandle("GET", "/api/public-admin/x"),
+                "边界判定必须挡住 '/api/public' + '-admin' 这类同前缀不同路径");
+        assertFalse(preHandle("GET", "/api/publicfoo"), "不得因为字符串开头相同就放行");
+        assertFalse(preHandle("GET", "/api/publicise"), "不得因为字符串开头相同就放行");
+
+        // 通配项不影响其他项：没写 /** 的仍然是精确匹配
+        assertFalse(preHandle("GET", "/api/health-details"), "/api/health 必须仍是精确匹配");
+    }
 }

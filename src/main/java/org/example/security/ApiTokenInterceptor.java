@@ -134,7 +134,22 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
         }
         for (String p : whiteList.split(",")) {
             String entry = p.trim();
-            if (!entry.isEmpty() && entry.equals(path)) {
+            if (entry.isEmpty()) {
+                continue;
+            }
+            if (entry.endsWith("/**")) {
+                // 显式通配：白名单写 "/api/public/**" 才放行 /api/public 下的所有路径。
+                // 关键点是【必须带边界】—— 用 "/api/public" 做前缀，
+                // 不能写成裸 startsWith(entry)，否则将来出现
+                // /api/public-admin/xxx 这类路径会被静默放行。
+                String prefix = entry.substring(0, entry.length() - 3);
+                if (path.equals(prefix) || path.startsWith(prefix + "/")) {
+                    return true;
+                }
+                continue;
+            }
+            // 其余一律【精确匹配】：不做前缀推断，边界越简单越可验证
+            if (entry.equals(path)) {
                 return true;
             }
         }

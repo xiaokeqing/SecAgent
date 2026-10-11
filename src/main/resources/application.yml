@@ -105,16 +105,20 @@ app:
   auth:
     enabled: true   # 默认开启鉴权：登录会话 Token 或系统级 API Token 任一通过即可
     token: ${SECAGENT_API_TOKEN:secagent-demo-token}  # 生产环境务必通过环境变量注入强随机 Token
-    # 免鉴权白名单（逗号分隔，按前缀匹配）。
+    # 免鉴权白名单（逗号分隔）。除显式写 "/**" 的通配项外，一律【精确匹配】——
+    # 前缀匹配会让"以白名单开头的别的新端点"被静默放行。
     #   /api/health           —— 健康检查，监控与容器 healthcheck 要用
     #   /api/playground/check —— 「试着攻击我」的公开检测接口
+    #   /api/public/**        —— 博客工作台的公开只读端点（包 org.example.publicapi）
     #
-    # 敢把第二个公开，是因为同时满足三条：
-    #   1. 只读 —— 只做字符串检测，不写库、不改状态、不执行任何动作
-    #   2. 不调模型 —— 纯正则匹配，没有 Token 成本，刷不出额度
-    #   3. 不回显原文 —— 只返回命中了哪条规则，避免变成反射型 XSS 的跳板
+    # 敢把后面两个公开，是因为同时满足三条：
+    #   1. 只读 —— 不写库、不改状态、不执行任何动作
+    #      （/api/public 的隔离由 PublicApiIsolationTest 在构建期强制，不靠约定）
+    #   2. 不调模型 —— 一个是纯正则匹配、一个是纯查询，没有 Token 成本，刷不出额度
+    #   3. 不回显原文 —— 告警的源 IP 掩码到网段、字段按白名单挑，
+    #      避免变成"反射型 XSS 跳板"或"内网拓扑查询接口"
     # 处置类接口一律要求管理员角色 + 人工审批，和这条路径是两条完全分开的路。
-    white-list: /api/health,/api/playground/check
+    white-list: /api/health,/api/playground/check,/api/public/**
   # 登录账号配置（生产环境请通过环境变量 SECAGENT_PASSWORD 注入密码）
   security:
     login:
@@ -132,6 +136,13 @@ app:
     enabled: true
     requests-per-minute: 60
     login-per-minute: 10
+  # 公网只读端点（博客工作台）专用配置。
+  # 【刻意与业务限流/配额分开】：否则"为了本地调试把上限调大"会顺手把公网端点一起放宽，
+  # 而这件事不会有任何报错。
+  public-api:
+    requests-per-minute: 20   # 比业务限流更严；进程内按 IP 固定窗口
+    cache-seconds: 15         # 应用内快照 TTL，同时作为 Cache-Control: max-age 下发
+    expose-build-sha: true    # 只暴露开源仓库的提交号，与 /api/health 同一口径
   # 每日模型调用配额，防止成本失控
   quota:
     enabled: true
