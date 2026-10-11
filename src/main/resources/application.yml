@@ -195,6 +195,20 @@ integration:
     indexer-url: ${WAZUH_INDEXER_URL:}
     indexer-username: ${WAZUH_INDEXER_USER:admin}
     indexer-password: ${WAZUH_INDEXER_PASS:}
+
+    # ===== 处置执行方式：SSH 直连封禁 =====
+    # Wazuh 的 active-response 投递在这套环境里走不通（配置全对、API 报成功、
+    # agent 就是不执行），所以改用 SSH forced command —— 一条能端到端验证的链路。
+    # 权限也更小：服务器 2 上那把密钥被 command="..." 锁死，只能封/解封 IP。
+    block:
+      ssh:
+        enabled: ${BLOCK_SSH_ENABLED:true}
+        host: ${BLOCK_SSH_HOST:}
+        port: ${BLOCK_SSH_PORT:22}
+        user: ${BLOCK_SSH_USER:root}
+        key: ${BLOCK_SSH_KEY:/opt/keys/secagent_block_ed25519}
+        known-hosts: ${BLOCK_SSH_KNOWN_HOSTS:/opt/keys/known_hosts}
+        timeout: ${BLOCK_SSH_TIMEOUT:15}
   # ===== Suricata 网络告警对接（读取 eve.json） =====
   suricata:
     enabled: true
