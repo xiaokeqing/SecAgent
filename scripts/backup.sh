@@ -15,11 +15,27 @@
 #   数据丢了没有任何地方能找回。
 #
 # 备份内容：
-#   /opt/secagent/data/          业务数据（向量库、事件、审计、评测…）
-#   /opt/secagent/docker-compose.yml  编排配置
-#   /opt/secagent/.env           凭据（⚠️ 含密钥，备份包属于敏感文件）
 #
-# 注意：.env 里有 API Key 和口令，所以备份包【本身就是敏感文件】，
+#   业务数据（能恢复服务）
+#     /opt/secagent/data/               向量库、事件、审计、评测、工单
+#     /opt/secagent/docker-compose.yml  编排配置
+#     /opt/secagent/.env                凭据（⚠️ 含密钥，备份包属于敏感文件）
+#
+#   主机配置（能换机）—— 放在 host/ 子目录，与业务数据分开
+#     host/crontab.txt                  定时任务
+#     host/cloudflared*                 隧道凭据与 systemd 单元
+#     host/security/                    fail2ban / firewalld / sshd 配置
+#     host/scripts/                     /root 下的运维脚本
+#     host/system-info.txt              系统快照
+#
+# 【为什么要把主机配置也收进来】
+#   一开始只备份业务数据。但「能恢复数据」不等于「能换机」——
+#   crontab 丢了，备份任务本身就不再执行（而且不会报错，是静默失效）；
+#   cloudflared token 丢了，要重建隧道；安全配置丢了，要凭记忆重配。
+#   换机这种事一辈子做不了几次，做完一次就忘，所以必须让备份自己带全。
+#   换机步骤见 docs/迁移手册.md。
+#
+# 注意：.env 与 cloudflared-token 里有密钥，所以备份包【本身就是敏感文件】，
 #      不要丢进 git 仓库、不要发给别人。脚本会把这一点打在输出里。
 # ============================================================
 set -euo pipefail
@@ -109,10 +125,31 @@ if [[ "${1:-}" == "--verify" ]]; then
   done
 
   echo
+  # 「能恢复业务数据」不等于「能换机」。换机还依赖主机配置，逐项点名检查，
+  # 缺了就明确报出缺哪个 —— 而不是给一个笼统的「校验通过」。
+  echo "  4) 换机必备项检查"
+  while IFS=: read -r path desc; do
+    if [[ -f "$TMP/$path" ]]; then
+      printf "     \033[1;32m[有]\033[0m %-30s %s\n" "$path" "$desc"
+    else
+      printf "     \033[1;31m[缺]\033[0m %-30s %s\n" "$path" "$desc"
+      FAIL=1
+    fi
+  done <<'ITEMS'
+host/crontab.txt:定时任务（备份任务本身在里面，丢了会静默失效）
+host/cloudflared-token:隧道凭据（丢了要重建隧道，或从 API 重新取）
+host/cloudflared.service:隧道 systemd 单元
+host/system-info.txt:系统快照（换机时对照发行版差异）
+docker-compose.yml:编排配置
+.env:凭据与配置
+ITEMS
+
+  echo
   if [[ $FAIL -eq 0 ]]; then
-    ok "校验通过 —— 这份备份是【真的能恢复】的，不只是文件存在"
+    ok "校验通过 —— 业务数据能恢复，换机必备项也齐全"
+    echo "       换机步骤见 docs/迁移手册.md"
   else
-    die "校验发现问题，这份备份不可信"
+    die "校验发现问题，这份备份不可信（或不足以换机）"
   fi
   exit 0
 fi
@@ -124,13 +161,54 @@ TS=$(date +%Y%m%d-%H%M%S)
 NAME="secagent-$TS.tar.gz"
 OUT="$BACKUP_DIR/$NAME"
 
-log "1/4 打包"
+log "1/4 打包业务数据"
 INCLUDE=("data" "docker-compose.yml" ".env")
 for item in "${INCLUDE[@]}"; do
   [[ -e "$APP_DIR/$item" ]] || die "缺少 $APP_DIR/$item，拒绝生成不完整的备份"
 done
-tar -czf "$OUT" -C "$APP_DIR" "${INCLUDE[@]}"
+
+# ------------------------------------------------------------
+# 主机配置：光有业务数据是不足以「换机」的。
+# 这台机器上还有一堆东西是业务数据之外的，丢了就得凭记忆重建：
+#   · crontab（备份任务本身就在里面，丢了就再也不备份了 —— 会静默失效）
+#   · cloudflared 的 systemd 单元与 tunnel token（丢了要重建隧道）
+#   · fail2ban / firewalld / sshd 的安全配置
+#   · /root 下的运维脚本
+# 所以一并收进来，放在 host/ 子目录里与业务数据分开。
+STAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/host/security" "$STAGE/host/scripts"
+
+crontab -l > "$STAGE/host/crontab.txt" 2>/dev/null || echo "# crontab 为空" > "$STAGE/host/crontab.txt"
+
+for u in cloudflared.service cloudflared-update.service secagent-tunnel.service; do
+  [[ -f "/etc/systemd/system/$u" ]] && cp "/etc/systemd/system/$u" "$STAGE/host/"
+done
+[[ -f /etc/cloudflared/token ]] && cp /etc/cloudflared/token "$STAGE/host/cloudflared-token"
+
+cp /etc/fail2ban/jail.local "$STAGE/host/security/" 2>/dev/null || true
+cp -r /etc/fail2ban/jail.d/. "$STAGE/host/security/" 2>/dev/null || true
+cp /etc/firewalld/zones/public.xml "$STAGE/host/security/" 2>/dev/null || true
+cp /etc/ssh/sshd_config.d/*.conf "$STAGE/host/security/" 2>/dev/null || true
+cp /root/*.sh "$STAGE/host/scripts/" 2>/dev/null || true
+
+# 系统信息快照：换机时用来对照发行版差异（RHEL 系与 Debian 系的坑不一样）
+{
+  echo "=== 采集时间 ==="; date -Is
+  echo; echo "=== 内核 ==="; uname -a
+  echo; echo "=== 发行版 ==="; cat /etc/os-release 2>/dev/null
+  echo; echo "=== systemd 版本 ==="; systemctl --version 2>/dev/null | head -1
+  echo; echo "=== 内存 / Swap ==="; free -m
+  echo; echo "=== 磁盘 ==="; df -h /
+  echo; echo "=== 监听端口 ==="; ss -tlnp 2>/dev/null
+  echo; echo "=== 已启用的服务 ==="; systemctl list-unit-files --state=enabled --no-legend 2>/dev/null
+  echo; echo "=== 镜像 ==="; docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' 2>/dev/null
+} > "$STAGE/host/system-info.txt" 2>&1
+
+tar -czf "$OUT" -C "$APP_DIR" "${INCLUDE[@]}" -C "$STAGE" host
 ok "已生成 $NAME  ($(du -h "$OUT" | cut -f1))"
+echo "       业务数据: ${INCLUDE[*]}"
+echo "       主机配置: host/（crontab / systemd / 隧道 token / 安全配置 / 运维脚本 / 系统快照）"
 
 log "2/4 校验包完整性"
 # 只验证能不能列出内容，不解包（解包留给 --verify）
