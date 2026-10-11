@@ -94,6 +94,22 @@ public class WazuhService implements WazuhGateway {
         }
     }
 
+    /**
+     * 处置通道是否可用 —— 与 {@link #isAvailable()} 语义不同，不要混用。
+     *
+     * <p>{@code isAvailable()} 回答的是"Wazuh 管理 API 连上了吗"，
+     * 它决定的是【告警数据】能不能取到真实值。
+     * <p>这个方法回答的是"处置动作能不能真的执行"。
+     * 处置的首选路径是 SSH 直连（不依赖 Wazuh API），
+     * 所以两者必须分开判断 —— 混用会导致
+     * "链路是通的，但业务代码认为不可用，直接走了 MOCK"。
+     */
+    public boolean isResponseCapable() {
+        return activeResponseEnabled
+                && sshExecutor != null
+                && sshExecutor.isEnabled();
+    }
+
     @Override
     public boolean isAvailable() {
         return available;

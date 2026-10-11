@@ -41,11 +41,32 @@ public class ResponseActionService {
         this.wazuhGatewayProvider = wazuhGatewayProvider;
     }
 
-    /** 网关是否可用：存在 Bean 且 isAvailable() 为真 */
+    /**
+     * 处置通道是否可用。
+     *
+     * <h3>这里修的是一个"判据过时"的 bug</h3>
+     * 原来的实现是 {@code gw.isAvailable()} —— 它的语义是
+     * "Wazuh 管理 API 连上了吗"。但处置现在**已经不走 Wazuh API 了**
+     * （AR 投递链路在这套环境里走不通，改用 SSH 直连）。
+     * 于是出现一个很隐蔽的情况：
+     * <b>链路明明是通的、脚本手工执行能封，但业务代码判断"不可用"，
+     * 直接走了 MOCK 分支</b> —— 表现就是 "已封禁 …（MOCK 模拟）"。
+     * <p>
+     * 这类 bug 的特点是：<b>判据和实际执行方式脱节了</b>。
+     * 改了一半（执行方式换了）没改另一半（可用性判据），
+     * 两边就不一致了。所以这里改成问网关一个专门的问题：
+     * "你能不能真的执行处置动作"，而不是复用一个语义不同的方法。
+     */
     private boolean wazuhReady() {
         try {
             org.example.integration.WazuhGateway gw = wazuhGatewayProvider.getIfAvailable();
-            return gw != null && gw.isAvailable();
+            if (gw == null) {
+                return false;
+            }
+            if (gw instanceof org.example.integration.wazuh.WazuhService) {
+                return ((org.example.integration.wazuh.WazuhService) gw).isResponseCapable();
+            }
+            return gw.isAvailable();
         } catch (Exception e) {
             return false;
         }
