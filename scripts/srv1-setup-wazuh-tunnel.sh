@@ -52,12 +52,25 @@ log "1/5 找 docker 网桥网关 IP（隧道要绑这个地址）"
 #
 # 真正可用的地址是【容器自己的默认网关】：容器的所有出网流量都经过它，
 # 所以一定可达。这里直接从容器里读出来，不依赖任何假设。
-GW=$(docker exec secagent sh -c "ip route | awk '/^default/{print \$3}'" 2>/dev/null | head -1)
-if [ -z "$GW" ]; then
-  # 容器里没有 ip 命令时，用 /proc/net/route 解析
-  GW=$(docker exec secagent sh -c "awk '\$2==\"00000000\"{printf \"%d.%d.%d.%d\", strtonum(\"0x\"substr(\$3,7,2)), strtonum(\"0x\"substr(\$3,5,2)), strtonum(\"0x\"substr(\$3,3,2)), strtonum(\"0x\"substr(\$3,1,2))}' /proc/net/route" 2>/dev/null | head -1)
+# 取【容器所在 docker 网络的网关】。
+# 优先在宿主机侧查（docker network inspect）—— 最可靠，
+# 不依赖容器里装了什么工具（实测这个精简镜像里没有 ip/route/netstat，
+# 只有 cat 和 awk）。
+NET=$(docker inspect secagent --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null | head -1)
+GW=""
+if [ -n "$NET" ]; then
+  GW=$(docker network inspect "$NET" --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null)
+  echo "  容器网络: $NET"
 fi
-echo "  容器自己的默认网关: ${GW:-没找到}"
+if [ -z "$GW" ]; then
+  # 兜底：从容器内的 /proc/net/route 解码（Gateway 字段是小端十六进制）
+  HEX=$(docker exec secagent sh -c "awk '\$2==\"00000000\"{print \$3}' /proc/net/route" 2>/dev/null | head -1)
+  if [ -n "$HEX" ] && [ ${#HEX} -eq 8 ]; then
+    GW=$(printf "%d.%d.%d.%d" 0x${HEX:6:2} 0x${HEX:4:2} 0x${HEX:2:2} 0x${HEX:0:2})
+    echo "  （从 /proc/net/route 解码）"
+  fi
+fi
+echo "  容器所在网络的网关: ${GW:-没找到}"
 [ -n "$GW" ] || { echo "  [X] 拿不到容器网关，无法继续"; exit 1; }
 
 log "2/5 先做一次临时隧道，验证链路真的通"

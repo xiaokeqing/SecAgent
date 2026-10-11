@@ -99,7 +99,7 @@ OK "docker-compose.yml 已上传"
 # 探测【容器自己的默认网关】并写进文件，供 compose 的 extra_hosts 使用。
 # 为什么要探测而不是写死：docker0 网关（172.17.0.1）和 compose 网络网关
 # （172.18.0.1）是两回事，容器只能到达后者。写死一定会错。
-$gw = (ssh @SSH "root@$Ip" "docker exec secagent sh -c `"ip route | awk '/^default/{print `$3}'`" 2>/dev/null" 2>&1 | Out-String).Trim()
+$gw = (ssh @SSH "root@$Ip" "NET=`$(docker inspect secagent --format '{{range `$k,`$v := .NetworkSettings.Networks}}{{`$k}}{{end}}'); docker network inspect `$NET --format '{{(index .IPAM.Config 0).Gateway}}'" 2>&1 | Out-String).Trim()
 if ($gw -match '^\d+\.\d+\.\d+\.\d+$') {
   Write-Host "  检测到容器默认网关: $gw"
   $gwFile = Join-Path $env:TEMP 'wazuh-host-ip.txt'
