@@ -39,29 +39,45 @@ docker load -i "$IMAGE_TAR"
 docker images secagent --format '  {{.Repository}}:{{.Tag}}  {{.Size}}'
 
 # ------------------------------------------------------------
-log "2/5 拉取源码"
+log "2/5 更新配置（从上传的文件，不依赖 git）"
 # ------------------------------------------------------------
-# 只需要 docker-compose.yml、security-docs/ 和 data/vector-store.json。
-# 源码在这里不参与构建（镜像是本地构建好传上来的），放一份只是为了便于排查。
+# ⚠️ 为什么配置走 scp 而不是 git pull —— 这是踩坑之后改的。
 #
-# 这一步【必须容错】：实测阿里云杭州这台机器访问 github.com 时好时坏，
-# 已经因此让整次部署失败过一次 —— 镜像都载入成功了，却卡在一个
-# 非必需的步骤上退出（脚本开头有 set -e）。
-# 拉不到就用现有版本继续，只给个告警。
+# 原来的做法：docker-compose.yml 靠 `git pull` 从 GitHub 拉。
+# 实测阿里云杭州这台机器访问 github.com 时好时坏，于是出现这个组合：
+#     镜像更新成功了（走 scp）
+#     配置没更新（走 git，失败了）
+#     -> 容器用旧 compose 起来，新加的环境变量压根没被引用
+#
+# 而【这一切是静默的】：部署日志里只有一行「拉取源码失败，沿用现有版本」，
+# 然后健康检查照样通过、服务照样正常 —— 只是配置没生效。
+# 我因此白折腾了一轮（buildSha 一直是 unknown，查了半天才发现 compose 是旧的）。
+#
+# 教训：既然镜像走 scp 是可靠的，配置也该走 scp。
+#      【不要让同一次部署里的两个依赖项用两种可靠性不同的传输方式。】
+#
+# 源码仍然拉一份（便于在服务器上排查），但它【失败不影响配置】。
+if [[ -f /root/deploy-compose.yml ]]; then
+  cp /root/deploy-compose.yml "$APP_DIR/docker-compose.yml"
+  ok "docker-compose.yml 已从上传文件更新"
+else
+  warn "没找到 /root/deploy-compose.yml，沿用现有 compose（可能与仓库不一致）"
+fi
+
 set +e
 if [[ -d $APP_DIR/.git ]]; then
   if git -C "$APP_DIR" fetch --all --quiet 2>/dev/null \
      && git -C "$APP_DIR" reset --hard origin/main --quiet 2>/dev/null; then
     ok "源码已更新到最新 main"
   else
-    warn "拉取源码失败（GitHub 连接问题），沿用现有版本继续部署"
+    warn "拉取源码失败（GitHub 连接问题）—— 不影响配置，继续部署"
   fi
 else
   mkdir -p "$(dirname $APP_DIR)"
   if git clone --depth 1 "$REPO_URL" "$APP_DIR" --quiet 2>/dev/null; then
     ok "已克隆到 $APP_DIR"
   else
-    warn "克隆源码失败，跳过（镜像已载入，不影响启动）"
+    warn "克隆源码失败，跳过（镜像和配置都已就位，不影响启动）"
   fi
 fi
 set -e
@@ -97,7 +113,17 @@ fi
 # 线上 buildSha 与仓库 HEAD，不一致就报错。
 # （这个机制是被一次真实的部署漂移逼出来的：代码改了、提交了，
 #   但忘了部署，线上仍是旧的有缺陷版本，而从外部完全看不出来。）
-export BUILD_SHA="$(cd /opt/secagent && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+#
+# 版本号优先取【上传文件】里写的 —— 那是开发机上的真实 HEAD。
+# 退回到服务器 git 的话，如果 git pull 恰好失败，就会把一个
+# 旧版本号报成"当前版本"，反而掩盖了漂移。
+if [[ -f /root/build-sha.txt ]]; then
+  export BUILD_SHA="$(tr -d '[:space:]' < /root/build-sha.txt)"
+  ok "BUILD_SHA=$BUILD_SHA（来自上传文件，即开发机 HEAD）"
+else
+  export BUILD_SHA="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  warn "BUILD_SHA=$BUILD_SHA（取自服务器 git，可能不是当次部署的版本）"
+fi
 export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 chown -R 999:999 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || warn "chown 数据目录失败"
 chmod 750 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || true
