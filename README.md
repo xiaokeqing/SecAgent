@@ -17,7 +17,9 @@
 - **多智能体协同（核心）**：`agent/multi/MultiAgentCoordinatorImpl` 统一收口。PLANNER 调度员先用规则关键词路由（离线可用），配真实 Key 时切模型路由，解析失败自动回退规则路由；再派发给三个专职智能体——ANALYST 研判分析员（知识库 RAG + 时间，只依据知识库作答）、FORENSICS 取证分析员（告警指标 + 安全日志 + 时间，只输出工具事实）、RESPONDER 处置执行员（SecurityActionTools + 时间）。汇总输出「结论 + 证据 + 处置结果」，前端对话页展示协同过程时间线（`/api/chat` 返回 steps 数组）。**处置动作在 SecurityActionTools 内部强制走 ResponseActionService（ResponseGuard 白名单 + 高危审批 + 审计），不靠提示词约束。**
 - **告警聚合去重**：`aggregation/AlertAggregationService` 按「同一源 IP + 5 分钟时间窗（可配）+ 同类告警」自动聚合；聚合行带 ×N 徽标、时间窗、涉及资产、双来源徽标，可下钻原始明细。`/api/alerts/list` 默认聚合（同时返回 rawTotal/aggregatedTotal），`?raw=true` 返回原始。
 - **封禁到期自动解封**：封禁成功登记 `data/blocked-ips.json`（含 expiresAt、来源=手动/审批/智能体）；`UnblockScheduler` 每 60s（可配，开关 `response.unblock.enabled`）扫描到期自动调 Wazuh active-response 解封（无 Wazuh 自动 MOCK），写审计 `action=unblock-ip actor=scheduler`；`GET /api/response/blocks` 查封禁中列表。
-- **红队评测误报率**：用例集扩到 19 例（攻击 11 离线 + 2 模型 SKIPPED + 正常流量 8 离线）；summary 新增 `falsePositiveRate`/`normalExecuted`/`normalMisblocked`，逐例 MISBLOCKED=误拦；前端 KPI 五卡并列（攻击成功率/绕过率/误报率/平均耗时/Token 成本）。
+- **红队评测误报率**：用例集 27 例（基础 19 = 攻击 11 离线 + 2 模型 + 正常流量 8 离线；绕过型 8）；summary 含 `falsePositiveRate`/`normalExecuted`/`normalMisblocked`，逐例 MISBLOCKED=误拦；前端 KPI 五卡并列（攻击成功率/绕过率/误报率/平均耗时/Token 成本）。
+  - **实测数值**：拦下 15 / 绕过 4，绕过率 4/19 = 21.05%（95% CI 约 8%~44%）；8 例正常流量**未观察到误拦** —— 注意真实误报率的 95% 置信上限约 **37.5%**（三法则 3/n），样本量不足以支撑「误报率很低」的结论。
+  - 修过的一个指标 bug：`attackSuccessRate` 原本用 `bypassed/executedCount`（分母 19），与 `bypassRate` 的 `bypassed/expectBlockedExecuted`（分母 11）不一致。`attackSuccess` 只在攻击用例上才可能为 true，分母只能是攻击用例数。
 
 > 架构定位不变：智能编排、研判、护栏全部写在本仓库自有代码里；Wazuh 仅作「真实数据源 + 执行封禁/解封的手」，Suricata 仅作网络层告警来源；不引入 Shuffle 等独立 SOAR 平台。
 
