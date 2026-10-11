@@ -21,6 +21,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -155,6 +156,57 @@ public class WazuhService implements WazuhGateway {
         } else if (!available && was) {
             logger.warn("Wazuh 数据链路断开：模式 REAL -> MOCK。"
                     + "对外页面会如实显示「数据源不可用」，不会拿内置样本填充", baseUrl);
+        }
+    }
+
+    /**
+     * 近 24 小时告警概览 —— 用<b>时间范围聚合</b>回答"这段时间有多少、其中多少严重的"。
+     *
+     * <h3>为什么不能靠告警列表凑</h3>
+     * 告警流取的是"最新 N 条"。网络侧低危告警一刷屏，高危就被挤出窗口，
+     * 面板上于是显示「严重 0 / 高危 0」——让人以为没出事，其实只是被噪声挤掉了。
+     * 口径问题只能靠口径解决。
+     */
+    @Override
+    public Map<String, Object> summary24h() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+
+        if (!available || client == null) {
+            return out;      // fail-closed：宁可显示"数据源不可用"，也不编造 0
+        }
+        try {
+            JsonNode root = client.fetchSummary24h();
+            long total = root.path("hits").path("total").path("value").asLong(0);
+
+            Map<String, Long> bySeverity = new LinkedHashMap<>();
+            for (AlertSeverity s : AlertSeverity.values()) {
+                bySeverity.put(s.name(), 0L);
+            }
+            for (JsonNode bucket : root.path("aggregations").path("by_level").path("buckets")) {
+                // rule.level 是 Wazuh 的 0–15 档，必须按 Wazuh 口径换算（不能用 parse()）
+                AlertSeverity sev = AlertSeverity.fromWazuhLevel(bucket.path("key").asText(""));
+                bySeverity.merge(sev.name(), bucket.path("doc_count").asLong(0), Long::sum);
+            }
+
+            List<Map<String, Object>> trend = new ArrayList<>();
+            for (JsonNode bucket : root.path("aggregations").path("by_hour").path("buckets")) {
+                String local = WazuhTime.toLocal(bucket.path("key_as_string").asText(""));
+                Map<String, Object> point = new LinkedHashMap<>();
+                point.put("time", local.length() >= 16 ? local.substring(11, 16) : local);
+                point.put("count", bucket.path("doc_count").asLong(0));
+                trend.add(point);
+            }
+
+            out.put("available", true);
+            out.put("total", total);
+            out.put("bySeverity", bySeverity);
+            out.put("trend", trend);
+            out.put("windowHours", 24);
+            return out;
+        } catch (Exception e) {
+            logger.warn("24h 聚合查询失败，前端会显示数据源不可用：{}", e.getMessage());
+            return out;
         }
     }
 

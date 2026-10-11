@@ -200,6 +200,9 @@ public class PublicApiController {
                 "byType", typeStats(raw),
                 "trend", trend(raw)
         ));
+        // 近 24 小时口径：KPI 的"严重/高危"与趋势图都取这一份 ——
+        // 取数窗口会被低危网络告警刷屏，按时间范围聚合才是"这段时间到底怎么样"
+        data.put("stats24h", source.summary24h());
         return data;
     }
 

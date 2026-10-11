@@ -32,6 +32,18 @@ public interface WazuhGateway {
     List<SecurityAlert> recentAlerts(int limit);
 
     /**
+     * 近 24 小时告警概览：总数、按本站四档分级计数、每小时趋势。
+     *
+     * <p>为什么单列一个方法：告警列表接口取的是"最新 N 条"，
+     * 低危告警一刷屏，严重/高危就被挤出窗口，面板上会显示成 0 ——
+     * 那是口径问题，不是真的没告警。时间窗口口径必须按时间范围聚合回答。
+     *
+     * @return {@code {available,total,bySeverity:{CRITICAL,HIGH,MEDIUM,LOW,INFO},trend:[{time,count}]}}；
+     *         数据源不可用时 {@code available=false}，其余字段为空（不编造 0）
+     */
+    Map<String, Object> summary24h();
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）

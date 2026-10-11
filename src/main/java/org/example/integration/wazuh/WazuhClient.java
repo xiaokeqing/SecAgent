@@ -333,6 +333,42 @@ public class WazuhClient {
         }
     }
 
+    /**
+     * 近 24 小时告警概览：总数 + 按等级分档 + 每小时趋势（一次聚合查询拿全）。
+     *
+     * <h3>为什么需要它</h3>
+     * 告警流取的是"最新 N 条"。网络侧的低危告警一旦刷屏，
+     * 严重/高危就被挤到窗口之外 —— 面板上会显示「严重 0 / 高危 0」，
+     * 让人以为没出事，实际上只是口径被噪声挤掉了。
+     * 时间窗口口径必须由<b>按时间范围聚合</b>来回答，不能靠"取最新几条"推断。
+     *
+     * @return OpenSearch 的 _search 响应（size=0，只有聚合结果）
+     */
+    public JsonNode fetchSummary24h() throws IOException {
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址（integration.wazuh.indexer-url）");
+        }
+        String body = "{\"size\":0,"
+                + "\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":{\"gte\":\"now-24h\"}}}]}},"
+                + "\"aggs\":{"
+                + "\"by_level\":{\"terms\":{\"field\":\"rule.level\",\"size\":20}},"
+                + "\"by_hour\":{\"date_histogram\":{\"field\":\"@timestamp\",\"fixed_interval\":\"1h\","
+                + "\"min_doc_count\":0,\"extended_bounds\":{\"min\":\"now-24h\",\"max\":\"now\"}}}}}";
+
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/wazuh-alerts-*/_search")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .post(RequestBody.create(body, JSON))
+                .build();
+        try (Response resp = indexerHttp.newCall(req).execute()) {
+            String respBody = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 24h 聚合查询失败 HTTP " + resp.code() + ": " + snippet(respBody));
+            }
+            return mapper.readTree(respBody);
+        }
+    }
+
     /** 拉取 manager 日志（取证用）。 */
     public JsonNode fetchManagerLogs(String query, int limit) throws IOException {
         StringBuilder path = new StringBuilder("/manager/logs?limit=" + Math.max(1, limit));

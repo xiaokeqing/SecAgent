@@ -92,6 +92,22 @@ public class PublicAlertSource {
         return aggregator.aggregate(readAlerts());
     }
 
+    /**
+     * 近 24 小时告警概览（按时间范围聚合，不受"最新 N 条"取数窗口影响）。
+     *
+     * <p>数据源不可用时返回 {@code {available:false}}，由前端显示"数据源不可用"，
+     * 绝不用 0 冒充"这段时间没有严重告警"。
+     */
+    public Map<String, Object> summary24h() {
+        try {
+            Map<String, Object> m = wazuhGateway.summary24h();
+            return m == null ? new java.util.LinkedHashMap<>() : m;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取 24h 概览失败：{}", e.getMessage());
+            return new java.util.LinkedHashMap<>();
+        }
+    }
+
     public int windowSize() {
         return WINDOW;
     }
