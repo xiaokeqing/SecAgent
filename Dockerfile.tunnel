@@ -1,0 +1,27 @@
+# ============================================================
+# Wazuh 隧道 sidecar 镜像
+# ------------------------------------------------------------
+# 为什么不直接在 compose 里用 alpine + apk add：
+#   实测阿里云那台机器【连不上 alpine 的 CDN，也连不上阿里云镜像源】，
+#   apk add openssh-client 必然失败。容器起来后 ssh 不存在，
+#   于是不停重启，而日志里只有一行 "ssh: not found"。
+#
+# 为什么不在服务器上现装：
+#   部署流程已经有一条可靠的镜像传输管道（本地构建 -> docker save ->
+#   scp -> docker load）。把隧道镜像也走这条路，
+#   就【不再依赖服务器能否访问外网软件源】——
+#   这是一类"环境依赖"，而环境依赖是部署失败最常见的原因。
+#
+# 镜像本身很小（alpine + openssh-client，约 15MB）。
+# ============================================================
+FROM alpine:3.19
+
+# 用阿里云镜像源（构建在开发机上进行，那里网络可达）
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories \
+    && apk add --no-cache openssh-client \
+    && rm -rf /var/cache/apk/*
+
+# 隧道不需要 shell 交互能力，去掉多余的东西减小攻击面
+# （这个容器唯一的职责就是维持一条 SSH 端口转发）
+
+ENTRYPOINT ["ssh"]

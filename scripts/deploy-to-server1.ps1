@@ -73,13 +73,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 ($mvnOut | Select-String -Pattern 'Tests run:.*Failures' | Select-Object -Last 1) | ForEach-Object { OK $_.Line.Trim() }
 docker build -t secagent:local . 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Bad "docker build secagent 失败"; exit 1 }
+# 隧道 sidecar 镜像也在本地构建 —— 服务器连不上 alpine 的 CDN，
+# 在服务器上 apk add 必然失败。走同一个传输管道。
+docker build -f Dockerfile.tunnel -t secagent-tunnel:local . 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { Bad "docker build tunnel 失败"; exit 1 }
 if ($LASTEXITCODE -ne 0) { Bad "docker build 失败"; exit 1 }
 OK "镜像已构建"
 
 # ── 2. 导出并上传 ────────────────────────────────────────────
 Step "2/6 导出并上传镜像（约 100 秒）"
 if (Test-Path $Tar) { Remove-Item -Force $Tar }
-docker save -o $Tar secagent:local 2>&1 | Out-Null
+docker save -o $Tar secagent:local secagent-tunnel:local 2>&1 | Out-Null
 $mb = [math]::Round((Get-Item $Tar).Length/1MB,0)
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 scp @SSH $Tar "root@${Ip}:/root/secagent-image.tar" 2>&1 | Out-Null

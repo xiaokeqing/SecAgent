@@ -130,23 +130,32 @@ services:
   #   · 不用改宿主机防火墙、不用探测网关 IP、没有 IP 漂移问题
   # ============================================================
   wazuh-tunnel:
-    image: alpine:3.19
+    image: secagent-tunnel:local
     container_name: wazuh-tunnel
     restart: unless-stopped
-    entrypoint: ["sh", "-c"]
+    # 镜像的 ENTRYPOINT 就是 ssh，这里只传参数。
+    # 不在容器里 apk add：阿里云那台机器连不上 alpine 的 CDN，
+    # 也连不上阿里云镜像源，装不上 ssh（日志只有一行 "ssh: not found"）。
+    # 改成在开发机构建好镜像、随部署一起传过去 —— 不再依赖服务器能否访问外网源。
     command:
-      - |
-        apk add --no-cache openssh-client >/dev/null 2>&1
-        exec ssh -NT \
-          -i /keys/tunnel_srv2_ed25519 \
-          -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null \
-          -o ExitOnForwardFailure=yes \
-          -o ServerAliveInterval=30 \
-          -o ServerAliveCountMax=3 \
-          -o ConnectTimeout=15 \
-          -L 0.0.0.0:55000:127.0.0.1:55000 \
-          root@43.143.114.79
+      - "-NT"
+      - "-i"
+      - "/keys/tunnel_srv2_ed25519"
+      - "-o"
+      - "StrictHostKeyChecking=no"
+      - "-o"
+      - "UserKnownHostsFile=/dev/null"
+      - "-o"
+      - "ExitOnForwardFailure=yes"
+      - "-o"
+      - "ServerAliveInterval=30"
+      - "-o"
+      - "ServerAliveCountMax=3"
+      - "-o"
+      - "ConnectTimeout=15"
+      - "-L"
+      - "0.0.0.0:55000:127.0.0.1:55000"
+      - "root@43.143.114.79"
     volumes:
       # 只读挂载专用隧道密钥（在服务器 2 上被限制为
       # 只能转发 55000、不能执行任何命令）
