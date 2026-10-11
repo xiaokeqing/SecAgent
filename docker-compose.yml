@@ -55,6 +55,20 @@ services:
       BLOCK_SSH_USER: "${BLOCK_SSH_USER:-root}"
       BLOCK_SSH_KEY: "/opt/keys/secagent_block_ed25519"
       BLOCK_SSH_KNOWN_HOSTS: "/opt/keys/known_hosts"
+      # 【关键】用 Spring 的宽松绑定命名再传一遍。
+      # 为什么需要：上面那几个 BLOCK_SSH_* 名字与 Spring 属性路径
+      # （integration.block.ssh.host）不匹配，导致 yml 里的
+      # ${BLOCK_SSH_HOST:} 占位符解析不到值、回落到空默认值 ——
+      # 结果 isEnabled()=false，处置一直走 MOCK。
+      # 启动自检打印出 host=[] 才把这个问题暴露出来。
+      # Spring 的宽松绑定会把 INTEGRATION_BLOCK_SSH_HOST 直接映射到
+      # integration.block.ssh.host，不依赖 yml 占位符是否被解析。
+      INTEGRATION_BLOCK_SSH_ENABLED: "true"
+      INTEGRATION_BLOCK_SSH_HOST: "43.143.114.79"
+      INTEGRATION_BLOCK_SSH_PORT: "22"
+      INTEGRATION_BLOCK_SSH_USER: "root"
+      INTEGRATION_BLOCK_SSH_KEY: "/opt/keys/secagent_block_ed25519"
+      INTEGRATION_BLOCK_SSH_KNOWN_HOSTS: "/opt/keys/known_hosts"
 
       # ===== 接真实 Wazuh（B3）=====
       # 为什么是 host.docker.internal 而不是 127.0.0.1：
