@@ -348,7 +348,7 @@ public class WazuhClient {
         if (indexerUrl == null || indexerHttp == null) {
             throw new IOException("未配置 Wazuh indexer 地址（integration.wazuh.indexer-url）");
         }
-        String body = "{\"size\":0,"
+        String body = "{\"size\":0,\"track_total_hits\":true,"
                 + "\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":{\"gte\":\"now-24h\"}}}]}},"
                 + "\"aggs\":{"
                 + "\"by_level\":{\"terms\":{\"field\":\"rule.level\",\"size\":20}},"
