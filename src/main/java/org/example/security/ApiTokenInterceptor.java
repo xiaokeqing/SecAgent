@@ -106,12 +106,35 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
         return false;
     }
 
+    /**
+     * 免鉴权路径判定 —— <b>精确匹配，不是前缀匹配</b>。
+     *
+     * <h3>为什么从 startsWith 改成 equals</h3>
+     * 原实现是 {@code path.startsWith(p)}。当时没出事，是因为恰好没有
+     * 别的端点以这两个白名单前缀开头 —— 也就是说，它靠"碰巧"安全。
+     * <p>
+     * 前缀匹配的隐患很具体：白名单里有 {@code /api/health}，
+     * 那么以后谁新增一个 {@code /api/health-details}（比如返回更详细的
+     * 运行时信息），它会被<b>静默放行</b> —— 而写这个端点的人根本不会想到
+     * 自己去查白名单前缀。
+     * <p>
+     * 更要紧的是这个失败模式：<b>它不会报错、不会告警，只是让一个本该
+     * 鉴权的接口变成公开的。</b>安全相关的默认行为必须是"不匹配就不放行"，
+     * 而不是"看起来像就放行"。
+     * <p>
+     * 顺带说明为什么不做成"前缀 + 精确都支持"的宽松版：白名单是安全边界，
+     * 边界越简单越容易验证。两个端点就写两个完整路径，没有歧义。
+     *
+     * @param path 请求 URI（{@code request.getRequestURI()}）
+     * @return true 表示该路径无需鉴权
+     */
     private boolean isWhiteListed(String path) {
         if (whiteList == null || whiteList.isEmpty()) {
             return false;
         }
         for (String p : whiteList.split(",")) {
-            if (!p.trim().isEmpty() && path.startsWith(p.trim())) {
+            String entry = p.trim();
+            if (!entry.isEmpty() && entry.equals(path)) {
                 return true;
             }
         }
