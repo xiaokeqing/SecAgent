@@ -28,7 +28,27 @@ for c in wazuh.indexer wazuh.manager wazuh.dashboard; do
 done
 
 # --- Wazuh 健康 ---
-echo "IDX_HEALTH=$(curl -sk -u admin:SecretPassword --max-time 8 https://127.0.0.1:9200/_cluster/health 2>/dev/null | grep -o '"status":"[a-z]*"' | head -1)"
+# ⚠️ 不能硬编码 indexer 口令！
+# 第一版写死了 admin:SecretPassword，结果口令一改，检查立刻开始说谎 ——
+# 401（认证失败）被报成"集群异常"。凭据轮换后必须所有引用处一起改，
+# 这个坑我在 Wazuh 配置里刚踩过，又在自己脚本里踩了第二次。
+# 正确做法：从服务器上的口令文件读。读不到再退化为默认值（并标注）。
+IDX_PW=$(grep '^INDEXER_ADMIN_PASSWORD=' /root/.wazuh-new-creds.txt 2>/dev/null | cut -d= -f2)
+if [ -z "$IDX_PW" ]; then
+  IDX_PW="SecretPassword"
+  echo "IDX_PW_SOURCE=default(未找到口令文件，可能还是默认口令)"
+else
+  echo "IDX_PW_SOURCE=file"
+fi
+# 注意引号：不能写成 echo "IDX_CODE=$(curl ... -u "admin:${IDX_PW}" ...)"
+# 内层双引号会提前闭合外层字符串。必须先算到变量再输出 —— 这个坑
+# 在这个项目里已经出现好几次了（PowerShell + bash 双层的引号地狱）。
+IDX_URL="https://127.0.0.1:9200/_cluster/health"
+IDX_RAW=$(curl -sk -u "admin:${IDX_PW}" --max-time 8 "$IDX_URL" 2>/dev/null)
+IDX_CODE=$(curl -sk -o /dev/null -w '%{http_code}' -u "admin:${IDX_PW}" --max-time 8 "$IDX_URL" 2>/dev/null)
+IDX_STATUS=$(echo "$IDX_RAW" | grep -o '"status":"[a-z]*"' | head -1)
+echo "IDX_CODE=${IDX_CODE}"
+echo "IDX_HEALTH=${IDX_STATUS}"
 echo "MGR_API=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1:55000/ 2>/dev/null)"
 echo "DASH=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 https://127.0.0.1:443/app/login 2>/dev/null)"
 
@@ -53,6 +73,7 @@ echo "DISKFREE=$(df -h / | tail -1 | awk '{print $4}')"
 echo "EXPOSED=$(ss -tlnp 2>/dev/null | grep -cE '0\.0\.0\.0:(9200|55000|443|5601|1514)')"
 
 # --- 凭据状态（判断 indexer 默认口令改了没） ---
+# 反过来测【默认口令】是否还有效（有效=还没改，需要改）
 echo "IDX_DEFAULT_ALIVE=$(curl -sk -o /dev/null -w '%{http_code}' -u admin:SecretPassword --max-time 8 https://127.0.0.1:9200/_cluster/health 2>/dev/null)"
 echo "API_NEWPW_OK=$([ -n "$(grep -o '^WAZUH_API_WUI_PASSWORD=' /root/.wazuh-new-creds.txt 2>/dev/null)" ] && echo yes || echo no)"
 

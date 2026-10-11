@@ -24,7 +24,7 @@ $BB = 'F:\7AAA\AI\blog'
 $S1 = '47.96.106.187'
 $K1 = "$env:USERPROFILE\.ssh\ssh_mcp_ed25519"
 $S1OPTS = @('-i',$K1,'-o','BatchMode=yes','-o','StrictHostKeyChecking=no','-o','ConnectTimeout=20')
-$S2OPTS = @('-l','root','-o','BatchMode=yes','-o','ConnectTimeout=20')
+$S2OPTS = @('-o','BatchMode=yes','-o','ConnectTimeout=20')
 
 $script:issues = 0
 $script:warns = 0
@@ -46,9 +46,22 @@ function Parse-KV($lines) {
 function Run-RemoteCheck($opts, $hostName, $localScript, $remoteName) {
   $t = [System.IO.File]::ReadAllText($localScript, [System.Text.Encoding]::UTF8) -replace "`r`n","`n"
   [System.IO.File]::WriteAllText($localScript, $t, (New-Object System.Text.UTF8Encoding($false)))
-  scp @opts $localScript "${hostName}:$remoteName" 2>$null | Out-Null
+
+  # 【本次的教训】这里必须检查 scp 是否成功。
+  # 原来写的是 `scp ... 2>$null | Out-Null`，失败被完全吞掉 ——
+  # 结果服务器上一直跑着旧版本的检查脚本，检查结果全是错的，
+  # 而我看到的只是"某个指标读不到"。检查脚本给出错误结论，
+  # 比完全没有检查更危险：它会把人引向修一个不存在的问题。
+  $scpOut = scp @opts $localScript "${hostName}:$remoteName" 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    BAD ("脚本上传失败（{0}）：{1}" -f $remoteName, ($scpOut -join ' '))
+    return @{}
+  }
   $out = ssh @opts $hostName "bash $remoteName" 2>&1
-  return Parse-KV $out
+  $h = Parse-KV $out
+  # 远程脚本有 root 自检，跑不对会输出 FATAL —— 明确报出来而不是静默
+  if ($h.ContainsKey('FATAL')) { BAD ("远程检查未正常执行: {0}" -f $h['FATAL']); return @{} }
+  return $h
 }
 
 Write-Host "============================================================"
@@ -136,7 +149,9 @@ else {
 
 # ============================================================
 SEC "③ 服务器 2（腾讯云 · 数据机）"
-$h2 = Run-RemoteCheck $S2OPTS 'secagent-srv2' (Join-Path $SB 'scripts\healthcheck-srv2.sh') '/tmp/hc2.sh'
+# 用户直接写进目标（root@host）：ssh config 里的 User 会被它覆盖，最可靠。
+# 之前用 -l root（scp 里 -l 是限速）和 -o User=root（被 config 盖过）都失败过。
+$h2 = Run-RemoteCheck $S2OPTS 'root@secagent-srv2' (Join-Path $SB 'scripts\healthcheck-srv2.sh') '/tmp/hc2.sh'
 if ($h2.Count -eq 0) { BAD "拿不到服务器 2 状态（SSH 失败？）" }
 else {
   INFO ("系统 {0}   运行 {1}" -f $h2['OS'], $h2['UPTIME'])
@@ -144,7 +159,14 @@ else {
   elseif ([int]$h2['WAZUH_N'] -eq 0) { BAD "Wazuh 容器都不在" }
   else { WARN ("Wazuh 只有 {0} 个容器在跑: {1}" -f $h2['WAZUH_N'], $h2['WAZUH_LIST']) }
 
-  if ($h2['IDX_HEALTH'] -match 'green|yellow') { OK ("indexer 集群 {0}" -f $h2['IDX_HEALTH']) } else { BAD ("indexer 异常: {0}" -f $h2['IDX_HEALTH']) }
+  # 先看 HTTP 码：401 是"口令不对"，不是"集群坏了" —— 两者要分清
+  if ($h2['IDX_CODE'] -eq '200' -and $h2['IDX_HEALTH'] -match 'green|yellow') {
+    OK ("indexer 集群 {0}（口令来源 {1}）" -f $h2['IDX_HEALTH'], $h2['IDX_PW_SOURCE'])
+  } elseif ($h2['IDX_CODE'] -eq '401') {
+    BAD ("indexer 认证失败（HTTP 401）—— 检查脚本读到的口令与实际不符，来源: {0}" -f $h2['IDX_PW_SOURCE'])
+  } else {
+    BAD ("indexer 异常: HTTP {0} / {1}" -f $h2['IDX_CODE'], $h2['IDX_HEALTH'])
+  }
   if ($h2['MGR_API'] -eq '401') { OK "manager API 存活（401 需认证）" } else { WARN ("manager API HTTP {0}" -f $h2['MGR_API']) }
   if ($h2['DASH'] -eq '200') { OK "dashboard HTTP 200" } else { WARN ("dashboard HTTP {0}" -f $h2['DASH']) }
 
@@ -174,15 +196,26 @@ $targets = @(
 )
 foreach ($t in $targets) {
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  try {
-    $r = Invoke-WebRequest -Uri $t.u -TimeoutSec 40 -UseBasicParsing
-    $sw.Stop()
-    if ($r.StatusCode -eq 200) { OK ("{0}  HTTP 200  {1} ms" -f $t.n, [math]::Round($sw.Elapsed.TotalMilliseconds,0)) }
-    else { BAD ("{0}  HTTP {1}" -f $t.n, $r.StatusCode) }
-  } catch {
-    $sw.Stop()
-    $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { '无响应' }
-    BAD ("{0}  失败: {1}" -f $t.n, $code)
+  # 重试 3 次：链路绕道境外，单次超时不等于服务坏了。
+  # （区分「服务坏了」和「这一跳网络抖了」很重要 —— 否则会去修不存在的问题。
+  #   第一次跑整体检查时就因为没重试，把一次超时报成了 SecAgent 挂了。）
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
+  $done = $false
+  foreach ($attempt in 1..3) {
+    try {
+      $r = Invoke-WebRequest -Uri $t.u -TimeoutSec 45 -UseBasicParsing
+      $sw.Stop()
+      if ($r.StatusCode -eq 200) { OK ("{0}  HTTP 200  {1} ms{2}" -f $t.n, [math]::Round($sw.Elapsed.TotalMilliseconds,0), $(if ($attempt -gt 1) { "（第 $attempt 次）" } else { "" })) }
+      else { BAD ("{0}  HTTP {1}" -f $t.n, $r.StatusCode) }
+      $done = $true; break
+    } catch {
+      if ($attempt -eq 3) {
+        $sw.Stop()
+        $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { '无响应' }
+        BAD ("{0}  3 次都失败: {1}" -f $t.n, $code)
+        $done = $true
+      } else { Start-Sleep -Seconds 4 }
+    }
   }
 }
 
