@@ -4,6 +4,8 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
 import java.security.SecureRandom;
@@ -24,6 +26,23 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code SECAGENT_PASSWORD}（管理员）/ {@code SECAGENT_ANALYST_PASSWORD}（分析员）
  * 注入强密码，并开启 {@code app.security.enforce-strong-credentials} 以防止
  * 带着默认口令对外启动。
+ *
+ * <h3>关于口令存储 —— 一次外部评审之后的修正</h3>
+ * 原实现把口令<b>明文</b>存进内存的 Account 对象，登录时用自己写的
+ * {@code constantTimeEquals} 做定长比较。定长比较说明作者想到了时序侧信道，
+ * 但漏掉了密码学上最基础的一步：口令不该以明文形式存在。
+ * <p>
+ * 风险不只是「内存里能看到」——本项目的 {@code JAVA_OPTS} 里开着
+ * {@code -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/app/data}，
+ * 一旦 OOM，含明文口令的堆转储会直接落到挂载卷上。
+ * <p>
+ * 现在改为启动时用 BCrypt 哈希一次，内存里只留哈希：
+ * <ul>
+ *   <li>BCrypt 自带随机盐，同一口令每次哈希结果都不同，不需要自己管盐</li>
+ *   <li>比对走 {@link PasswordEncoder#matches}，它内部本身就是定长比较，
+ *       所以自写的 {@code constantTimeEquals} 已删除 —— 留两套只会有两套行为</li>
+ *   <li>成本因子用默认值 10（约 50~100ms 一次），对登录接口是可以接受的代价</li>
+ * </ul>
  */
 @Service
 public class AuthService {
@@ -47,6 +66,23 @@ public class AuthService {
 
     private final SecureRandom secureRandom = new SecureRandom();
 
+    /**
+     * 口令哈希器。BCrypt 自带盐，默认强度 10。
+     *
+     * <p>用 crypto 模块而不是整个 spring-boot-starter-security：
+     * 后者会自动装配一整套过滤器链，把本项目自写的三个拦截器盖掉。
+     */
+    private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder();
+
+    /**
+     * 一个固定的假哈希，用于「用户不存在」时消耗与真实比对相当的时间。
+     *
+     * <p>为什么需要它：BCrypt 一次比对要 50~100ms，而账号不存在时如果直接返回，
+     * 响应时间会明显更快 —— 攻击者据此就能枚举出哪些用户名是存在的。
+     * 所以账号查不到时，仍然拿这个假哈希跑一次 matches，把耗时补齐。
+     */
+    private final String dummyHash = new BCryptPasswordEncoder().encode("dummy-password-for-timing");
+
     /** 账号：username -> 账号信息 */
     private final Map<String, Account> accounts = new ConcurrentHashMap<>();
 
@@ -55,13 +91,17 @@ public class AuthService {
 
     @PostConstruct
     public void init() {
-        accounts.put(adminUsername, new Account(adminUsername, adminPassword, Role.ADMIN));
+        // 启动时哈希一次，之后内存里只有哈希，没有明文
+        accounts.put(adminUsername,
+                new Account(adminUsername, passwordEncoder.encode(adminPassword), Role.ADMIN));
         if (!adminUsername.equals(analystUsername)) {
-            accounts.put(analystUsername, new Account(analystUsername, analystPassword, Role.ANALYST));
+            accounts.put(analystUsername,
+                    new Account(analystUsername, passwordEncoder.encode(analystPassword), Role.ANALYST));
         }
 
         // 凭据强度校验统一交由 CredentialGuard 在启动期完成（fail-closed），此处不再重复告警
-        logger.info("登录服务初始化完成，内置账号 {} 个，会话有效期 {} 分钟", accounts.size(), ttlMinutes);
+        logger.info("登录服务初始化完成，内置账号 {} 个，会话有效期 {} 分钟（口令以 BCrypt 哈希存储）",
+                accounts.size(), ttlMinutes);
     }
 
     /** 登录成功返回 token；账号或密码错误返回 null */
@@ -70,7 +110,13 @@ public class AuthService {
             return null;
         }
         Account account = accounts.get(inputUser.trim());
-        if (account == null || !constantTimeEquals(inputPass, account.password)) {
+        if (account == null) {
+            // 关键：用户不存在时也要走一次哈希比对，否则响应时间会泄露「这个用户名存不存在」
+            passwordEncoder.matches(inputPass, dummyHash);
+            return null;
+        }
+        // matches 内部已是定长比较，不需要再叠一层 constantTimeEquals
+        if (!passwordEncoder.matches(inputPass, account.passwordHash)) {
             return null;
         }
         byte[] bytes = new byte[32];
@@ -138,7 +184,9 @@ public class AuthService {
         if (rawPassword == null || rawPassword.length() < CredentialGuard.MIN_LENGTH) {
             throw new IllegalArgumentException("密码至少 " + CredentialGuard.MIN_LENGTH + " 位");
         }
-        accounts.put(u, new Account(u, rawPassword, role == null ? Role.ANALYST : role));
+        // 新增用户同样只存哈希
+        accounts.put(u, new Account(u, passwordEncoder.encode(rawPassword),
+                role == null ? Role.ANALYST : role));
         logger.info("管理员新增用户 {}，角色 {}", u, role);
     }
 
@@ -167,16 +215,20 @@ public class AuthService {
         }
     }
 
-    private static boolean constantTimeEquals(String a, String b) {
-        if (a == null || b == null || a.length() != b.length()) {
-            return false;
-        }
-        int r = 0;
-        for (int i = 0; i < a.length(); i++) {
-            r |= a.charAt(i) ^ b.charAt(i);
-        }
-        return r == 0;
-    }
+    /*
+      这里原本有一个自写的 constantTimeEquals（逐字符异或、长度不等直接返回 false）。
+      它现在被删掉了，原因有两条：
+
+        1. 用不上了 —— BCrypt 的 PasswordEncoder.matches 内部本来就是定长比较，
+           而且它比的是哈希值，比较耗时远小于哈希计算本身，时序差异被淹没在噪声里。
+        2. 留着有害 —— 两套比较逻辑意味着两套行为。以后有人改了这里、
+           忘了改那里，就会出现「看着有防护、实际没走那条路」的情况。
+           安全代码里，同一件事只该有一个实现。
+
+      它当初的存在说明作者想到了时序侧信道，这个意识是对的；
+      但真正的问题不在比较方式上，而在【口令本身以明文存储】——
+      比较得再小心，内存里躺着明文口令这件事都没解决。
+    */
 
     private static String toHex(byte[] bytes) {
         StringBuilder sb = new StringBuilder(bytes.length * 2);
@@ -186,15 +238,15 @@ public class AuthService {
         return sb.toString();
     }
 
-    /** 账号 */
+    /** 账号。注意这里存的是 BCrypt 哈希，字段名刻意叫 hash 而不是 password —— 免得以后有人当明文用 */
     private static class Account {
         final String username;
-        final String password;
+        final String passwordHash;
         final Role role;
 
-        Account(String username, String password, Role role) {
+        Account(String username, String passwordHash, Role role) {
             this.username = username;
-            this.password = password;
+            this.passwordHash = passwordHash;
             this.role = role;
         }
     }

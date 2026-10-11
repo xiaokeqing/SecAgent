@@ -46,10 +46,14 @@ services:
       # ---------- 对外 Demo 的调参 ----------
       # 用 SPRING_APPLICATION_JSON 显式覆盖，避免依赖环境变量与
       # 嵌套配置项之间的名称转换规则。
+      #
+      # self-assets 是「操作者知识」（我自己的公网资产有哪些），
+      # 代码里猜不出来，必须由部署者按实际填。留空时应用会打告警日志提醒。
       SPRING_APPLICATION_JSON: >-
         {"app":{"quota":{"daily-limit":${DAILY_QUOTA:-50}},
                  "ratelimit":{"requests-per-minute":${RATE_LIMIT_PER_MINUTE:-30}},
-                 "cors":{"allowed-origins":"${CORS_ALLOWED_ORIGINS:-http://localhost:9900}"}},
+                 "cors":{"allowed-origins":"${CORS_ALLOWED_ORIGINS:-http://localhost:9900}"},
+                 "response":{"self-assets":"${SECAGENT_SELF_ASSETS:-}"}},
          "vector":{"kb":{"auto-index":${VECTOR_KB_AUTO_INDEX:-false}}}}
 
       TZ: Asia/Shanghai

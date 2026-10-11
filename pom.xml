@@ -85,6 +85,25 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
+        <!--
+          只引 spring-security-crypto，【不引】 spring-boot-starter-security。
+
+          为什么：本项目的鉴权是自己写的三个拦截器（ApiTokenInterceptor /
+          RbacInterceptor / RateLimitInterceptor），行为完全可控。
+          一旦引入整个 starter，Spring Security 会自动装配一整套过滤器链
+          （默认全拦截 + 自动生成随机密码 + 自己的登录页），
+          把现有拦截器整个盖掉，改起来比重写还麻烦。
+
+          而 BCrypt 只需要 crypto 这一个模块，它没有自动配置，
+          不会改变任何现有行为 —— 这也是「只取需要的零件」的典型场景。
+
+          不写 version：由 spring-boot-starter-parent 3.2.0 的依赖管理决定
+          （对应 Spring Security 6.2.0）。手写版本号容易和 Spring Boot 版本错配。
+        -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-devtools</artifactId>
