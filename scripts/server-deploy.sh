@@ -86,6 +86,14 @@ else
 fi
 
 # ------------------------------------------------------------
+# ⚠️ 修正数据目录属主 —— 这一步是踩坑之后固化进来的。
+# 容器以 secagent(uid 999) 运行。bind mount 的宿主机目录如果属主是 root，
+# 容器就写不进去；而写失败只在日志里，API 照样返回 success ——
+# 结果是"审计与封禁记录全是空的，但功能看起来完全正常"。
+# 现在 StorageGuard 会在启动时检查可写性并拒绝启动（fail-closed），
+# 所以漏了这一步的后果从"静默失效"变成"起不来"—— 后者安全得多。
+chown -R 999:999 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || warn "chown 数据目录失败"
+chmod 750 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || true
 log "4/5 启动服务"
 # ------------------------------------------------------------
 cd "$APP_DIR"

@@ -136,6 +136,15 @@ app:
   quota:
     enabled: true
     daily-limit: 200
+  # 启动期存储可写性校验（fail-closed）
+  # 为什么要有：线上出现过 data 目录属主是 root、容器以 uid 999 运行，
+  # 审计写不进去但 API 仍返回 success —— 功能"看起来正常"、留痕全是空的。
+  # 所以启动时实际写一个探针文件，不可写就拒绝启动。
+  storage:
+    writable-dirs: data,uploads
+    # true  = 对外部署：不可写直接拒绝启动（推荐）
+    # false = 本地开发：仅告警
+    enforce-writable: true
   # 自动处置护栏（阶段3 封禁 IP 动作使用）
   response:
     # 保护网段：任何情况下都不该被封的地址。
