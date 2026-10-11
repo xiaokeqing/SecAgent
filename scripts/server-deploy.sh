@@ -92,6 +92,13 @@ fi
 # 结果是"审计与封禁记录全是空的，但功能看起来完全正常"。
 # 现在 StorageGuard 会在启动时检查可写性并拒绝启动（fail-closed），
 # 所以漏了这一步的后果从"静默失效"变成"起不来"—— 后者安全得多。
+# 把当次代码版本写进环境变量，供健康接口返回。
+# 这样"改了代码但没重新部署"会自己暴露 —— 整体检查会比对
+# 线上 buildSha 与仓库 HEAD，不一致就报错。
+# （这个机制是被一次真实的部署漂移逼出来的：代码改了、提交了，
+#   但忘了部署，线上仍是旧的有缺陷版本，而从外部完全看不出来。）
+export BUILD_SHA="$(cd /opt/secagent && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 chown -R 999:999 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || warn "chown 数据目录失败"
 chmod 750 /opt/secagent/data /opt/secagent/uploads 2>/dev/null || true
 log "4/5 启动服务"

@@ -43,6 +43,12 @@ services:
       # 生成后改回 false，之后重启不再重复花钱。
       VECTOR_KB_AUTO_INDEX: "${VECTOR_KB_AUTO_INDEX:-false}"
 
+      # 构建信息：由部署脚本传入当次 commit。
+      # 健康接口返回它，整体检查拿它跟仓库 HEAD 比对 ——
+      # 这样"忘了部署"（部署漂移）会自己暴露，不靠人记得。
+      BUILD_SHA: "${BUILD_SHA:-unknown}"
+      BUILD_TIME: "${BUILD_TIME:-unknown}"
+
       # ---------- 对外 Demo 的调参 ----------
       # 用 SPRING_APPLICATION_JSON 显式覆盖，避免依赖环境变量与
       # 嵌套配置项之间的名称转换规则。

@@ -136,6 +136,12 @@ app:
   quota:
     enabled: true
     daily-limit: 200
+  # 构建信息：由 docker-compose 通过环境变量注入。
+  # 健康接口返回它，整体检查用它比对线上与仓库是否一致 ——
+  # 这是为了检测「部署漂移」（改了代码但忘了部署）。
+  build:
+    sha: ${BUILD_SHA:unknown}
+    time: ${BUILD_TIME:unknown}
   # 启动期存储可写性校验（fail-closed）
   # 为什么要有：线上出现过 data 目录属主是 root、容器以 uid 999 运行，
   # 审计写不进去但 API 仍返回 success —— 功能"看起来正常"、留痕全是空的。

@@ -123,6 +123,22 @@ else {
     $j = $h1['HAPI'] | ConvertFrom-Json
     if ($j.status -eq 'ok') { OK ("健康接口 ok，向量 {0} 条，存储 {1}" -f $j.documentVectors, $j.vectorStore) }
     else { BAD ("健康接口非 ok") }
+
+    # 【部署漂移检测】
+    # 这是被一次真实事故逼出来的检查：代码改完、测试跑过、提交也推了，
+    # 但忘了部署 —— 线上跑的还是有已知缺陷的旧镜像。
+    # 而从外部完全看不出来：服务健康、接口正常、演示也正常，只是修复没生效。
+    # 靠"我记得要部署"是解决不了的（那次就是以为部署了），
+    # 所以让线上自己报出版本号，这里跟仓库 HEAD 比对。
+    $localSha = (git -C $SB rev-parse --short HEAD 2>$null)
+    $liveSha  = "$($j.buildSha)"
+    if ($liveSha -eq 'unknown' -or [string]::IsNullOrWhiteSpace($liveSha)) {
+      WARN "线上没报告 buildSha —— 镜像里没注入版本号（这本身也说明该重新部署了）"
+    } elseif ($localSha -and $liveSha -ne $localSha) {
+      BAD ("部署漂移！仓库 HEAD=$localSha，线上运行=$liveSha —— 代码改了但没部署，线上跑的仍是旧版本")
+    } else {
+      OK ("线上版本与仓库一致（$liveSha）")
+    }
   } catch { BAD ("健康接口不可解析: {0}" -f $h1['HAPI']) }
 
   $wl = $h1['WL']; if (-not $wl) { $wl = $h1['WL51'] }
