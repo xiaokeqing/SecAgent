@@ -105,7 +105,16 @@ app:
   auth:
     enabled: true   # 默认开启鉴权：登录会话 Token 或系统级 API Token 任一通过即可
     token: ${SECAGENT_API_TOKEN:secagent-demo-token}  # 生产环境务必通过环境变量注入强随机 Token
-    white-list: /api/health
+    # 免鉴权白名单（逗号分隔，按前缀匹配）。
+    #   /api/health           —— 健康检查，监控与容器 healthcheck 要用
+    #   /api/playground/check —— 「试着攻击我」的公开检测接口
+    #
+    # 敢把第二个公开，是因为同时满足三条：
+    #   1. 只读 —— 只做字符串检测，不写库、不改状态、不执行任何动作
+    #   2. 不调模型 —— 纯正则匹配，没有 Token 成本，刷不出额度
+    #   3. 不回显原文 —— 只返回命中了哪条规则，避免变成反射型 XSS 的跳板
+    # 处置类接口一律要求管理员角色 + 人工审批，和这条路径是两条完全分开的路。
+    white-list: /api/health,/api/playground/check
   # 登录账号配置（生产环境请通过环境变量 SECAGENT_PASSWORD 注入密码）
   security:
     login:
