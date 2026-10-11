@@ -22,6 +22,10 @@ ENV_SRC=/root/secagent.env
 
 log()  { echo -e "\n\033[1;36m==> $*\033[0m"; }
 ok()   { echo -e "\033[1;32m  [OK] $*\033[0m"; }
+# warn 曾经漏定义：脚本里调用了它，但只在另一个脚本（server-setup.sh）里定义过。
+# 表现是部署日志里冒出一行 "warn: command not found" —— 因为刚好在 set +e 的
+# 区间里，不影响流程，所以很容易被忽略。函数定义必须和调用对齐。
+warn() { echo -e "\033[1;33m  [!] $*\033[0m"; }
 die()  { echo -e "\033[1;31m  [X] $*\033[0m" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "请用 root 运行"
@@ -38,25 +42,48 @@ docker images secagent --format '  {{.Repository}}:{{.Tag}}  {{.Size}}'
 log "2/5 拉取源码"
 # ------------------------------------------------------------
 # 只需要 docker-compose.yml、security-docs/ 和 data/vector-store.json。
-# 源码在这里不参与构建，但放一份便于排查与更新。
+# 源码在这里不参与构建（镜像是本地构建好传上来的），放一份只是为了便于排查。
+#
+# 这一步【必须容错】：实测阿里云杭州这台机器访问 github.com 时好时坏，
+# 已经因此让整次部署失败过一次 —— 镜像都载入成功了，却卡在一个
+# 非必需的步骤上退出（脚本开头有 set -e）。
+# 拉不到就用现有版本继续，只给个告警。
+set +e
 if [[ -d $APP_DIR/.git ]]; then
-  git -C "$APP_DIR" fetch --all --quiet
-  git -C "$APP_DIR" reset --hard origin/main --quiet
-  ok "已更新到最新 main"
+  if git -C "$APP_DIR" fetch --all --quiet 2>/dev/null \
+     && git -C "$APP_DIR" reset --hard origin/main --quiet 2>/dev/null; then
+    ok "源码已更新到最新 main"
+  else
+    warn "拉取源码失败（GitHub 连接问题），沿用现有版本继续部署"
+  fi
 else
   mkdir -p "$(dirname $APP_DIR)"
-  git clone --depth 1 "$REPO_URL" "$APP_DIR" --quiet
-  ok "已克隆到 $APP_DIR"
+  if git clone --depth 1 "$REPO_URL" "$APP_DIR" --quiet 2>/dev/null; then
+    ok "已克隆到 $APP_DIR"
+  else
+    warn "克隆源码失败，跳过（镜像已载入，不影响启动）"
+  fi
 fi
+set -e
 
 # ------------------------------------------------------------
 log "3/5 写入凭据"
 # ------------------------------------------------------------
-[[ -f $ENV_SRC ]] || die "找不到凭据文件 $ENV_SRC"
-install -m 600 "$ENV_SRC" "$APP_DIR/.env"
-ok ".env 已就位（权限 600）"
-# 部署用的凭据副本用完就删，避免在 /root 下多留一份
-shred -u "$ENV_SRC" 2>/dev/null || rm -f "$ENV_SRC"
+# 这个脚本要支持两种场景：
+#   首次部署 —— 凭据由 /root/secagent.env 提供，装完就删掉副本
+#   重复部署 —— 凭据已经在 $APP_DIR/.env 里了，不该也不需要重新提供
+# 初版只处理了第一种，导致第二次部署直接 die 在「找不到凭据文件」上。
+if [[ -f $ENV_SRC ]]; then
+  install -m 600 "$ENV_SRC" "$APP_DIR/.env"
+  ok ".env 已更新（权限 600）"
+  # 部署用的凭据副本用完就删，避免在 /root 下多留一份
+  shred -u "$ENV_SRC" 2>/dev/null || rm -f "$ENV_SRC"
+elif [[ -f $APP_DIR/.env ]]; then
+  chmod 600 "$APP_DIR/.env"
+  ok ".env 已存在，沿用（权限已校正为 600）"
+else
+  die "既没有 $ENV_SRC 也没有 $APP_DIR/.env，无法确定凭据"
+fi
 
 # ------------------------------------------------------------
 log "4/5 启动服务"
