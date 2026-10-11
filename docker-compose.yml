@@ -55,7 +55,7 @@ services:
       #   而隧道建在宿主机的 docker 网桥网关上（172.18.0.1），
       #   host.docker.internal 通过 host-gateway 正好指向那里。
       #   这样"容器能访问、公网访问不到"，也不用暴露任何端口。
-      WAZUH_URL: "${WAZUH_URL:-https://host.docker.internal:55000}"
+      WAZUH_URL: "${WAZUH_URL:-https://wazuh-tunnel:55000}"
       WAZUH_USER: "${WAZUH_USER:-wazuh-wui}"
       WAZUH_PASS: "${WAZUH_PASS:-}"
 
@@ -107,3 +107,53 @@ services:
       retries: 3
       # 低配机器上 Spring 上下文初始化需要 40~90 秒，给少了会被误判为不健康
       start_period: 120s
+
+  # ============================================================
+  # Wazuh 隧道 sidecar
+  # ------------------------------------------------------------
+  # 为什么把隧道做成容器，而不是在宿主机上开一条 SSH：
+  #
+  # 原来是在宿主机建 systemd 隧道，绑到 docker 网桥网关，
+  # 让容器通过 host.docker.internal 访问。折腾了很久都没通：
+  #   · host-gateway 解析成 docker0 网关（172.17.0.1），
+  #     而容器在 compose 网络（172.18.0.0/16）—— 两个网络之间无路由
+  #   · 改成绑容器自己的网关（172.18.0.1）后，抓包显示
+  #     容器的 SYN 到了宿主机，但没有 SYN-ACK 回来
+  #     （回程正常、rp_filter=0、iptables INPUT 无规则 —— 原因没查清）
+  #
+  # 结论：【不该让容器的出流量绕到宿主机再回来】。
+  # 把隧道放进同一个 compose 网络，SecAgent 直接连 wazuh-tunnel:55000，
+  # 就是普通的容器间通信 —— 从架构上就不会碰到宿主网络那些坑。
+  #
+  # 顺带的好处：
+  #   · 隧道和它所服务的应用在同一个 compose 里，启停一致
+  #   · 不用改宿主机防火墙、不用探测网关 IP、没有 IP 漂移问题
+  # ============================================================
+  wazuh-tunnel:
+    image: alpine:3.19
+    container_name: wazuh-tunnel
+    restart: unless-stopped
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        apk add --no-cache openssh-client >/dev/null 2>&1
+        exec ssh -NT \
+          -i /keys/tunnel_srv2_ed25519 \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          -o ExitOnForwardFailure=yes \
+          -o ServerAliveInterval=30 \
+          -o ServerAliveCountMax=3 \
+          -o ConnectTimeout=15 \
+          -L 0.0.0.0:55000:127.0.0.1:55000 \
+          root@43.143.114.79
+    volumes:
+      # 只读挂载专用隧道密钥（在服务器 2 上被限制为
+      # 只能转发 55000、不能执行任何命令）
+      - /root/.ssh/tunnel_srv2_ed25519:/keys/tunnel_srv2_ed25519:ro
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
