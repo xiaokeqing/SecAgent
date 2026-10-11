@@ -186,8 +186,17 @@ services:
       - "-L"
       - "0.0.0.0:9200:127.0.0.1:9200"
       - "root@43.143.114.79"
-      # 只读挂载专用隧道密钥（在服务器 2 上被限制为
-      # 只能转发 55000、不能执行任何命令）
+    # 只读挂载专用隧道密钥（在服务器 2 上被限制为
+    # 只能转发 55000、不能执行任何命令）
+    #
+    # 【必须写在这里，不能写成 command 的一项】
+    # 曾经它被误当成 command 列表的最后一项，YAML 语法完全合法、
+    # 容器也能起来，但密钥根本没挂进容器 —— 日志刷
+    # "Identity file /keys/tunnel_srv2_ed25519 not accessible"，
+    # 隧道崩溃循环 restart=65，SecAgent 于是静默降级成 MOCK 数据。
+    # 这类"语法合法、语义错位"的配置改错，只能靠运行态（docker inspect
+    # 的 Mounts）验证，不能靠看文件或 grep 判断。
+    volumes:
       - /root/.ssh/tunnel_srv2_ed25519:/keys/tunnel_srv2_ed25519:ro
     mem_limit: 64m
     logging:
