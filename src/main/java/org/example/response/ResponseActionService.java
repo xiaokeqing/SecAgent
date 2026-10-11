@@ -31,42 +31,57 @@ public class ResponseActionService {
     /** Wazuh 网关可能没有实现 Bean，缺失时自动降级 MOCK */
     private final ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider;
 
+    /**
+     * SSH 直连封禁执行器（处置的首选路径）。
+     *
+     * <p>这里**直接注入执行器本身**，而不是通过网关问"你能不能执行" ——
+     * 原因是我先前那版用 {@code gw instanceof WazuhService} 来判断，
+     * 结果一直走 MOCK 分支。问题是：<b>Spring 可能用代理包装 Bean，
+     * 此时 instanceof 会返回 false</b>，于是判断悄悄失效、又退回 MOCK，
+     * 而表面看不出任何异常。
+     * <p>
+     * 直接注入依赖对象、按类型检查，绕开代理对 instanceof 的影响。
+     * 用 ObjectProvider 是为了在没配置时也能正常启动（缺失即降级）。
+     */
+    private final ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider;
+
     public ResponseActionService(ResponseGuard responseGuard,
                                  AuditService auditService,
                                  BlockRecordStore blockRecordStore,
-                                 ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider) {
+                                 ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
+                                 ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider) {
         this.responseGuard = responseGuard;
         this.auditService = auditService;
         this.blockRecordStore = blockRecordStore;
         this.wazuhGatewayProvider = wazuhGatewayProvider;
+        this.sshBlockProvider = sshBlockProvider;
     }
 
     /**
      * 处置通道是否可用。
      *
      * <h3>这里修的是一个"判据过时"的 bug</h3>
-     * 原来的实现是 {@code gw.isAvailable()} —— 它的语义是
+     * 原来的实现是 {@code gw.isAvailable()} —— 语义是
      * "Wazuh 管理 API 连上了吗"。但处置现在**已经不走 Wazuh API 了**
-     * （AR 投递链路在这套环境里走不通，改用 SSH 直连）。
-     * 于是出现一个很隐蔽的情况：
-     * <b>链路明明是通的、脚本手工执行能封，但业务代码判断"不可用"，
-     * 直接走了 MOCK 分支</b> —— 表现就是 "已封禁 …（MOCK 模拟）"。
+     * （AR 投递链路不通，改用 SSH 直连）。
+     * 于是出现很隐蔽的情况：
+     * <b>链路明明是通的、脚本手工执行能封，业务代码却判断"不可用"，
+     * 直接走 MOCK 分支</b> —— 表现就是 "已封禁 …（MOCK 模拟）"。
      * <p>
-     * 这类 bug 的特点是：<b>判据和实际执行方式脱节了</b>。
-     * 改了一半（执行方式换了）没改另一半（可用性判据），
-     * 两边就不一致了。所以这里改成问网关一个专门的问题：
-     * "你能不能真的执行处置动作"，而不是复用一个语义不同的方法。
+     * 教训：改执行路径时，必须同时检查
+     * "有哪些地方在判断这条路可不可用"，否则两边不一致，
+     * 而且表现是【成功 + 假数据】，最难发现。
      */
     private boolean wazuhReady() {
         try {
+            // 1) 首选：SSH 直连可用就能处置（不依赖 Wazuh API）
+            org.example.integration.wazuh.SshBlockExecutor ssh = sshBlockProvider.getIfAvailable();
+            if (ssh != null && ssh.isEnabled()) {
+                return true;
+            }
+            // 2) 退回：Wazuh API 通道
             org.example.integration.WazuhGateway gw = wazuhGatewayProvider.getIfAvailable();
-            if (gw == null) {
-                return false;
-            }
-            if (gw instanceof org.example.integration.wazuh.WazuhService) {
-                return ((org.example.integration.wazuh.WazuhService) gw).isResponseCapable();
-            }
-            return gw.isAvailable();
+            return gw != null && gw.isAvailable();
         } catch (Exception e) {
             return false;
         }
