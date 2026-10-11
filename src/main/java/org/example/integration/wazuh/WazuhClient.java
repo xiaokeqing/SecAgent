@@ -188,6 +188,42 @@ public class WazuhClient {
         }
     }
 
+    /**
+     * indexer（<b>告警真正的存放处</b>）是否可达且凭据有效。
+     *
+     * <h3>为什么探测必须包含它</h3>
+     * {@link #testConnection()} 只登录管理 API（55000），而告警<b>不在管理 API 里</b>
+     * —— 那个查询端点根本不存在。于是会出现这种最坏的情况：
+     * 管理 API 通了 → 模式报 REAL，但取告警的链路（独立端口 9200、独立凭据）坏了，
+     * 页面就变成"有模式、没数据"，而且看不出来是哪一端的问题。
+     * <p>
+     * 判据必须覆盖<b>实际用到的那条链路</b>，否则它只是一个安慰性的绿灯。
+     *
+     * @return true 表示 indexer 可达且鉴权通过；未配置时返回 false
+     *         （未配置 indexer 就等于没有真实告警来源，不该报 REAL）
+     */
+    public boolean indexerReachable() {
+        if (indexerUrl == null || indexerHttp == null) {
+            logger.info("未配置 Wazuh indexer 地址，真实告警来源不存在");
+            return false;
+        }
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .get()
+                .build();
+        try (Response resp = indexerHttp.newCall(req).execute()) {
+            boolean ok = resp.isSuccessful();
+            if (!ok) {
+                logger.info("Wazuh indexer 探测失败：HTTP {}（{}）", resp.code(), indexerUrl);
+            }
+            return ok;
+        } catch (IOException e) {
+            logger.info("Wazuh indexer 探测异常：{}（{}）", e.getMessage(), indexerUrl);
+            return false;
+        }
+    }
+
     // ==================== 通用 GET / PUT ====================
 
     /**

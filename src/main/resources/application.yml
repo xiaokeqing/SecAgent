@@ -206,6 +206,15 @@ integration:
     indexer-url: ${WAZUH_INDEXER_URL:}
     indexer-username: ${WAZUH_INDEXER_USER:admin}
     indexer-password: ${WAZUH_INDEXER_PASS:}
+    # ===== 数据链路周期性重探（自愈）=====
+    # 为什么需要：原来只在启动时探测一次，失败就把 available=false 一直缓存着。
+    # 而 docker compose up -d 会同时重启隧道和应用，隧道要 30 多秒才连上 ——
+    # 应用那次探测必然失败，于是"数据源 MOCK"一直挂到下一次重启，从外部看不出来。
+    # 实测事故：应用 13:55:16 启动、隧道 13:55:50 才起来，应用 13:55:23 探测失败。
+    # 现在每 60 秒重探一次（覆盖 manager 登录 + indexer 可达两个条件），
+    # REAL/MOCK 的每次切换都写日志。
+    reprobe-initial-delay-ms: 20000
+    reprobe-interval-ms: 60000
 
     # ===== 处置执行方式：SSH 直连封禁 =====
     # Wazuh 的 active-response 投递在这套环境里走不通（配置全对、API 报成功、

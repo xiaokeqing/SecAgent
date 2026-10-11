@@ -14,7 +14,10 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
+import org.springframework.scheduling.annotation.Scheduled;
+
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -82,15 +85,76 @@ public class WazuhService implements WazuhGateway {
         try {
             this.client = new WazuhClient(baseUrl, username, password, verifySsl, timeout,
                     indexerUrl, indexerUsername, indexerPassword);
-            this.available = client.testConnection();
+            this.available = probe();
             if (available) {
-                logger.info("Wazuh 已连接（REAL 模式）：{}", baseUrl);
+                logger.info("Wazuh 已连接（REAL 模式）：manager={}  indexer={}", baseUrl, indexerUrl);
             } else {
-                logger.warn("Wazuh 无法连接（{}），降级为内置样本（MOCK）", baseUrl);
+                logger.warn("Wazuh 数据链路不可用（manager={} indexer={}），本次降级为内置样本（MOCK）；"
+                        + "后台会周期性重探，恢复后自动切回 REAL", baseUrl, indexerUrl);
             }
         } catch (Exception e) {
             this.available = false;
             logger.warn("Wazuh 初始化异常，降级为内置样本（MOCK）：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 探测「能不能取到真实告警」。
+     *
+     * <p>两个条件都要满足，缺一不算 REAL：
+     * <ol>
+     *   <li>管理 API 能登录 —— 取证日志走这条路；</li>
+     *   <li><b>indexer 可达且鉴权通过</b> —— 告警真正存放的地方。</li>
+     * </ol>
+     * 只测第 1 条会给出一个安慰性的绿灯：管理 API 通、取告警的链路断了，
+     * 页面就变成「有模式、没数据」，而且看不出是哪一端的问题。
+     */
+    private boolean probe() {
+        if (client == null) {
+            return false;
+        }
+        boolean manager = client.testConnection();
+        boolean indexer = client.indexerReachable();
+        if (!manager) {
+            logger.warn("Wazuh 管理 API 不可达：{}", baseUrl);
+        }
+        if (!indexer) {
+            logger.warn("Wazuh indexer 不可达：{}（取不到真实告警，不能报 REAL）", indexerUrl);
+        }
+        return manager && indexer;
+    }
+
+    /**
+     * 周期性重新探测数据链路 —— <b>让「不可达」能自愈</b>。
+     *
+     * <h3>为什么必须有它（一次真实事故）</h3>
+     * 原来只在启动时探测一次，失败就把 {@code available=false} 一直缓存着。
+     * 而线上部署时 {@code docker compose up -d} 会<b>同时</b>重启隧道和应用：
+     * 隧道要 30 多秒才连上，应用那次探测必然失败 ——
+     * 实测日志：应用 13:55:16 启动、隧道 13:55:50 才起来，应用 13:55:23 探测失败，
+     * 于是「数据源 MOCK」一直挂到下一次重启，从外部完全看不出来。
+     * <p>
+     * 启动时序靠运气的问题不该靠「记得先起隧道」解决，系统应该自己恢复。
+     * 这里每 60 秒重探一次，REAL/MOCK 的每次切换都留日志。
+     */
+    @Scheduled(initialDelayString = "${integration.wazuh.reprobe-initial-delay-ms:20000}",
+               fixedDelayString = "${integration.wazuh.reprobe-interval-ms:60000}")
+    public void reprobe() {
+        if (!enabled || client == null) {
+            return;
+        }
+        boolean was = available;
+        try {
+            available = probe();
+        } catch (Exception e) {
+            available = false;
+            logger.warn("Wazuh 重新探测异常：{}", e.getMessage());
+        }
+        if (available && !was) {
+            logger.info("Wazuh 数据链路已恢复：模式 MOCK -> REAL（manager={} indexer={}）", baseUrl, indexerUrl);
+        } else if (!available && was) {
+            logger.warn("Wazuh 数据链路断开：模式 REAL -> MOCK。"
+                    + "对外页面会如实显示「数据源不可用」，不会拿内置样本填充", baseUrl);
         }
     }
 
@@ -471,25 +535,14 @@ public class WazuhService implements WazuhGateway {
         return (s == null || s.isEmpty()) ? dflt : s;
     }
 
-    /** Wazuh 时间多为 ISO8601（如 2026-09-29T10:20:30.000Z），统一转成 yyyy-MM-dd HH:mm:ss。 */
+    /**
+     * Wazuh 时间 → <b>本地时区</b>的 yyyy-MM-dd HH:mm:ss。
+     *
+     * <p>实现与事故说明见 {@link WazuhTime}（抽出去是为了能用固定时区写断言 ——
+     * 依赖 JVM 默认时区的测试会在别的机器上飘，而会飘的测试最终一定会被忽略）。
+     */
     private static String normalizeTime(String iso) {
-        if (iso == null || iso.isBlank()) {
-            return LocalDateTime.now().format(FMT);
-        }
-        try {
-            String s = iso.trim();
-            // 兼容带时区的 ISO
-            if (s.contains("T")) {
-                s = s.replace('T', ' ');
-            }
-            // 去掉毫秒和时区后缀
-            int dot = s.indexOf('.');
-            if (dot > 0) s = s.substring(0, dot);
-            s = s.replaceAll("[Zz]\\s*$", "").trim();
-            return LocalDateTime.parse(s, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")).format(FMT);
-        } catch (Exception e) {
-            return iso;
-        }
+        return WazuhTime.toLocal(iso, ZoneId.systemDefault());
     }
 
     private static String snippet(String s) {
