@@ -79,3 +79,7 @@ docs/internal/
 *.tmp
 *.swp
 *~
+_backups/
+_deploy/
+*.tar.gz
+*.hprof
