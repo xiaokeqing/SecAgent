@@ -58,8 +58,33 @@ public class AlertBoardController {
     private List<SecurityAlert> mergedAlerts(int limit) {
         int want = Math.min(Math.max(limit, 1), FETCH_LIMIT);
         List<SecurityAlert> merged = new ArrayList<>();
-        merged.addAll(safeGet(wazuh, want));
-        merged.addAll(safeGet(suricata, want));
+
+        // 【fail-closed：MOCK 的数据不进真实告警流】
+        //
+        // 这两个网关连不上时都会返回"内置可演示样本"，样本长得很像真的
+        // （SSH 暴力破解、SQL 注入、Webshell…），IP 用的是 203.0.113.x 这类
+        // 文档保留地址。原来无条件合并，于是页面上真告警和假样本混在一条流里，
+        // 只看界面完全看不出来 —— 而"看着成功、实际没做"是这个项目吃得最多的亏。
+        //
+        // 现在的口径：哪个源是 MOCK，就把它的样本整体剔除；
+        // 当期的数据源模式照旧通过 wazuhMode / suricataMode 如实返回，
+        // 前端据此显示"某某数据源不可用"，而不是拿假数据把版面填满。
+        boolean wazuhReal = isReal(wazuh.mode());
+        boolean suricataReal = isReal(suricata.mode());
+
+        if (wazuhReal) {
+            merged.addAll(safeGet(wazuh, want));
+        } else {
+            logger.warn("WazuhGATEWAY=MOCK：内置样本已从告警流中剔除（fail-closed），"
+                    + "当期不展示伪造的主机告警");
+        }
+        if (suricataReal) {
+            merged.addAll(safeGet(suricata, want));
+        } else {
+            logger.info("SuricataGateway=MOCK：eve.json 样本已剔除。"
+                    + "注：网络告警的真实数据经 Wazuh agent 采集后随 indexer 一起返回，"
+                    + "来源已在 WazuhService.classifySource() 里判为 SURICATA");
+        }
 
         // 按 id 去重（同一事件在两个来源重复出现时只保留一条）
         Map<String, SecurityAlert> byId = new LinkedHashMap<>();
@@ -70,6 +95,11 @@ public class AlertBoardController {
         list.sort(Comparator.comparing(SecurityAlert::getOccurredAt,
                 Comparator.nullsLast(Comparator.reverseOrder())));
         return list;
+    }
+
+    /** 数据源模式是否是真数据。只有 REAL 才算，其余（MOCK / null）一律不信。 */
+    private static boolean isReal(String mode) {
+        return mode != null && "REAL".equalsIgnoreCase(mode.trim());
     }
 
     /**

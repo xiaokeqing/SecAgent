@@ -189,9 +189,9 @@ public class WazuhService implements WazuhGateway {
             SecurityAlert a = new SecurityAlert(
                     text(n.path("id"), text(n.path("_id"), "wz-" + out.size())),
                     desc,
-                    AlertSeverity.parse(levelRaw),
+                    AlertSeverity.fromWazuhLevel(levelRaw),
                     AlertType.guess(ruleName + " " + desc),
-                    AlertSource.WAZUH);
+                    classifySource(n));
             a.setRuleName(ruleName);
             a.setSrcIp(srcIp);
             a.setDstIp(dstIp);
@@ -203,6 +203,41 @@ public class WazuhService implements WazuhGateway {
             out.add(a);
         }
         return out;
+    }
+
+    /**
+     * 判定这条 indexer 告警的<b>真实来源</b>。
+     *
+     * <h3>修的是什么</h3>
+     * 原实现把从 indexer 取回的每一条都硬编码成 {@link AlertSource#WAZUH}。
+     * 但 indexer 的 {@code wazuh-alerts-*} 是<b>所有检测器的汇总</b> ——
+     * Wazuh agent 会把服务器 2 上 Suricata 的 {@code eve.json} 也读进去，
+     * 所以索引里绝大部分文档其实是<b>网络告警</b>。
+     * <p>
+     * 实测（2026-10-11 线上）：全库 7415 条里 {@code rule.groups} 含 suricata 的
+     * 有 6633 条；取最新 200 条分类后是
+     * <b>Suricata 154 条 / 蜜罐 8 条 / 主机侧 38 条</b>。
+     * 也就是说告警大屏上那个"Wazuh 主机告警 200 条"里，
+     * 有四分之三根本不是主机告警 —— 来源分布图等于在骗人。
+     * <p>
+     * 顺带说明为什么这也解释了"网络告警为什么只有 5 条"：
+     * 那 5 条来自 {@code SuricataService} 读 {@code /var/log/suricata/eve.json}
+     * 的内置样本路径（那个文件在服务器 2，容器里根本没有），
+     * 真数据 6633 条反而被算进了 Wazuh 那一栏。
+     *
+     * @param n indexer 命中的文档（_source）
+     * @return SURICATA（网络层）/ WAZUH（主机侧、蜜罐等一切非 Suricata 来源）
+     */
+    private static AlertSource classifySource(JsonNode n) {
+        JsonNode groups = n.path("rule").path("groups");
+        if (groups.isArray()) {
+            for (JsonNode g : groups) {
+                if (g.asText("").toLowerCase().contains("suricata")) {
+                    return AlertSource.SURICATA;
+                }
+            }
+        }
+        return AlertSource.WAZUH;
     }
 
     // ==================== 取证日志 ====================
