@@ -47,17 +47,61 @@ public class WazuhClient {
     private final int timeoutSeconds;
     private final ObjectMapper mapper = new ObjectMapper();
 
+    /**
+     * Wazuh indexer（OpenSearch）地址与凭据。
+     *
+     * <h3>为什么需要第二个地址</h3>
+     * 告警【不在 Wazuh 管理 API 里】。管理 API（55000）提供的是
+     * agents / manager 日志 / active-response 这些运维接口，
+     * <b>没有任何查询告警的端点</b> —— 实测 {@code /security/alerts}
+     * 返回 404，而这个项目原来的代码正是在调它，
+     * 所以"真实告警"从来没取到过，界面上显示的永远是内置样本。
+     * <p>
+     * 告警实际存在 indexer（OpenSearch，9200）的
+     * {@code wazuh-alerts-*} 索引里。要拿真实数据，必须查那里。
+     */
+    private final String indexerUrl;
+    private final String indexerAuthHeader;
+    private final OkHttpClient indexerHttp;
+
     private final OkHttpClient http;
     private volatile String cachedToken;
 
     public WazuhClient(String baseUrl, String username, String password,
                        boolean verifySsl, int timeoutSeconds) {
+        this(baseUrl, username, password, verifySsl, timeoutSeconds, null, null, null);
+    }
+
+    /**
+     * 完整构造：额外给出 indexer 地址与凭据。
+     *
+     * @param indexerUrl      形如 https://wazuh-indexer:9200；为 null 表示不接真实告警
+     * @param indexerUser     indexer 用户名
+     * @param indexerPassword indexer 口令
+     */
+    public WazuhClient(String baseUrl, String username, String password,
+                       boolean verifySsl, int timeoutSeconds,
+                       String indexerUrl, String indexerUser, String indexerPassword) {
         this.baseUrl = trimTrailingSlash(baseUrl);
         this.authHeader = "Basic " + Base64.getEncoder()
                 .encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
         this.verifySsl = verifySsl;
         this.timeoutSeconds = Math.max(timeoutSeconds, 3);
         this.http = buildClient();
+
+        this.indexerUrl = (indexerUrl == null || indexerUrl.isBlank())
+                ? null : trimTrailingSlash(indexerUrl.trim());
+        this.indexerAuthHeader = (indexerUser == null)
+                ? null
+                : "Basic " + Base64.getEncoder()
+                        .encodeToString((indexerUser + ":" + (indexerPassword == null ? "" : indexerPassword))
+                                .getBytes(StandardCharsets.UTF_8));
+        this.indexerHttp = (this.indexerUrl == null) ? null : buildClient();
+        if (this.indexerUrl != null) {
+            logger.info("Wazuh 告警改用 indexer 查询：{}", this.indexerUrl);
+        } else {
+            logger.warn("未配置 Wazuh indexer 地址 —— 无法获取真实告警，将使用内置样本");
+        }
     }
 
     private static String trimTrailingSlash(String s) {
@@ -210,12 +254,47 @@ public class WazuhClient {
     // ==================== 业务接口封装 ====================
 
     /**
-     * 拉取近期告警。Wazuh 4.x 告警接口返回结构可能是
-     * {data:{affected_items:[...]}} 或 {data:[...]}，这里两种都兼容。
+     * 拉取近期告警 —— <b>从 indexer（OpenSearch）查，不是从管理 API</b>。
+     *
+     * <h3>这里修的是一个长期存在的根本性 bug</h3>
+     * 原实现调 {@code GET /security/alerts}。<b>这个端点在 Wazuh 里不存在</b>
+     * （实测返回 404，管理 API 也没有任何查询告警的端点）。
+     * 后果是：连接明明成功（隧道通、JWT 登录成功、mode 显示 REAL），
+     * 但每次取告警都抛异常 → 上层 catch 里回退到内置样本 →
+     * <b>界面上显示的告警从头到尾都是假的</b>。
+     * <p>
+     * 而"假数据看起来很像真的"（SSH 暴力破解、SQL 注入、Webshell……），
+     * 所以这个 bug 藏了很久才被发现。
+     * <p>
+     * 告警的真实位置：indexer 的 {@code wazuh-alerts-*} 索引。
+     * 返回结构是 OpenSearch 的 <code>{hits:{hits:[{_source:{...}}]}}</code>，
+     * 和原来按 Wazuh API 结构解析的代码不兼容 —— 上层 mapRealAlerts
+     * 已经相应加了 _source 的处理。
+     *
+     * @param limit 最多返回多少条
+     * @return OpenSearch 的 _search 响应
+     * @throws IOException indexer 不可达或未配置
      */
     public JsonNode fetchAlerts(int limit) throws IOException {
-        String path = "/security/alerts?limit=" + Math.max(1, limit) + "&sort=-timestamp";
-        return getJson(path);
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址（integration.wazuh.indexer-url）—— "
+                    + "告警不在管理 API 里，必须从 indexer 查询");
+        }
+        int size = Math.max(1, limit);
+        // 排序用 @timestamp：Wazuh 写入 indexer 时就是这么命名的
+        String path = "/wazuh-alerts-*/_search?size=" + size + "&sort=@timestamp:desc";
+        Request req = new Request.Builder()
+                .url(indexerUrl + path)
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .get()
+                .build();
+        try (Response resp = indexerHttp.newCall(req).execute()) {
+            String body = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 查询告警失败 HTTP " + resp.code() + ": " + snippet(body));
+            }
+            return mapper.readTree(body);
+        }
     }
 
     /** 拉取 manager 日志（取证用）。 */

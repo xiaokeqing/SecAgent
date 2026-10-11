@@ -49,6 +49,20 @@ public class WazuhService implements WazuhGateway {
     private boolean verifySsl;
     @Value("${integration.wazuh.timeout:10}")
     private int timeout;
+    /**
+     * Wazuh indexer（OpenSearch）地址 —— 告警真正存放的地方。
+     *
+     * 为什么单独一个配置项而不是复用 base-url：
+     *   管理 API（55000）和 indexer（9200）是两个不同的服务、端口、凭据。
+     *   而【管理 API 里根本没有查询告警的端点】，只配 base-url 拿不到真实告警
+     *   —— 这正是那个"界面上永远是内置样本"的 bug 的根因。
+     */
+    @Value("${integration.wazuh.indexer-url:}")
+    private String indexerUrl;
+    @Value("${integration.wazuh.indexer-username:admin}")
+    private String indexerUsername;
+    @Value("${integration.wazuh.indexer-password:}")
+    private String indexerPassword;
     @Value("${integration.wazuh.active-response-enabled:true}")
     private boolean activeResponseEnabled;
 
@@ -62,7 +76,8 @@ public class WazuhService implements WazuhGateway {
             return;
         }
         try {
-            this.client = new WazuhClient(baseUrl, username, password, verifySsl, timeout);
+            this.client = new WazuhClient(baseUrl, username, password, verifySsl, timeout,
+                    indexerUrl, indexerUsername, indexerPassword);
             this.available = client.testConnection();
             if (available) {
                 logger.info("Wazuh 已连接（REAL 模式）：{}", baseUrl);
@@ -100,32 +115,59 @@ public class WazuhService implements WazuhGateway {
         return builtinAlerts(limit);
     }
 
-    /** 把 Wazuh /security/alerts 返回的 JSON 规整为 SecurityAlert。 */
+    /**
+     * 把取回的 JSON 规整为 SecurityAlert。
+     *
+     * <h3>两种返回结构都要认</h3>
+     * <ul>
+     *   <li><b>OpenSearch（现在走的就是这条）</b>：
+     *       {@code {hits:{hits:[{_id:..., _source:{@timestamp, rule:{...}, agent:{...}}}]}}}
+     *       —— 真实告警在 {@code _source} 里，时间字段叫 {@code @timestamp}</li>
+     *   <li>Wazuh 管理 API 风格：{@code {data:{affected_items:[...]}}}
+     *       —— 保留兼容</li>
+     * </ul>
+     * 原实现只认第二种。<b>换了数据源但不换解析逻辑，等于没换</b> ——
+     * 所以这次两件事必须一起改。
+     */
     private List<SecurityAlert> mapRealAlerts(JsonNode root, int limit) {
         List<SecurityAlert> out = new ArrayList<>();
-        JsonNode items = root.path("data").path("affected_items");
-        if (items.isMissingNode() || !items.isArray()) {
-            items = root.path("data");
+
+        // 先认 OpenSearch 的 hits.hits[]._source
+        List<JsonNode> nodes = new ArrayList<>();
+        JsonNode hits = root.path("hits").path("hits");
+        if (hits.isArray()) {
+            for (JsonNode h : hits) {
+                JsonNode src = h.path("_source");
+                nodes.add((src.isMissingNode() || src.isNull()) ? h : src);
+            }
+        } else {
+            JsonNode items = root.path("data").path("affected_items");
+            if (!items.isArray()) {
+                items = root.path("data");
+            }
+            if (items.isArray()) {
+                for (JsonNode n : items) {
+                    nodes.add(n);
+                }
+            }
         }
-        if (!items.isArray()) {
-            items = root.path("data").path("hits");
-        }
-        if (!items.isArray()) {
-            return out;
-        }
-        for (JsonNode n : items) {
+
+        for (JsonNode n : nodes) {
             if (out.size() >= limit) break;
-            String ruleName = text(n.path("rule").path("name"), text(n.path("rule").path("id"), "wazuh-alert"));
-            String levelRaw = text(n.path("rule").path("level"), "2");
-            String ts = text(n.path("timestamp"), "");
+            JsonNode rule = n.path("rule");
+            String ruleName = text(rule.path("description"),
+                    text(rule.path("name"), text(rule.path("id"), "wazuh-alert")));
+            String levelRaw = text(rule.path("level"), "2");
+            // indexer 里时间字段是 @timestamp；管理 API 风格是 timestamp
+            String ts = text(n.path("@timestamp"), text(n.path("timestamp"), ""));
             String srcIp = text(n.path("data").path("srcip"), text(n.path("data").path("src_ip"), ""));
             String dstIp = text(n.path("agent").path("ip"), "");
             String dstAsset = text(n.path("agent").path("name"), dstIp);
-            String desc = text(n.path("data").path("description"), text(n.path("description"), ruleName));
+            String desc = ruleName;
             String raw = text(n.path("full_log"), n.toString());
 
             SecurityAlert a = new SecurityAlert(
-                    text(n.path("id"), "wz-" + out.size()),
+                    text(n.path("id"), text(n.path("_id"), "wz-" + out.size())),
                     desc,
                     AlertSeverity.parse(levelRaw),
                     AlertType.guess(ruleName + " " + desc),

@@ -58,6 +58,10 @@ services:
       WAZUH_URL: "${WAZUH_URL:-https://wazuh-tunnel:55000}"
       WAZUH_USER: "${WAZUH_USER:-wazuh-wui}"
       WAZUH_PASS: "${WAZUH_PASS:-}"
+      # 告警数据源：indexer（OpenSearch）。详见 application.yml 的说明。
+      WAZUH_INDEXER_URL: "${WAZUH_INDEXER_URL:-}"
+      WAZUH_INDEXER_USER: "${WAZUH_INDEXER_USER:-admin}"
+      WAZUH_INDEXER_PASS: "${WAZUH_INDEXER_PASS:-}"
 
       # ---------- 对外 Demo 的调参 ----------
       # 用 SPRING_APPLICATION_JSON 显式覆盖，避免依赖环境变量与
@@ -155,6 +159,7 @@ services:
       - "ConnectTimeout=15"
       - "-L"
       - "0.0.0.0:55000:127.0.0.1:55000"
+      - "0.0.0.0:9200:127.0.0.1:9200"
       - "root@43.143.114.79"
     volumes:
       # 只读挂载专用隧道密钥（在服务器 2 上被限制为

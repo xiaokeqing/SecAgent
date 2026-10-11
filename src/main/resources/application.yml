@@ -187,6 +187,14 @@ integration:
     verify-ssl: false                      # 本地自签证书默认不校验
     timeout: 10
     active-response-enabled: true          # 是否允许真实下发 active-response；false 时只模拟
+      # ===== 告警数据源（indexer）=====
+      # 【为什么必须有】管理 API(55000) 里没有查询告警的端点（实测 /security/alerts 返回 404）。
+      # 告警实际存在 indexer(9200) 的 wazuh-alerts-* 索引里。
+      # 原来只配 base-url，所以永远取不到真实告警，界面上一律回退到内置样本 ——
+      # 而内置样本长得很像真的，所以这个问题藏了很久才被发现。
+      indexer-url: ${WAZUH_INDEXER_URL:}
+      indexer-username: ${WAZUH_INDEXER_USER:admin}
+      indexer-password: ${WAZUH_INDEXER_PASS:}
   # ===== Suricata 网络告警对接（读取 eve.json） =====
   suricata:
     enabled: true
