@@ -1,0 +1,130 @@
+name: CI
+
+# 什么时候跑：
+#   · 推到 main —— 保证主干永远是绿的
+#   · 任何 PR —— 合并前拦住退化
+#   · 手动触发 —— 需要时重跑
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支的旧运行自动取消，避免排队堆积
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================================
+  # 1. 密钥扫描
+  # ----------------------------------------------------------
+  # 为什么单独一个 job 而且排在最先：
+  #   这是唯一一个「一旦出事就不可逆」的检查。
+  #   代码写错可以改、测试挂可以修，但真实密钥一旦进了 git 历史，
+  #   即使后来删除也还在历史里 —— 只能改写历史 + 轮换密钥，
+  #   而这两个动作的代价都很大。
+  #
+  #   对安全方向的项目来说，公开仓库里有凭据是致命伤。
+  #   所以这道关卡要跑得最快、最先失败。
+  #
+  # 说明：本项目仓库里确实有一些"长得像密钥"的字符串，
+  #   但它们是 DLP 检测器的测试样例（要测"能不能识别出 AK"，
+  #   就得有个长得像 AK 的字符串）。全部是 AbcDefGhiJklmn 这类
+  #   明显构造的值，见 .gitleaks.toml 里的 allowlist。
+  # ==========================================================
+  secret-scan:
+    name: 密钥扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 扫描需要完整历史：只扫当前工作区会漏掉
+          # "曾经提交过、后来删掉"的密钥 —— 而那种恰恰是最危险的，
+          # 因为它看起来已经删干净了。
+          fetch-depth: 0
+
+      - name: gitleaks 扫描
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================
+  # 2. 单元测试
+  # ----------------------------------------------------------
+  # 43 个测试，全部是纯逻辑（凭据校验 / 路径安全 / 敏感内容扫描 /
+  # 提示注入边界 / 处置护栏白名单 / 存储可写性），不依赖外部服务。
+  # ==========================================================
+  unit-tests:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: 运行单元测试
+        run: mvn -B test
+
+      # 失败时把测试报告传上来，不然只能看日志猜哪条挂了
+      - name: 上传测试报告（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+  # ==========================================================
+  # 3. 红队评测离线回归
+  # ----------------------------------------------------------
+  # 为什么单独一个 job 而不是并进单元测试：
+  #   它要真启动一个 Spring Boot 实例、等健康检查、跑 27 例评测，
+  #   耗时和失败原因都和单元测试完全不同。分开能让「是逻辑错还是行为错」
+  #   一眼看出来。
+  #
+  # 为什么值得做：
+  #   红队评测原来是「手点一下看个数」，改完安全组件没人知道有没有退化。
+  #   没有自动重跑的地方，评测就只是一次性表演 ——
+  #   这个 job 让「绕过数不能变多、误报率不能上升」变成硬性关卡。
+  #
+  # 覆盖边界（必须说清楚，别让"CI 全绿"被理解成"全链路有保障"）：
+  #   离线模式不配模型 Key，2 例需要模型的用例自动 SKIPPED，
+  #   剩下 25 例覆盖规则类防护。那 2 例走模型的路径 CI 测不到。
+  #   不带 Key 是刻意的 —— 花钱和网络抖动都不该进 CI。
+  # ==========================================================
+  red-team-regression:
+    name: 红队评测回归
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      - name: 打包（跳过测试，测试已在上一个 job 跑过）
+        run: mvn -B -DskipTests package
+
+      - name: 运行红队回归
+        run: bash scripts/eval-regression.sh target/sec-agent-1.0-SNAPSHOT.jar
+
+      # 失败时把应用日志留着，方便判断是哪条用例退化了
+      - name: 上传失败现场（应用日志）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: redteam-failure-context
+          path: /tmp/eval-app.log
+          retention-days: 7
+          if-no-files-found: ignore

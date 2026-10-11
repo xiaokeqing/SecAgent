@@ -1,0 +1,41 @@
+# gitleaks 配置
+# ------------------------------------------------------------
+# 这个仓库里确实有一些"长得像密钥"的字符串，但它们【全部是测试样例】：
+#   · DLP 检测器要测"能不能识别出阿里云 AccessKey"，
+#     就必须有一个长得像 AK 的字符串 —— 否则测不了。
+#   · 值是 LTAI5t7abcdefghijklmnop / LTAI5tAbcDefGhiJklmn12345 这类
+#     明显构造的（顺序字母、驼峰单词），不是真实凭据。
+#
+# 所以这里用 allowlist 放行这几个【具体文件里的具体模式】，
+# 而不是全局关掉 AK 检测 —— 后者会让真正的密钥也漏过去。
+#
+# 为什么不禁用规则、只放行文件：
+#   如果全局禁掉 aliyun-access-token 规则，那以后真的有人误提交了一个
+#   真实 AK，CI 也不会报。放行范围越窄越好。
+
+title = "SecAgent gitleaks 配置"
+
+[extend]
+# 继承默认规则集，再叠加下面的放宽
+useDefault = true
+
+[allowlist]
+description = "DLP 检测器的测试样例（非真实凭据）"
+# 只放行这几个文件：它们是 DLP 测试数据所在之处
+paths = [
+  # 单元测试：验证 SensitiveContentScanner 能识别出各类敏感内容
+  '''src/test/java/org/example/security/SensitiveContentScannerTest\.java''',
+  # 红队评测用例：攻击载荷里包含"含密钥的文档"
+  '''src/main/java/org/example/eval/RedTeamEvalService\.java''',
+  # 文档与复现脚本：演示"上传含密钥的文档会被 DLP 拦截"
+  '''docs/02-.*\.md''',
+  '''docs/poc/.*''',
+]
+# 再加一层正则白名单：即使上面路径判断失效，这些明显构造的值也放行。
+# 判据是"一眼能看出是编的"：连续字母序列 / 驼峰单词 / 重复字符。
+regexes = [
+  # LTAI5t7abcdefghijklmnop（连续字母）、LTAI5tAbcDefGhiJklmn12345（驼峰单词）
+  '''LTAI5t[A-Za-z]{3}(abcdefghijklmnop|AbcDefGhiJklmn[0-9]+)''',
+  # PEM 私钥的测试样例：正文是省略号，不是真实的 base64 密钥体
+  '''MIIEpAIBAAK\.\.\.''',
+]
