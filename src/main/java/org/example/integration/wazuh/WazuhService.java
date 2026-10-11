@@ -66,6 +66,10 @@ public class WazuhService implements WazuhGateway {
     @Value("${integration.wazuh.active-response-enabled:true}")
     private boolean activeResponseEnabled;
 
+    /** SSH 直连封禁执行器（处置的首选路径，已端到端验证）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private SshBlockExecutor sshExecutor;
+
     private WazuhClient client;
     private volatile boolean available;
 
@@ -230,6 +234,35 @@ public class WazuhService implements WazuhGateway {
         String target = String.valueOf(arguments.getOrDefault("target", arguments.getOrDefault("ip", "-")));
         String auditId = "AR-" + System.currentTimeMillis();
 
+        // ==================== 处置路径 1：SSH 直连（默认，已验证可用）====================
+        //
+        // 为什么它排在 Wazuh API 前面：
+        //   Wazuh 的 active-response 投递链路在这套环境里走不通 ——
+        //   配置全对（命令注册、ar.conf 一致、agent 002 确认产生告警、
+        //   <expect>srcip</expect> 也加了），API 也报
+        //   "AR command was sent to all agents"，但 agent 就是不执行。
+        //   而封禁脚本手工执行 100% 有效。
+        //   所以换成一条我能端到端验证的链路：SSH forced command。
+        //   权限也更小：那把密钥只能封/解封 IP，开不了 shell。
+        if (sshExecutor != null && sshExecutor.isEnabled() && activeResponseEnabled) {
+            String action = ("unblock".equalsIgnoreCase(command) || "delete".equalsIgnoreCase(command))
+                    ? "delete" : "add";
+            try {
+                String out = sshExecutor.run(action, target);
+                logger.info("SSH 直连处置成功: {} {}（auditId={}）", action, target, auditId);
+                return ActiveResponseResult.real(command, target,
+                        "已通过 SSH 直连在防护主机上执行 " + action + " " + target + "：" + out,
+                        auditId);
+            } catch (Exception e) {
+                // 失败要如实上报，不能悄悄降级成"模拟成功"——
+                // 那正是这个项目反复踩过的"看着成功、实际没做"的坑。
+                logger.error("SSH 直连处置失败: {} {} -> {}", action, target, e.getMessage());
+                return ActiveResponseResult.failed(command, target,
+                        "SSH 直连处置失败（未生效）：" + e.getMessage());
+            }
+        }
+
+        // ==================== 处置路径 2：Wazuh API（保留但默认不用）====================
         boolean canReal = enabled && activeResponseEnabled && available && client != null;
         if (canReal) {
             try {
@@ -252,7 +285,7 @@ public class WazuhService implements WazuhGateway {
         // 降级：清楚标注是模拟
         String reason = !enabled ? "Wazuh 总开关未启用"
                 : !activeResponseEnabled ? "active-response-enabled=false（仅模拟）"
-                : "Wazuh 未连接真实服务（MOCK）";
+                : "未配置 SSH 直连且 Wazuh 未连接（MOCK）";
         return ActiveResponseResult.mock(command, target,
                 "【模拟处置】未真实下发：" + reason + "。演示命令=" + command + " 目标=" + target, auditId);
     }

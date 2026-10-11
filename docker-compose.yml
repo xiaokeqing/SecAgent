@@ -48,6 +48,13 @@ services:
       # 这样"忘了部署"（部署漂移）会自己暴露，不靠人记得。
       BUILD_SHA: "${BUILD_SHA:-unknown}"
       BUILD_TIME: "${BUILD_TIME:-unknown}"
+      # SSH 直连封禁（处置的首选路径）
+      BLOCK_SSH_ENABLED: "${BLOCK_SSH_ENABLED:-true}"
+      BLOCK_SSH_HOST: "${BLOCK_SSH_HOST:-43.143.114.79}"
+      BLOCK_SSH_PORT: "${BLOCK_SSH_PORT:-22}"
+      BLOCK_SSH_USER: "${BLOCK_SSH_USER:-root}"
+      BLOCK_SSH_KEY: "/opt/keys/secagent_block_ed25519"
+      BLOCK_SSH_KNOWN_HOSTS: "/opt/keys/known_hosts"
 
       # ===== 接真实 Wazuh（B3）=====
       # 为什么是 host.docker.internal 而不是 127.0.0.1：
@@ -90,6 +97,12 @@ services:
     # docker 网桥的网关 IP（172.18.0.1）在网络重建后会变，
     # 写死的话某天会静默失效 —— 而"连不上 Wazuh"在这个系统里
     # 会【自动降级成 MOCK】，页面照常显示，只是数据变成假的了。
+    volumes:
+      # 只读挂载封禁密钥。密钥【不进镜像】——
+      # 镜像会被 docker save/scp，甚至可能被推到仓库，
+      # 把私钥烘焙进去等于泄漏。运行时挂载 + 600 权限才是正确做法。
+      - /opt/secagent/keys:/opt/keys:ro
+
     extra_hosts:
       # 【不能写 host-gateway】它会解析成 docker0 默认网桥的网关（172.17.0.1），
       # 而本容器在 compose 自建网络上（172.18.0.0/16）——

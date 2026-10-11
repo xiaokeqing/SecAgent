@@ -51,7 +51,8 @@ RUN apt-get update \
       fonts-noto-cjk \
       ca-certificates \
       curl \
- && rm -rf /var/lib/apt/lists/* \
+        openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
  && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
  && echo "Asia/Shanghai" > /etc/timezone \
  && test -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
