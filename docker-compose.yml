@@ -86,6 +86,8 @@ services:
       TZ: Asia/Shanghai
 
     volumes:
+      # 只读挂载封禁密钥 —— 密钥不进镜像（镜像会被 save/scp，甚至可能推到仓库）
+      - /opt/secagent/keys:/opt/keys:ro
       # 运行数据持久化：向量库、审计留痕、封禁记录、评测结果
       - ./data:/app/data
       - ./uploads:/app/uploads
@@ -97,11 +99,6 @@ services:
     # docker 网桥的网关 IP（172.18.0.1）在网络重建后会变，
     # 写死的话某天会静默失效 —— 而"连不上 Wazuh"在这个系统里
     # 会【自动降级成 MOCK】，页面照常显示，只是数据变成假的了。
-    volumes:
-      # 只读挂载封禁密钥。密钥【不进镜像】——
-      # 镜像会被 docker save/scp，甚至可能被推到仓库，
-      # 把私钥烘焙进去等于泄漏。运行时挂载 + 600 权限才是正确做法。
-      - /opt/secagent/keys:/opt/keys:ro
 
     extra_hosts:
       # 【不能写 host-gateway】它会解析成 docker0 默认网桥的网关（172.17.0.1），
@@ -175,7 +172,6 @@ services:
       - "-L"
       - "0.0.0.0:9200:127.0.0.1:9200"
       - "root@43.143.114.79"
-    volumes:
       # 只读挂载专用隧道密钥（在服务器 2 上被限制为
       # 只能转发 55000、不能执行任何命令）
       - /root/.ssh/tunnel_srv2_ed25519:/keys/tunnel_srv2_ed25519:ro
