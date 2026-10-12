@@ -228,6 +228,24 @@ app:
     ttl-minutes: 120
     max: 1000
 
+  # ===== 出站客户端统一超时（C2）=====
+  # 【为什么必须统一】原来只有 LLM 通道有界（chat 15s / embedding 8s），
+  # 而 Wazuh 管理 API、Wazuh indexer、SSH 直连这几条出站链路各自读不同的配置项，
+  # 外部依赖挂起时会拖住请求线程（该项目真实发生过"模型不可用挂 180 秒"）。
+  # 现在三类链路共用下面这一组值，并由启动自检把"实际生效值"打进日志，便于事后核对。
+  #   connect 必须短：阻断出网时卡住的是 TCP 建连，且建连对线程中断无反应；
+  #   read    适中  ：等对端响应；
+  #   call    封顶  ：兜住"读超时之上还有重试/重定向"，且必须小于入口预算
+  #                  （/api/chat 25s、公开问答 20s），否则入口先被拖死。
+  # 熔断/冷却复用 OutboundGuard（有界等待 + 每依赖 60s 冷却 + 半开），见 app.outbound.default-cooldown-ms。
+  outbound:
+    connect-timeout-ms: 3000
+    read-timeout-ms: 12000
+    call-timeout-ms: 15000
+    # 出站守卫：单依赖在飞上限 / 默认冷却时长（毫秒）
+    max-inflight-per-dependency: 2
+    default-cooldown-ms: 60000
+
 # ===== Wazuh 主机安全平台对接 =====
 # Wazuh 仅作为"真实数据源 + 执行封禁的手"；研判/编排/护栏均在 SecAgent 内。
 # enabled=true 但连不上服务时，自动降级为内置样本（MOCK），保证开箱可演示。
@@ -238,7 +256,8 @@ integration:
     username: ${WAZUH_USER:wazuh}
     password: ${WAZUH_PASS:wazuh}
     verify-ssl: false                      # 本地自签证书默认不校验
-    timeout: 10
+    # 超时不再写在这里：管理 API 与 indexer 统一走 app.outbound.*（3s/12s/15s，
+    # 由 OutboundGuard 做有界等待与熔断冷却），避免"两个数各说各话"。
     active-response-enabled: true          # 是否允许真实下发 active-response；false 时只模拟
     # ===== 告警数据源（indexer）=====
     # 【为什么必须有】管理 API(55000) 里没有查询告警的端点（实测 /security/alerts 返回 404）。
@@ -270,7 +289,8 @@ integration:
         user: ${BLOCK_SSH_USER:root}
         key: ${BLOCK_SSH_KEY:/opt/keys/secagent_block_ed25519}
         known-hosts: ${BLOCK_SSH_KNOWN_HOSTS:/opt/keys/known_hosts}
-        timeout: ${BLOCK_SSH_TIMEOUT:15}
+        # connect/read/总预算不再单独配置：与 Wazuh 链路统一走 app.outbound.*
+        # （ConnectTimeout 取 connect 值、进程等待取 read 值、OutboundGuard 用 call 封顶）
   # ===== Suricata 网络告警对接（读取 eve.json） =====
   suricata:
     enabled: true

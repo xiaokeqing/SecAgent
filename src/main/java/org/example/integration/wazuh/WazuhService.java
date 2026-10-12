@@ -51,8 +51,24 @@ public class WazuhService implements WazuhGateway {
     private String password;
     @Value("${integration.wazuh.verify-ssl:false}")
     private boolean verifySsl;
-    @Value("${integration.wazuh.timeout:10}")
-    private int timeout;
+    /**
+     * 统一出站超时（connect 3s / read 12s / call 15s）。
+     *
+     * <p>原来这里有一个 {@code integration.wazuh.timeout:10}，管理 API 与 indexer 共用，
+     * 与 LLM 通道的 15s/8s 各说各话 —— 外部依赖挂起时无法解释"到底会等多久"。
+     * 现在三类出站链路统一走 {@code app.outbound.*}，并由启动自检把生效值打进日志。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.example.config.OutboundTimeouts outboundTimeouts;
+
+    /**
+     * 出站守卫：有界等待 + 每依赖 60s 冷却 + 半开。
+     *
+     * <p>与 embedding 通道复用同一个 Bean（不是另造一套）：一次超时后该依赖进入冷却，
+     * 期间立即失败，避免"一次请求里每个调用点各等一遍超时"的叠加。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.example.llm.OutboundGuard outboundGuard;
     /**
      * Wazuh indexer（OpenSearch）地址 —— 告警真正存放的地方。
      *
@@ -84,8 +100,11 @@ public class WazuhService implements WazuhGateway {
             return;
         }
         try {
-            this.client = new WazuhClient(baseUrl, username, password, verifySsl, timeout,
+            this.client = new WazuhClient(baseUrl, username, password, verifySsl,
+                    outboundTimeouts, outboundGuard,
                     indexerUrl, indexerUsername, indexerPassword);
+            logger.info("Wazuh 出站超时生效值（manager/indexer 共用）：{}（守卫={}）",
+                    outboundTimeouts.describe(), outboundGuard != null);
             this.available = probe();
             if (available) {
                 logger.info("Wazuh 已连接（REAL 模式）：manager={}  indexer={}", baseUrl, indexerUrl);
@@ -350,6 +369,21 @@ public class WazuhService implements WazuhGateway {
     @Override
     public boolean isAvailable() {
         return available;
+    }
+
+    /**
+     * 出站超时的<b>实际生效值</b>（启动自检用）。
+     *
+     * <p>取自真正构造 WazuhClient 的那个对象，而不是"再读一遍配置"——
+     * 后者会在"配置改了但客户端没拿到"时打印出骗人的值。
+     */
+    public org.example.config.OutboundTimeouts effectiveOutboundTimeouts() {
+        return (client != null) ? client.effectiveTimeouts() : outboundTimeouts;
+    }
+
+    /** 出站守卫是否已接入该客户端（自检用：false 表示只有传输层超时） */
+    public boolean outboundGuardEnabled() {
+        return client != null && client.guardEnabled();
     }
 
     @Override

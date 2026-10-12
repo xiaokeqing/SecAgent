@@ -47,6 +47,16 @@ public class VectorEmbeddingService {
     @org.springframework.beans.factory.annotation.Value("${app.llm.embedding-timeout-ms:8000}")
     private long embeddingTimeoutMs;
 
+    /**
+     * embedding 单次调用的实际生效预算（启动自检用）。
+     *
+     * <p>SDK 自身没有显式 connect/read 配置，能保证的只有"调用层最多等这么久" ——
+     * 所以自检里 connect/read 会如实打印 MISSING，而不是编一个数字出来。
+     */
+    public long effectiveCallTimeoutMs() {
+        return embeddingTimeoutMs;
+    }
+
     private TextEmbedding textEmbedding;
 
     /**

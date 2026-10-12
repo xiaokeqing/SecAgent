@@ -8,6 +8,8 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import org.example.config.OutboundTimeouts;
+import org.example.llm.OutboundGuard;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -20,6 +22,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -44,8 +47,23 @@ public class WazuhClient {
     private final String baseUrl;
     private final String authHeader;   // Basic base64(user:pass)
     private final boolean verifySsl;
-    private final int timeoutSeconds;
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /**
+     * 统一出站超时（connect 3s / read 12s / call 15s）。
+     *
+     * <p>以前这里只有一个 {@code timeoutSeconds}，三项共用且来源是
+     * {@code integration.wazuh.timeout} —— 与 LLM 通道的 15s/8s 各说各话，
+     * 外部依赖挂起时会拖住请求线程。现在改成显式声明、可被启动自检核对的值。
+     */
+    private final OutboundTimeouts timeouts;
+
+    /** 出站守卫（有界等待 + 熔断冷却 + 半开）；为 null 时退化为"仅传输层超时"（单测/旧构造） */
+    private final OutboundGuard guard;
+
+    /** 依赖标识：管理 API 与 indexer 分开计冷却，互不拖累 */
+    public static final String DEP_API = "wazuh-api";
+    public static final String DEP_INDEXER = "wazuh-indexer";
 
     /**
      * Wazuh indexer（OpenSearch）地址与凭据。
@@ -67,26 +85,32 @@ public class WazuhClient {
     private final OkHttpClient http;
     private volatile String cachedToken;
 
+    /** 旧构造：三项超时同为 timeoutSeconds（保留兼容，内部走统一默认值语义） */
     public WazuhClient(String baseUrl, String username, String password,
                        boolean verifySsl, int timeoutSeconds) {
-        this(baseUrl, username, password, verifySsl, timeoutSeconds, null, null, null);
+        this(baseUrl, username, password, verifySsl,
+                new OutboundTimeouts(timeoutSeconds * 1000L, timeoutSeconds * 1000L, timeoutSeconds * 1000L),
+                null, null, null, null);
     }
 
     /**
-     * 完整构造：额外给出 indexer 地址与凭据。
+     * 完整构造（统一超时 + 出站守卫）。
      *
+     * @param timeouts        统一出站超时（connect/read/call）
+     * @param guard           出站守卫；为 null 表示不启用有界等待与冷却（单测用）
      * @param indexerUrl      形如 https://wazuh-indexer:9200；为 null 表示不接真实告警
      * @param indexerUser     indexer 用户名
      * @param indexerPassword indexer 口令
      */
     public WazuhClient(String baseUrl, String username, String password,
-                       boolean verifySsl, int timeoutSeconds,
+                       boolean verifySsl, OutboundTimeouts timeouts, OutboundGuard guard,
                        String indexerUrl, String indexerUser, String indexerPassword) {
         this.baseUrl = trimTrailingSlash(baseUrl);
         this.authHeader = "Basic " + Base64.getEncoder()
                 .encodeToString((username + ":" + password).getBytes(StandardCharsets.UTF_8));
         this.verifySsl = verifySsl;
-        this.timeoutSeconds = Math.max(timeoutSeconds, 3);
+        this.timeouts = (timeouts == null) ? OutboundTimeouts.defaults() : timeouts;
+        this.guard = guard;
         this.http = buildClient();
 
         this.indexerUrl = (indexerUrl == null || indexerUrl.isBlank())
@@ -98,10 +122,20 @@ public class WazuhClient {
                                 .getBytes(StandardCharsets.UTF_8));
         this.indexerHttp = (this.indexerUrl == null) ? null : buildClient();
         if (this.indexerUrl != null) {
-            logger.info("Wazuh 告警改用 indexer 查询：{}", this.indexerUrl);
+            logger.info("Wazuh 告警改用 indexer 查询：{}（{}）", this.indexerUrl, this.timeouts.describe());
         } else {
             logger.warn("未配置 Wazuh indexer 地址 —— 无法获取真实告警，将使用内置样本");
         }
+    }
+
+    /** 统一超时的实际生效值（供启动自检核对） */
+    public OutboundTimeouts effectiveTimeouts() {
+        return timeouts;
+    }
+
+    /** 出站守卫是否接入（false 表示只有传输层超时，没有冷却/半开） */
+    public boolean guardEnabled() {
+        return guard != null;
     }
 
     private static String trimTrailingSlash(String s) {
@@ -110,10 +144,13 @@ public class WazuhClient {
     }
 
     private OkHttpClient buildClient() {
+        // callTimeout 与总预算一致：兜住"读超时之上还有重试/重定向"的情况，
+        // 保证单次调用绝不会超过入口预算。
         OkHttpClient.Builder b = new OkHttpClient.Builder()
-                .connectTimeout(Duration.ofSeconds(timeoutSeconds))
-                .readTimeout(Duration.ofSeconds(timeoutSeconds))
-                .writeTimeout(Duration.ofSeconds(timeoutSeconds));
+                .connectTimeout(Duration.ofMillis(timeouts.getConnectTimeoutMs()))
+                .readTimeout(Duration.ofMillis(timeouts.getReadTimeoutMs()))
+                .writeTimeout(Duration.ofMillis(timeouts.getReadTimeoutMs()))
+                .callTimeout(Duration.ofMillis(timeouts.getCallTimeoutMs()));
         if (!verifySsl) {
             try {
                 X509TrustManager trustAll = new X509TrustManager() {
@@ -136,6 +173,42 @@ public class WazuhClient {
         return b.build();
     }
 
+    /**
+     * 出站调用的统一收口：<b>传输层超时之上再套一层有界等待 + 熔断冷却</b>。
+     *
+     * <h3>为什么两层都要</h3>
+     * <ul>
+     *   <li>OkHttp 的 connect/read/callTimeout 管的是"这一次 HTTP 调用"；</li>
+     *   <li>{@link OutboundGuard} 管的是"调用方最多等多久 + 故障后不再反复等"
+     *       —— 一次超时后该依赖进入 60s 冷却，期间立即失败，
+     *       避免一次请求里每个调用点各等一遍（实测过 15s+15s+15s 叠加）。</li>
+     * </ul>
+     * 超时/冷却抛出的信息里带"超时/冷却"，{@link OutboundGuard#isUnavailable} 可据此判定，
+     * 上层照旧走 fail-closed 降级（MOCK / 数据源不可用），不会静默成功。
+     */
+    private <T> T bounded(String dependency, Callable<T> call) throws IOException {
+        if (guard == null) {
+            try {
+                return call.call();
+            } catch (IOException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new IOException("出站调用失败（依赖=" + dependency + "）：" + e.getMessage(), e);
+            }
+        }
+        try {
+            return guard.call(dependency, timeouts.getCallTimeoutMs(), call);
+        } catch (IOException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            // 超时/冷却：保留 IllegalStateException 的类型与文案（含"超时/冷却"），
+            // 上层与 OutboundGuard.isUnavailable 的判定都依赖这段文案
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("出站调用失败（依赖=" + dependency + "）：" + e.getMessage(), e);
+        }
+    }
+
     // ==================== 登录与 token 缓存 ====================
 
     /**
@@ -149,7 +222,7 @@ public class WazuhClient {
                 .header("Authorization", authHeader)
                 .get()
                 .build();
-        try (Response resp = http.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_API, () -> http.newCall(req).execute())) {
             String body = readBody(resp);
             if (resp.code() != 200) {
                 throw new IOException("Wazuh 登录失败 HTTP " + resp.code() + ": " + snippet(body));
@@ -212,13 +285,16 @@ public class WazuhClient {
                 .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
                 .get()
                 .build();
-        try (Response resp = indexerHttp.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
             boolean ok = resp.isSuccessful();
             if (!ok) {
                 logger.info("Wazuh indexer 探测失败：HTTP {}（{}）", resp.code(), indexerUrl);
             }
             return ok;
-        } catch (IOException e) {
+        } catch (Exception e) {
+            // 探活必须"什么失败都不抛"：除了 IOException，超时/冷却这类
+            // 有界等待的结果是 IllegalStateException —— 之前只 catch IOException，
+            // 加了 OutboundGuard 之后它就会穿出去，把"探活失败"变成"重新探测异常"。
             logger.info("Wazuh indexer 探测异常：{}（{}）", e.getMessage(), indexerUrl);
             return false;
         }
@@ -245,7 +321,7 @@ public class WazuhClient {
                 .header("Authorization", "Bearer " + token())
                 .get()
                 .build();
-        try (Response resp = http.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_API, () -> http.newCall(req).execute())) {
             String body = readBody(resp);
             if (resp.code() == 401 && !retried) {
                 throw new UnauthorizedException();
@@ -275,7 +351,7 @@ public class WazuhClient {
                 .header("Authorization", "Bearer " + token())
                 .put(reqBody)
                 .build();
-        try (Response resp = http.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_API, () -> http.newCall(req).execute())) {
             String body = readBody(resp);
             if (resp.code() == 401 && !retried) {
                 throw new UnauthorizedException();
@@ -324,7 +400,7 @@ public class WazuhClient {
                 .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
                 .get()
                 .build();
-        try (Response resp = indexerHttp.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
             String body = resp.body() != null ? resp.body().string() : "";
             if (!resp.isSuccessful()) {
                 throw new IOException("indexer 查询告警失败 HTTP " + resp.code() + ": " + snippet(body));
@@ -360,7 +436,7 @@ public class WazuhClient {
                 .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
                 .post(RequestBody.create(body, JSON))
                 .build();
-        try (Response resp = indexerHttp.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
             String respBody = resp.body() != null ? resp.body().string() : "";
             if (!resp.isSuccessful()) {
                 throw new IOException("indexer 24h 聚合查询失败 HTTP " + resp.code() + ": " + snippet(respBody));
@@ -387,7 +463,7 @@ public class WazuhClient {
                 .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
                 .post(RequestBody.create(bodyJson, JSON))
                 .build();
-        try (Response resp = indexerHttp.newCall(req).execute()) {
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
             String respBody = resp.body() != null ? resp.body().string() : "";
             if (!resp.isSuccessful()) {
                 throw new IOException("indexer 查询失败 HTTP " + resp.code() + ": " + snippet(respBody));

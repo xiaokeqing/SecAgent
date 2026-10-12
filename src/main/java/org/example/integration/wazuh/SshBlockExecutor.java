@@ -1,5 +1,7 @@
 package org.example.integration.wazuh;
 
+import org.example.config.OutboundTimeouts;
+import org.example.llm.OutboundGuard;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -10,6 +12,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
@@ -78,8 +81,50 @@ public class SshBlockExecutor {
     @Value("${integration.block.ssh.known-hosts:/opt/keys/known_hosts}")
     private String knownHosts;
 
-    @Value("${integration.block.ssh.timeout:15}")
-    private int timeoutSeconds;
+    /**
+     * 统一出站超时（connect 3s / read 12s / call 15s）。
+     *
+     * <p>原来这里是一个独立的 {@code integration.block.ssh.timeout:15}：
+     * SSH 建连 15s、进程等待 20s，两条都与其它出站链路不一致，
+     * 依赖挂起时会占住处置请求线程。现在与 Wazuh 链路共用同一组值。
+     */
+    private final OutboundTimeouts outboundTimeouts;
+
+    /**
+     * 出站守卫（有界等待 + 每依赖 60s 冷却 + 半开）—— 与 embedding / Wazuh 链路同一个 Bean。
+     *
+     * <p>SSH 是处置路径上唯一"会真的等一个外部进程"的调用，
+     * 一次失败后进入冷却，可以避免连续处置请求各等一遍超时（把处置线程池耗尽）。
+     */
+    private final OutboundGuard outboundGuard;
+
+    /** 依赖标识：冷却按它隔离 */
+    public static final String DEP_SSH = "ssh-block";
+
+    public SshBlockExecutor(OutboundGuard outboundGuard, OutboundTimeouts outboundTimeouts) {
+        this.outboundGuard = outboundGuard;
+        this.outboundTimeouts = (outboundTimeouts == null) ? OutboundTimeouts.defaults() : outboundTimeouts;
+    }
+
+    /** SSH 建连超时（秒）：取统一 connect 值，向上取整且至少 1 秒（ssh 的 ConnectTimeout 只接受整数秒） */
+    int connectTimeoutSeconds() {
+        return (int) Math.max(1, Math.ceil(outboundTimeouts.getConnectTimeoutMs() / 1000.0));
+    }
+
+    /** 进程等待上限（毫秒）：取统一 read 值 */
+    long processWaitMs() {
+        return outboundTimeouts.getReadTimeoutMs();
+    }
+
+    /** 统一超时的实际生效值（启动自检用） */
+    public OutboundTimeouts effectiveTimeouts() {
+        return outboundTimeouts;
+    }
+
+    /** 出站守卫是否接入 */
+    public boolean guardEnabled() {
+        return outboundGuard != null;
+    }
 
     /**
      * 启动自检 —— 把配置的实际绑定值打出来。
@@ -115,6 +160,8 @@ public class SshBlockExecutor {
             logger.info("  known_hosts 存在 = {}", java.nio.file.Files.exists(kh));
         } catch (Exception ignored) {
         }
+        logger.info("  出站超时生效值 = {}（ssh ConnectTimeout={}s，进程等待上限={}ms，守卫={}）",
+                outboundTimeouts.describe(), connectTimeoutSeconds(), processWaitMs(), guardEnabled());
         logger.info("  >>> isEnabled() 最终结果 = {}", isEnabled());
         logger.info("=== 自检结束 ===");
     }
@@ -155,40 +202,85 @@ public class SshBlockExecutor {
         if (!isEnabled()) {
             throw new IOException("SSH 直连封禁未启用（integration.block.ssh.*）");
         }
-        // 第一道：本地形状校验
+        // 第一道：本地形状校验（纯内存，尽早失败，不消耗任何出站预算）
         if (action == null || !ACTION.matcher(action).matches()) {
             throw new IOException("非法动作: " + action);
         }
         if (!looksLikeIp(ip)) {
             throw new IOException("非法 IP: " + ip);
         }
+        if (outboundGuard == null) {
+            return runOnce(action, ip);
+        }
+        // 有界等待 + 每依赖 60s 冷却 + 半开：一次超时后短时间内直接失败，
+        // 不再让每个处置请求各等一遍（那会把处置线程占满）
+        try {
+            return outboundGuard.call(DEP_SSH, outboundTimeouts.getCallTimeoutMs(),
+                    () -> runOnce(action, ip));
+        } catch (IOException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw new IOException("SSH 直连处置被终止（依赖=" + DEP_SSH + "）：" + e.getMessage(), e);
+        } catch (Exception e) {
+            throw new IOException("SSH 直连处置失败（依赖=" + DEP_SSH + "）：" + e.getMessage(), e);
+        }
+    }
 
-        // 用参数数组 —— shell 不经手，注入面从机制上消除
-        List<String> cmd = new ArrayList<>();
-        cmd.add("ssh");
-        cmd.add("-i");
-        cmd.add(keyPath);
-        cmd.add("-p");
-        cmd.add(String.valueOf(port));
-        cmd.add("-o");
-        cmd.add("BatchMode=yes");
-        cmd.add("-o");
-        // 严格校验 host key：预置在 known_hosts 里，防中间人
-        cmd.add("StrictHostKeyChecking=yes");
-        cmd.add("-o");
-        cmd.add("UserKnownHostsFile=" + knownHosts);
-        cmd.add("-o");
-        cmd.add("ConnectTimeout=" + Math.max(5, timeoutSeconds));
+    /**
+     * 构造 ssh 命令（参数数组，shell 不经手，注入面从机制上消除）。
+     *
+     * <p>抽成独立方法是为了单测能直接断言"实际下发给了 ssh 哪几个超时参数" ——
+     * 光断言常量不算证据，要断言真正进了命令行。
+     */
+    List<String> buildCommand(String action, String ip) {
+        List<String> cmd = new ArrayList<>(Arrays.asList(
+                "ssh",
+                "-i", keyPath,
+                "-p", String.valueOf(port),
+                "-o", "BatchMode=yes",
+                // 严格校验 host key：预置在 known_hosts 里，防中间人
+                "-o", "StrictHostKeyChecking=yes",
+                "-o", "UserKnownHostsFile=" + knownHosts,
+                // 建连超时取统一 connect 值（3s）：不可达时快速失败，不占住处置线程
+                "-o", "ConnectTimeout=" + connectTimeoutSeconds(),
+                // 连上之后不再无限等对端：两个 keepalive 周期内无响应即断开
+                "-o", "ServerAliveInterval=" + Math.max(1, connectTimeoutSeconds()),
+                "-o", "ServerAliveCountMax=2"));
         // 注意：整条指令作为【一个】参数传给 ssh，
         // 服务端的 forced command 会从 $SSH_ORIGINAL_COMMAND 读到它。
         cmd.add(user + "@" + host);
         cmd.add(action + " " + ip);
+        return cmd;
+    }
 
-        logger.info("SSH 直连处置：{} {} -> {}@{}", action, ip, user, host);
+    private String runOnce(String action, String ip) throws IOException {
+        logger.info("SSH 直连处置：{} {} -> {}@{}（ConnectTimeout={}s，等待上限={}ms）",
+                action, ip, user, host, connectTimeoutSeconds(), processWaitMs());
 
-        ProcessBuilder pb = new ProcessBuilder(cmd);
+        ProcessBuilder pb = new ProcessBuilder(buildCommand(action, ip));
         pb.redirectErrorStream(true);
-        Process p = pb.start();
+        Process p;
+        try {
+            p = pb.start();
+        } catch (IOException e) {
+            throw new IOException("无法启动 ssh 进程：" + e.getMessage(), e);
+        }
+
+        boolean finished;
+        try {
+            // 刻意"先等进程、再读输出"：原来是先 readLine 再 waitFor，
+            // 一旦对端连上却不回包，线程会卡在 readLine 上，waitFor 的超时永远不会生效。
+            // 输出是 forced command 的一行文本，远小于管道缓冲，先等不会死锁。
+            finished = p.waitFor(processWaitMs(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            p.destroyForcibly();
+            throw new IOException("等待 SSH 结果被中断");
+        }
+        if (!finished) {
+            p.destroyForcibly();
+            throw new IOException("SSH 执行超时（" + processWaitMs() + " ms，依赖=" + DEP_SSH + "）：已强制终止");
+        }
 
         StringBuilder out = new StringBuilder();
         try (BufferedReader r = new BufferedReader(
@@ -197,18 +289,6 @@ public class SshBlockExecutor {
             while ((line = r.readLine()) != null) {
                 out.append(line).append('\n');
             }
-        }
-        boolean finished;
-        try {
-            finished = p.waitFor(timeoutSeconds + 5L, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            p.destroyForcibly();
-            throw new IOException("等待 SSH 结果被中断");
-        }
-        if (!finished) {
-            p.destroyForcibly();
-            throw new IOException("SSH 执行超时");
         }
 
         String result = out.toString().trim();
