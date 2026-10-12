@@ -656,3 +656,41 @@ U2（回收开发期额度）的完整执行方法：
 教训：凡是"检查仓库文件"的体检项，都要先确认【被检查的那份文件到底是哪一份】——
       本地工作区、服务器源码树、镜像内 jar，三者可能不是同一个版本。
 ```
+
+---
+
+## 14. 集群 yellow 的常见成因：ISM 每日历史索引（2026-10-13 实测）
+
+```
+症状：/_cluster/health 报 yellow 且 unassigned_shards=1，但 _cat/indices 里所有业务索引都是 green。
+成因：ISM 插件每天新建一个内部历史索引，形如
+      .opendistro-ism-managed-index-history-YYYY.MM.DD-N
+      并且【带 1 个副本】—— 单节点集群上这个副本永远分不出去，于是集群常年 yellow。
+      注意：即使已有 .opendistro-* 的 0 副本模板，ISM 仍可能以显式设置创建该索引（实测如此）。
+
+定位：
+  curl ... /_cat/shards?h=index,shard,prirep,state,unassigned.reason | grep -i unassign
+修掉当前这个（一行）：
+  curl -XPUT .../<该索引>/_settings -d '{"index":{"number_of_replicas":0}}'
+预防（模板已扩充，覆盖 .kibana* / .opensearch-* / .plugins-* / .opendistro-*）：
+  _template/secagent-single-node-internal → settings.index.number_of_replicas=0, auto_expand_replicas=false, order=100
+
+【仍未根治】ISM 显式带副本创建时模板拦不住 —— 若明天又黄，按上面两条命令处理即可；
+  彻底根治需要 ISM 侧配置或加一个"每日把 .opendistro-ism-* 副本置 0"的例行任务（未做，留作选项）。
+```
+
+## 15. 夜间整机体检快照（2026-10-13 01:2x，作为收尾基线）
+
+```
+应用：commit e950b5a ｜ health status=ok ｜ fingerprintMismatch=false ｜ 向量 318
+发布链：ACR stable == 线上 == e950b5a ｜ 容器引用为 digest sha256:a0bc50ff… ｜ 发布服务 Result=success
+定时器：secagent-redeploy.timer active/enabled ｜ secagent-healthwatch.timer active/enabled
+看门狗：连续失败=0 ｜ 从未触发回滚 ｜ 当前探测健康
+检测：Suricata 正常（sid 2001219 阈值抑制生效）｜ 索引全部 green ｜ 未分配分片 0
+数据链路：REAL（degraded=false）；降级时如实显示"数据源不可用"并约 1 分钟内自愈
+保留策略：ISM 策略 2 条（secagent-alerts-30d / secagent-stats-14d）｜ 单节点零副本模板已扩充
+评测基线：/opt/secagent/eval-runs/eval-all-20261013-010745.json（commit=e950b5a，artifactMd5=7d2c4272…）
+额度：用户池 1 ｜ 评测池 142 ｜ 公开池 69（date=2026-10-13；开发期上限仍为 300/200/300，发布前须回收）
+公开端点：verify-public-endpoint.sh --full 13/13 通过
+博客：本地 HEAD 7c1346b（八轮改版），相对 origin/main 13 文件 +925/−309，**未发布**（等站主确认）
+```
