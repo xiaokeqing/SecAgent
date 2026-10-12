@@ -325,7 +325,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             return step;
         }
 
-        String verdict = askAnalystModel(userInput, rag);
+        String verdict = askModelVerdict(userInput, rag);
         String body;
         String summary;
         if (verdict != null) {
@@ -353,7 +353,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
      *
      * <p>返回 null 的语义是"<b>本次没有模型结论</b>"，调用方必须如实标注 —— 不是"退回模板"的信号。
      */
-    private String askAnalystModel(String userInput, String rag) {
+    private String askModelVerdict(String userInput, String rag) {
         if (llmProvider == null || !llmProvider.available()) {
             logger.warn("[MultiAgent] 模型 provider 不可用，ANALYST 不生成结论（不做模板兜底）");
             return null;
@@ -465,7 +465,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
 
             if (unknown) {
                 return "**模型判定：依据不足，不做定性。**\n\n不给出攻击类型与处置建议（unknown=true）。"
-                        + (reason.isEmpty() ? "" : "\n\n**原因**：" + escape(reason));
+                        + (reason.isEmpty() ? "" : "\n\n**原因**：" + reason);
             }
             StringBuilder sb = new StringBuilder();
             if (conceptQuestion) {
@@ -583,17 +583,28 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 : safeCallTool(() -> queryLogsTools.queryLogs(null, fTopic, fLogQuery, 10), "日志查询");
         String alerts = safeCallTool(() -> queryMetricsTools.queryPrometheusAlerts("1h"), "告警查询");
 
-        String summary = "已采集【" + topic + "】日志证据与当前活动告警，仅输出工具返回事实";
-        String detail = "【日志工具 queryLogs 返回】\n" + clip(logs, 1200)
+        String evidence = "【日志工具 queryLogs 返回】\n" + clip(logs, 1200)
                 + "\n\n【告警工具 queryPrometheusAlerts 返回】\n" + clip(alerts, 1200);
+
+        // 两段式：① 选题是规则（可审计，保留）② 证据解读交模型（不可用则如实标注，不给定级）
+        String verdict = askModelVerdict(userInput, evidence);
+
+        String summary = verdict != null
+                ? "已采集【" + topic + "】日志与活动告警，并由模型完成证据解读（generatedBy=" + llmProvider.id() + "/" + llmProvider.modelName() + "）"
+                : "已采集【" + topic + "】日志与活动告警；模型不可用或输出未通过校验，**未做模型解读、不给定级**";
         String body = "## 取证发现\n"
-                + "取证分析员已采集日志与活动告警作为证据（仅陈述工具返回的事实，未做主观推断）。\n\n"
+                + "> 证据采集方式：**规则选题**（按关键词选取日志主题，确定性、可审计，非模型产出）\n\n"
                 + "**日志证据（" + topic + "，关键字：" + (logQuery == null ? "核心日志" : logQuery) + "）：**\n\n"
-                + clip(logs, 600)
-                + "\n\n**当前活动告警：**\n\n" + clip(alerts, 600)
-                + "\n\n**初步研判建议：** 上述证据若显示暴力破解/WebShell/外联等活动，建议转研判分析员对照知识库定性，并按需转处置执行员封禁来源 IP 或隔离主机（处置仍过护栏+审批+审计）。";
+                + untrustedBlock(logs, 600)
+                + "\n\n**当前活动告警：**\n\n" + untrustedBlock(alerts, 600)
+                + "\n\n### 证据解读\n"
+                + (verdict != null
+                        ? "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n\n" + verdict
+                        : "> 结论生成方式：**未生成**（模型不可用或输出未通过 schema 校验）\n\n"
+                          + "按 fail-closed 原则**不做出定性、不给出定级与处置动作**。"
+                          + "取证只负责「工具看到了什么」，定性需模型可用后由研判路径给出。");
         AgentStepResult step = new AgentStepResult(AgentRole.FORENSICS.getDisplayName(), AgentRole.FORENSICS.name(),
-                "forensics_agent", "取证分析：查询日志与告警、采集证据", summary, detail,
+                "forensics_agent", "取证分析：查询日志与告警、采集证据并由模型解读", summary, evidence,
                 System.currentTimeMillis() - start, true);
         bodies.put(AgentRole.FORENSICS, body);
         return step;
