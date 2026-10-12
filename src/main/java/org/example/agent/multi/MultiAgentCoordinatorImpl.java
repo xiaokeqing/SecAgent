@@ -345,7 +345,8 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             String summary = why + "；本次不输出研判结论（无依据不推断）";
             createPendingTicketAsync(userInput, summary);
             String body = "## 研判结论\n"
-                    + "> 结论生成方式：**未生成**（" + why + "）\n\n"
+                    + "> 结论生成方式：**未生成**（" + why + "）\n"
+                    + "> state=" + (ragError ? "retrieval-failed" : "no-retrieval") + "\n\n"
                     + "没有可用依据，按 fail-closed 原则**不给出结论**；已自动创建「待补充知识」工单。\n\n"
                     + "---\n\n## 知识库参考（未经 AI 加工）\n\n" + untrustedBlock(rag, 800);
             AgentStepResult step = new AgentStepResult(AgentRole.ANALYST.getDisplayName(), AgentRole.ANALYST.name(),
@@ -361,13 +362,15 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         if (verdict != null) {
             summary = "模型已基于知识库片段生成结构化结论（generatedBy=" + llmProvider.id() + "/" + llmProvider.modelName() + "）";
             body = "## 研判结论\n"
-                    + "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n\n"
+                    + "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n"
+                    + "> state=model\n\n"
                     + verdict + "\n\n"
                     + "---\n\n## 知识库参考（未经 AI 加工）\n\n" + untrustedBlock(rag, 800);
         } else {
             summary = "模型不可用或输出未通过 schema 校验；本次不输出结论（已显式标注，不用模板冒充）";
             body = "## 研判结论\n"
-                    + "> 结论生成方式：**未生成**（模型不可用或输出未通过校验）\n\n"
+                    + "> 结论生成方式：**未生成**（模型不可用或输出未通过校验）\n"
+                    + "> state=model-failed\n\n"
                     + "按 fail-closed 原则**不给出结论**，也不退回模板拼装。\n\n"
                     + "---\n\n## 知识库参考（未经 AI 加工）\n\n" + untrustedBlock(rag, 800);
         }
@@ -629,8 +632,8 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 + "\n\n**当前活动告警：**\n\n" + untrustedBlock(alerts, 600)
                 + "\n\n### 证据解读\n"
                 + (verdict != null
-                        ? "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n\n" + verdict
-                        : "> 结论生成方式：**未生成**（模型不可用或输出未通过 schema 校验）\n\n"
+                        ? "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n> state=model\n\n" + verdict
+                        : "> 结论生成方式：**未生成**（模型不可用或输出未通过 schema 校验）\n> state=model-failed\n\n"
                           + "按 fail-closed 原则**不做出定性、不给出定级与处置动作**。"
                           + "取证只负责「工具看到了什么」，定性需模型可用后由研判路径给出。");
         AgentStepResult step = new AgentStepResult(AgentRole.FORENSICS.getDisplayName(), AgentRole.FORENSICS.name(),
