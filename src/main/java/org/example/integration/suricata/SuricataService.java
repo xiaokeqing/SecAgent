@@ -61,7 +61,12 @@ public class SuricataService implements SuricataGateway {
             logger.info("Suricata eve.json 可读（REAL 模式）：{}", eveJsonPath);
         } else {
             this.available = false;
-            logger.warn("Suricata eve.json 不存在或不可读（{}），降级为内置网络告警样本（MOCK）", eveJsonPath);
+            // 【2026-10-13 澄清】这条不是故障：Suricata 跑在 srv2，SecAgent 容器里没有它的 eve.json。
+            // 真实网络告警是通过 Wazuh agent → indexer（wazuh-alerts-*，rule.groups=suricata）回来的，
+            // 也就是 /api/public/alerts 那条通路。原来用 WARN 打印，容易被误读成"检测坏了"，
+            // 所以改成 INFO 并把口径写清楚。
+            logger.info("未挂载 Suricata eve.json（{}）—— 属预期：网络告警经 Wazuh agent → indexer 通路返回，"
+                    + "本进程不使用本地样本（该降级仅影响本进程内的本地文件直读模式）", eveJsonPath);
         }
     }
 

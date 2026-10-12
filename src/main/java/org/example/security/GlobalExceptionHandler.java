@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -41,6 +42,20 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleIllegalArg(IllegalArgumentException e) {
         logger.warn("非法参数: {}", e.getMessage());
         return build(HttpStatus.BAD_REQUEST, e.getMessage());
+    }
+
+    /**
+     * 访问了不存在的路径。
+     *
+     * <p>典型场景：前端会探测一些"可选端点"（例如博客对 {@code /api/public/latest} 的探测），
+     * 这些端点尚未实现时属于正常的 404，而不是"未处理异常"。
+     * <p>此前这类请求会落到下面的 {@code Exception} 兜底分支：既回了 500，又在日志里打一整段堆栈，
+     * 把日志噪声当成了故障信号。现在显式处理为 404，并且只用 debug 级记录。
+     */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoResource(NoResourceFoundException e) {
+        logger.debug("路径不存在: {} {}", e.getHttpMethod(), e.getResourcePath());
+        return build(HttpStatus.NOT_FOUND, "接口或资源不存在");
     }
 
     /** 兜底：不向客户端泄露内部堆栈 */
