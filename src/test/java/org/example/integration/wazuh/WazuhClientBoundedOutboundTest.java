@@ -111,6 +111,37 @@ class WazuhClientBoundedOutboundTest {
 
     @Test
     @Timeout(30)
+    @DisplayName("传输层读超时也会打开 60s 冷却：第二次调用秒回且不再发请求")
+    void transportTimeoutOpensCooldownSoNextCallFailsFast() throws Exception {
+        server = new StallingServer();
+        OutboundGuard guard = guardWithCooldown(60000);
+
+        // read(500ms) < call(1500ms)：OkHttp 的读超时会先触发（这正是 srv1 演练实测到的形态）
+        WazuhClient client = new WazuhClient(
+                "http://127.0.0.1:" + server.port(), "wazuh", "wazuh", false,
+                new OutboundTimeouts(1000, 500, 1500), guard,
+                "http://127.0.0.1:" + server.port(), "admin", "admin");
+
+        long first = System.nanoTime();
+        assertThrows(Exception.class, () -> client.search("wazuh-alerts-*", "{\"size\":1}"));
+        long firstMs = (System.nanoTime() - first) / 1_000_000L;
+        assertTrue(firstMs < 5000, "第一次调用应被读超时截断，实际 " + firstMs + " ms");
+        assertTrue(guard.coolingDown(WazuhClient.DEP_INDEXER),
+                "传输层（读超时）失败也必须打开冷却 —— 否则 60s 熔断永远不会生效，"
+                        + "依赖挂掉后每个请求都要各等满一次读超时");
+
+        int acceptsBefore = server.accepts();
+        long second = System.nanoTime();
+        Exception e = assertThrows(Exception.class, () -> client.search("wazuh-alerts-*", "{\"size\":1}"));
+        long secondMs = (System.nanoTime() - second) / 1_000_000L;
+        assertTrue(e.getMessage() != null && e.getMessage().contains("冷却"),
+                "第二次调用应命中冷却并说明原因：" + e.getMessage());
+        assertTrue(secondMs < 300, "第二次调用必须秒回，实际 " + secondMs + " ms");
+        assertEquals(acceptsBefore, server.accepts(), "冷却期内不应再发出网络请求");
+    }
+
+    @Test
+    @Timeout(30)
     @DisplayName("管理 API 未配置/不可达时快速失败，不挂住调用线程")
     void managerApiFailsFastWhenUnreachable() {
         // 端口选一个几乎不可能有监听的：连接被拒 → 立刻失败（不是超时，但同样满足"不挂住"）

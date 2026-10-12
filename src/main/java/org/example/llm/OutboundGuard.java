@@ -134,6 +134,18 @@ public class OutboundGuard {
         cooldownUntil.put(key, System.currentTimeMillis() + cooldownMs);
     }
 
+    /**
+     * 按默认冷却时长打开熔断。
+     *
+     * <p>给"传输层已经失败"的调用方用：实测（srv1 演练）当依赖进程被冻结时，
+     * OkHttp 的 read timeout（12s）会先于守卫的 callTimeout（15s）触发，
+     * 于是守卫只看到"调用抛了 SocketTimeoutException" —— 若不在这种情况打开冷却，
+     * 60s 熔断就<b>永远不会生效</b>，每个请求都要再等满一次读超时。
+     */
+    public void openCircuit(String key) {
+        openCircuit(key, defaultCooldownMs);
+    }
+
     /** 依赖不可用的统一判定（超时与冷却期都算） */
     public static boolean isUnavailable(Throwable e) {
         if (e == null) {

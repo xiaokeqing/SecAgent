@@ -199,6 +199,15 @@ public class WazuhClient {
         try {
             return guard.call(dependency, timeouts.getCallTimeoutMs(), call);
         } catch (IOException e) {
+            // 传输层失败（连不上/读超时/DNS 失败）也要打开冷却：
+            // 实测 read timeout(12s) 会先于守卫的 callTimeout(15s) 触发，
+            // 若只靠守卫自己的超时来开熔断，60s 冷却就永远不会生效 ——
+            // 表现是"依赖已经挂了，每个请求还要各等 12 秒"。
+            if (guard != null && isConnectivityFailure(e)) {
+                guard.openCircuit(dependency);
+                logger.warn("依赖 {} 传输层失败（{}），打开熔断冷却：{}",
+                        dependency, e.getClass().getSimpleName(), e.getMessage());
+            }
             throw e;
         } catch (RuntimeException e) {
             // 超时/冷却：保留 IllegalStateException 的类型与文案（含"超时/冷却"），
@@ -207,6 +216,26 @@ public class WazuhClient {
         } catch (Exception e) {
             throw new IOException("出站调用失败（依赖=" + dependency + "）：" + e.getMessage(), e);
         }
+    }
+
+    /**
+     * 是否属于"连接层失败"（而不是对端明确回了错误码）。
+     *
+     * <p>刻意只认这几类：HTTP 4xx/5xx 是"服务在、但拒绝"，不该把依赖整体熔断；
+     * 而连不上、读超时、DNS 解析失败意味着"这条链路现在不通"，应当立刻冷却。
+     */
+    private static boolean isConnectivityFailure(IOException e) {
+        if (e instanceof java.net.UnknownHostException
+                || e instanceof java.net.SocketException          // 含 ConnectException / NoRouteToHost / reset
+                || e instanceof java.io.InterruptedIOException) { // 含 SocketTimeoutException
+            return true;
+        }
+        // OkHttp 在部分路径上会把原因包一层
+        Throwable cause = e.getCause();
+        return cause instanceof IOException
+                && (cause instanceof java.net.UnknownHostException
+                    || cause instanceof java.net.SocketException
+                    || cause instanceof java.io.InterruptedIOException);
     }
 
     // ==================== 登录与 token 缓存 ====================
