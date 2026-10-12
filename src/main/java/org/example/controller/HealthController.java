@@ -48,6 +48,20 @@ public class HealthController {
     @Value("${app.build.sha:unknown}")
     private String buildSha;
 
+    /**
+     * 服务器源码树的 revision（由部署脚本注入）。
+     *
+     * <p>为什么要与 buildSha 分开暴露：实测出现过「buildSha 显示新版本、容器里跑的是旧代码」——
+     * 因为多阶段 Dockerfile 在镜像内用**服务器上的旧 src** 编译。
+     * 把"声称的版本"与"真实产物/源码指纹"分开，这类漂移才看得出来。
+     */
+    @Value("${app.build.source-sha:unknown}")
+    private String sourceSha;
+
+    /** 构建进镜像的 jar 的 MD5（部署脚本在服务器侧构建时算出并注入）—— 最硬的产物指纹 */
+    @Value("${app.build.artifact-md5:unknown}")
+    private String artifactMd5;
+
     /** 构建时间（由 compose 通过 BUILD_TIME 注入） */
     @Value("${app.build.time:unknown}")
     private String buildTime;
@@ -59,6 +73,15 @@ public class HealthController {
         result.put("application", "SecAgent");
         result.put("buildSha", buildSha);
         result.put("buildTime", buildTime);
+        // 双指纹（P0-4）：不再只靠 buildSha 自述，能看出"跑的是哪个产物、哪份源码"
+        result.put("sourceSha", sourceSha);
+        result.put("artifactMd5", artifactMd5);
+        result.put("fingerprint",
+                "buildSha=声称版本(env)｜sourceSha=服务器源码｜artifactMd5=镜像内 jar MD5(最硬)");
+        if (!"unknown".equals(buildSha) && "unknown".equals(artifactMd5)) {
+            result.put("fingerprintWarning",
+                    "缺少 artifactMd5 —— 不是服务器侧构建（或脚本未注入），无法验证产物与源码是否一致");
+        }
         result.put("vectorStore", vectorStore.backend());
         result.put("documentVectors", vectorStore.count());
         result.put("logsMockEnabled", clsMock);
