@@ -27,13 +27,15 @@ if [ "${1:-}" = "--drill" ]; then
   BASE="$(dirname "$MAN")"
   [ -d "$BASE/files" ] && BASE="$BASE/files"
   cd "$BASE"
-  echo "  清单条目: $(wc -l < manifest.sha256)"
-  if sha256sum -c manifest.sha256 --quiet 2>/dev/null; then
+  # 清单文件本身在上一层（$DIR），校验时的工作目录必须在 files/ ——
+  # 所以引用清单要用绝对路径 $MAN，不能写相对名（踩过：wd 里没有 manifest.sha256）
+  echo "  清单条目: $(wc -l < "$MAN")"
+  if sha256sum -c "$MAN" --quiet 2>/dev/null; then
     echo "  [OK] 全部文件校验通过 —— 该快照可用于恢复"
     rc=0
   else
     echo "  [X] 存在校验失败的文件："
-    sha256sum -c manifest.sha256 2>/dev/null | grep -v ': OK$' | head -n 5
+    sha256sum -c "$MAN" 2>/dev/null | grep -v ': OK$' | head -n 5
     rc=1
   fi
   rm -rf "$TMP"
