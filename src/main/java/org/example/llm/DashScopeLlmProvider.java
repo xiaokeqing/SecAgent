@@ -67,6 +67,19 @@ public class DashScopeLlmProvider implements LlmProvider {
     @Autowired
     private ChatService chatService;
 
+    /**
+     * 模型配额（可空注入，便于单测）。
+     *
+     * <p><b>为什么配额要放在这里而不是控制器</b>：实测发现配额检查在 {@code ChatController}
+     * 里、编排之前 —— 于是"规则路由 + 代码护栏 + 审计 + 处置"这些**不依赖模型**的能力
+     * 也随配额一起失效（配额用尽时，一个纯处置请求 25ms 就被拒，护栏根本没生效）。
+     * 对安全运营系统这是反的：外部模型不可用不该让整个响应能力瘫痪。
+     * 现在配额只拦"真正要调模型"的这一步，上层按既有降级路径处理：
+     * Planner → 回退规则路由；ANALYST/FORENSICS → 如实标"未生成"。
+     */
+    @Autowired(required = false)
+    private org.example.service.ModelQuotaService modelQuotaService;
+
     @Override
     public String id() {
         return "dashscope";
@@ -97,6 +110,11 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
+        if (modelQuotaService != null && !modelQuotaService.tryAcquire()) {
+            // 配额用尽只影响"这一步"：抛出后由上层降级（Planner 回退规则、研判标未生成），
+            // 不再像以前那样把整条请求（含护栏/处置）一起拒掉。
+            throw new IllegalStateException("模型额度已用完（今日）：本次不调用模型，由上层降级处理");
+        }
         if (System.currentTimeMillis() < cooldownUntil) {
             // 冷却期内快速失败：不再让调用方各等一遍 15 秒超时
             throw new java.io.IOException("模型处于冷却期（上次调用失败），直接 fail-closed");

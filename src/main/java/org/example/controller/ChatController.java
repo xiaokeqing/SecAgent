@@ -133,10 +133,10 @@ public class ChatController {
                 return ResponseEntity.ok(ApiResponse.success(ChatResponse.error("问题内容不能为空")));
             }
 
-            // 模型调用每日配额，超限直接拒绝
-            if (!modelQuotaService.tryAcquire()) {
-                return ResponseEntity.ok(ApiResponse.success(ChatResponse.error("今日模型调用额度已用完，请明天再试或联系管理员")));
-            }
+            // 配额检查已下移到 LlmProvider（模型出口）：
+            // 原先在这里"超限直接拒绝整条请求"，导致配额用尽时连【规则路由 + 护栏 + 审计 + 处置】
+            // 这些不依赖模型的能力也一起失效（实测：纯处置请求 25ms 被拒、护栏未生效）。
+            // 现在只有真正要调模型的那一步受配额影响，上层按既有降级路径处理。
 
             // 获取或创建会话
             SessionInfo session = getOrCreateSession(request.getId());
