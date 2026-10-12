@@ -1,0 +1,273 @@
+# ============================================================
+# 构建镜像并推送阿里云 ACR（"构建离开服务器"的第一步）
+# ------------------------------------------------------------
+# 目标：把生产构建从 srv1（2C2G、连不上 GitHub）搬到 GitHub Actions。
+#   Actions 只做「构建 + 推送 ACR」，**不部署、不持有 SSH 密钥**；
+#   部署由 srv1 上的 systemd timer 按「发布指针」自行拉取（见
+#   scripts/srv1-redeploy.sh 与 deploy/secagent-redeploy.timer）。
+#
+# 为什么每一步都要 fail-closed：
+#   这个项目真实发生过「镜像是新的、代码是旧的」——
+#   服务器侧多阶段构建用服务器上的旧 src/ 编译，而 BUILD_SHA 环境变量
+#   显示新版本号。所以本 workflow 的每一步都在证明「产物 = 这个 commit」：
+#     ① 工作区干净 + HEAD == 触发 commit（否则源码与 commit 不是一回事）
+#     ② jar 内必须有 git.properties，且其中的 commit == 触发 commit
+#     ③ 镜像 label 里写死 revision + artifact-md5（可被 srv1 读取核对）
+#   任何一步不成立就直接失败，**绝不产出一个来源不明的镜像**。
+#
+# 需要的 Secrets（由站主在 Settings → Secrets and variables → Actions 填写）：
+#   ACR_REGISTRY  个人版 ACR 公网地址（GitHub Actions 在公网，只能走公网地址）
+#   ACR_USERNAME  阿里云主账号名（RAM 子账号 AK 登录个人版实例实测不被接受）
+#   ACR_PASSWORD  ACR Registry 登录密码
+# 仓库内不写任何凭据，只引用 secrets.*。
+# ============================================================
+name: Build & Push Image
+
+# "on" 加引号：避免 YAML 1.1 解析器把裸 on 当成布尔值
+"on":
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+# 同一 ref 的旧运行取消，避免排队；但稳定发布指针（stable）由最后一次成功者推进
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: xiaokeqing/secagent
+
+jobs:
+  build-and-push:
+    name: 构建并推送镜像
+    runs-on: ubuntu-latest
+    steps:
+      # ---------------- 0. 取源码 ----------------
+      # fetch-depth: 0 —— git-commit-id-maven-plugin 需要完整历史/正确 HEAD；
+      # 浅克隆会让 commit 判定与 total.commit.count 失真。
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ---------------- 1. 构建前校验（fail-closed） ----------------
+      # 为什么必须在构建**之前**：
+      #   如果工作区有未提交改动，或者 checkout 出来的 HEAD 不是触发这次
+      #   workflow 的 commit，那么「构建出来的 jar」与「commit 号」之间
+      #   就没有必然关系 —— 后面的所有指纹校验都会变成自欺。
+      #   宁可现在失败，也不产出一个"标签对不上代码"的镜像。
+      - name: 构建前校验（工作区干净 + HEAD == 触发 commit）
+        run: |
+          set -euo pipefail
+          echo "触发 commit（GITHUB_SHA）= $GITHUB_SHA"
+          echo "工作区 HEAD           = $(git rev-parse HEAD)"
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "::error::工作区有未提交改动 —— 构建产物无法对应任何 commit（fail-closed）"
+            git status --porcelain
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::工作区有未跟踪/未提交文件 —— 同样无法保证产物来源（fail-closed）"
+            git status --porcelain
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]; then
+            echo "::error::HEAD 与触发 commit 不一致 —— 拒绝构建（fail-closed）"
+            exit 1
+          fi
+          echo "HEAD_MATCH=ok" >> "$GITHUB_ENV"
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      # ---------------- 2. 全量测试 ----------------
+      # 顺序刻意是「先测后打包」：测试不过就不该产生任何镜像。
+      # 单独一步（而不是 -DskipTests 一把过）是为了让测试结果在 UI 上一眼可见。
+      - name: 全量测试（不过就不推镜像）
+        run: mvn -B test
+
+      - name: 上传测试报告（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # ---------------- 3. 打包（跳过测试：测试已在上一阶段跑过） ----------------
+      - name: 打包 jar
+        run: mvn -B -DskipTests package
+
+      # ---------------- 4. 解包校验 jar 内 git.properties（fail-closed） ----------------
+      # 这是「源码指纹」从"环境变量自述"变成"jar 内固化证据"的关键一步：
+      #   git-commit-id-maven-plugin 在 initialize 阶段把 classes/git.properties
+      #   写进 jar；这里把 jar 拆开、读出来、与触发 commit 比对。
+      #   对不上（或文件不存在）→ 直接失败，不推镜像。
+      - name: 解包校验 jar 内 git.properties
+        run: |
+          set -euo pipefail
+          JAR=target/sec-agent-1.0-SNAPSHOT.jar
+          test -f "$JAR" || { echo "::error::找不到 $JAR"; exit 1; }
+          rm -rf /tmp/jarcheck && mkdir -p /tmp/jarcheck
+          unzip -o -q "$JAR" 'BOOT-INF/classes/git.properties' -d /tmp/jarcheck \
+            || { echo "::error::jar 内缺少 BOOT-INF/classes/git.properties —— 构建来源不可证（fail-closed）"; exit 1; }
+          GP=/tmp/jarcheck/BOOT-INF/classes/git.properties
+          cat "$GP"
+          C=$(grep -E '^git\.commit\.id=' "$GP" | head -1 | cut -d= -f2-)
+          D=$(grep -E '^git\.dirty=' "$GP" | head -1 | cut -d= -f2-)
+          echo "jar 内 commit = $C"
+          echo "jar 内 dirty  = $D"
+          if [ "$C" != "$GITHUB_SHA" ]; then
+            echo "::error::jar 内 commit($C) ≠ 触发 commit($GITHUB_SHA) —— 拒绝推送（fail-closed）"
+            exit 1
+          fi
+          if [ "$D" != "false" ]; then
+            echo "::error::jar 内 git.dirty=$D —— 产物含未提交改动，不可发布（fail-closed）"
+            exit 1
+          fi
+          echo "GIT_PROPERTIES_OK=1" >> "$GITHUB_ENV"
+
+      # ---------------- 5. 计算产物指纹 ----------------
+      - name: 计算 jar 的 sha256/md5
+        run: |
+          set -euo pipefail
+          JAR=target/sec-agent-1.0-SNAPSHOT.jar
+          SHA256=$(sha256sum "$JAR" | cut -d' ' -f1)
+          MD5=$(md5sum "$JAR" | cut -d' ' -f1)
+          SHORT=$(git rev-parse --short=12 HEAD)
+          echo "JAR_SHA256=$SHA256" >> "$GITHUB_ENV"
+          echo "JAR_MD5=$MD5" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=$SHORT" >> "$GITHUB_ENV"
+          echo "sha256 = $SHA256"
+          echo "md5    = $MD5"
+          echo "短号   = $SHORT"
+
+      # ---------------- 6. 构建镜像（基于 Dockerfile.runtime） ----------------
+      # 为什么必须用 Dockerfile.runtime 而不是 Dockerfile：
+      #   Dockerfile 是多阶段构建，会在镜像内 mvn 编译 —— 一旦源码上下文
+      #   不是本次 commit（在服务器上就真实发生过），就会产出"镜像新、代码旧"。
+      #   Dockerfile.runtime 单阶段、只 COPY jar，是"构建产物即镜像内容"。
+      #
+      # 为什么从镜像里再取一次 jar 算 md5：
+      #   部署脚本/srv1 会读取镜像 label artifact-md5 与容器内真实 jar 比对，
+      #   若这里算的是本地文件 md5，任何 COPY 层差异都会让线上永远 degraded。
+      #   用镜像里真实的那份做基准，才能真正证明"跑的就是构建产物"。
+      - name: 构建镜像并校验镜像内 jar
+        run: |
+          set -euo pipefail
+          JAR=target/sec-agent-1.0-SNAPSHOT.jar
+          mkdir -p runtime
+          cp "$JAR" runtime/app.jar
+          # label 由构建期算出的产物指纹填充：srv1 会读它并与容器内 jar 比对
+          docker build -f Dockerfile.runtime \
+            -t "$IMAGE_NAME:${SHORT_SHA}" \
+            -t "$IMAGE_NAME:stable" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "artifact-md5=${JAR_MD5}" \
+            .
+          # 从镜像里取出真实 jar 校验：证明 COPY 进镜像的确实是本次构建产物
+          CID=$(docker create "$IMAGE_NAME:${SHORT_SHA}")
+          docker cp "$CID:/app/app.jar" /tmp/image-app.jar
+          docker rm -f "$CID" >/dev/null
+          IMG_MD5=$(md5sum /tmp/image-app.jar | cut -d' ' -f1)
+          IMG_SHA=$(sha256sum /tmp/image-app.jar | cut -d' ' -f1)
+          echo "镜像内 jar md5    = $IMG_MD5"
+          echo "本地 jar md5      = $JAR_MD5"
+          if [ "$IMG_MD5" != "$JAR_MD5" ]; then
+            echo "::error::镜像内 jar 与构建产物不一致（md5 $IMG_MD5 ≠ $JAR_MD5）—— 拒绝推送"
+            exit 1
+          fi
+          if [ "$IMG_SHA" != "$JAR_SHA256" ]; then
+            echo "::error::镜像内 jar 与构建产物不一致（sha256 不符）—— 拒绝推送"
+            exit 1
+          fi
+          echo "IMG_MD5=$IMG_MD5" >> "$GITHUB_ENV"
+          docker image inspect "$IMAGE_NAME:${SHORT_SHA}" \
+            --format '镜像标签: {{json .Config.Labels}}'
+
+      # ---------------- 7. 登录 ACR ----------------
+      - name: 登录阿里云 ACR
+        run: |
+          set -euo pipefail
+          if [ -z "${ACR_REGISTRY:-}" ] || [ -z "${ACR_USERNAME:-}" ] || [ -z "${ACR_PASSWORD:-}" ]; then
+            echo "::error::ACR_REGISTRY / ACR_USERNAME / ACR_PASSWORD 未配置（见仓库 Secrets）"
+            exit 1
+          fi
+          echo "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+
+      # ---------------- 8. 推两个 tag ----------------
+      # <commit短号>：不可变、可追溯（回滚/复现就认它）
+      # stable     ：**发布指针** —— srv1 上的 timer 读的就是它
+      # 顺序刻意是"先 commit 短号、后 stable"：stable 是线上生效开关，
+      # 必须最后推。若这里失败，stable 不动，线上不受影响。
+      - name: 推送镜像（commit 短号 + stable 发布指针）
+        run: |
+          set -euo pipefail
+          REG="${ACR_REGISTRY}/${IMAGE_NAME}"
+          docker tag "$IMAGE_NAME:${SHORT_SHA}" "${REG}:${SHORT_SHA}"
+          docker tag "$IMAGE_NAME:stable"     "${REG}:stable"
+          docker push "${REG}:${SHORT_SHA}"
+          docker push "${REG}:stable"
+          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "${REG}:${SHORT_SHA}" | sed 's/.*@//')
+          echo "DIGEST=$DIGEST" >> "$GITHUB_ENV"
+          echo "推送完成：${REG}:${SHORT_SHA}   digest=${DIGEST}"
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+
+      # ---------------- 9. 校验远端 stable 指针指向本次产物 ----------------
+      # 「推成功」不等于「指针指对了」。拉到远端 stable，读它的 RepoDigests，
+      # 与本次 commit 短号 tag 的 digest 比对；不一致就是发错了（或并发运行推进了）。
+      # 用 pull + inspect 而不是 docker manifest inspect：后者在部分环境下要开实验特性。
+      - name: 校验远端发布指针
+        run: |
+          set -euo pipefail
+          REG="${ACR_REGISTRY}/${IMAGE_NAME}"
+          docker pull "${REG}:stable" >/dev/null
+          docker pull "${REG}:${SHORT_SHA}" >/dev/null
+          STABLE_DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "${REG}:stable" | sed 's/.*@//')
+          SHORT_DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "${REG}:${SHORT_SHA}" | sed 's/.*@//')
+          echo "stable(${SHORT_SHA}) digest = $STABLE_DIGEST"
+          echo "commit 短号 tag digest   = $SHORT_DIGEST"
+          [ -n "$STABLE_DIGEST" ] || { echo "::error::读不到 stable 的 digest"; exit 1; }
+          if [ "$STABLE_DIGEST" != "$SHORT_DIGEST" ]; then
+            echo "::error::stable 指针 digest 与本次产物 digest 不同 —— 发布指针没指对，请人工核对"
+            exit 1
+          fi
+          echo "DIGEST=$STABLE_DIGEST" >> "$GITHUB_ENV"
+        env:
+          ACR_REGISTRY: ${{ secrets.ACR_REGISTRY }}
+
+      # ---------------- 10. job summary（人工核对入口） ----------------
+      - name: 写 job summary
+        if: always()
+        run: |
+          {
+            echo "## SecAgent 镜像构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| 短号 tag | \`${SHORT_SHA}\` |"
+            echo "| 发布指针 | \`stable\` |"
+            echo "| 镜像 digest | \`${DIGEST:-<未推送>}\` |"
+            echo "| jar md5（镜像内真实值） | \`${IMG_MD5:-<未构建>}\` |"
+            echo "| jar sha256 | \`${JAR_SHA256:-<未构建>}\` |"
+            echo "| 触发方式 | ${GITHUB_EVENT_NAME} / ${GITHUB_REF} |"
+            echo ""
+            echo "> srv1 以 \`stable\` 的 **digest** 为准，5 分钟内自动拉取并重启；"
+            echo "> 部署后会核对镜像 label \`org.opencontainers.image.revision\` 与容器"
+            echo "\`/api/health\` 的 \`embeddedGitCommit\`，不一致即回滚。"
+          } >> "$GITHUB_STEP_SUMMARY"

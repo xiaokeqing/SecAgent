@@ -1,0 +1,58 @@
+# ============================================================
+# SecAgent 按发布指针重新部署（systemd service）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-redeploy.timer（每 5 分钟）
+# 做什么：跑 scripts/srv1-redeploy.sh —— 读 ACR 里 stable 的 digest，
+#         与当前运行比对，不同才 pull + 重建 + 硬校验 + 健康核对。
+#         没变时脚本立刻安静退出（幂等），所以 5 分钟一次不是负担。
+#
+# 为什么用 systemd timer 而不是 cron / webhook：
+#   · 零入站端口：服务器不需要被外部触达，攻击面最小
+#   · 服务器不需要 SSH 私钥、不需要 GitHub 凭据，只需要一个只读 ACR 登录
+#   · 天然可审计：journalctl -u secagent-redeploy.service 就是部署历史
+#   · 代价是最长 5 分钟延迟 —— 对这个项目完全可接受
+#
+# 安装（root，srv1）：
+#   install -m 644 deploy/secagent-redeploy.service deploy/secagent-redeploy.timer /etc/systemd/system/ \
+#     && install -m 755 scripts/srv1-redeploy.sh /opt/secagent/scripts/srv1-redeploy.sh \
+#     && systemctl daemon-reload && systemctl enable --now secagent-redeploy.timer
+# 查看：
+#   systemctl list-timers secagent-redeploy.timer
+#   journalctl -u secagent-redeploy.service -n 100 --no-pager
+# 手动跑一次（不等 timer）：
+#   systemctl start secagent-redeploy.service
+#   # 或直接 bash /opt/secagent/scripts/srv1-redeploy.sh --dry-run
+# ============================================================
+[Unit]
+Description=SecAgent 按发布指针（ACR stable digest）重新部署
+Documentation=file:/opt/secagent/RUNBOOK.md
+# 需要 docker；不写 After=network-online 会让刚开机那一次大概率失败
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+# 脚本自己带 flock（/var/lock/secagent-deploy.lock）串行化，
+# 与 rollback / 人工执行互斥，因此这里不需要再叠一层锁。
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-redeploy.sh
+# 部署是"要么整体成功、要么回滚"的动作，超时给足（低配机 Spring 启动要 40~90s）
+TimeoutStartSec=900
+# 失败时保留现场：不自动重试（timer 5 分钟后再来），但日志要留下来
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# 资源占用限制：部署不应把 2C2G 的机器拖死（容器本身 mem_limit 1536m）
+MemoryMax=700M
+CPUQuota=60%
+# 基本加固：脚本只写 /opt/secagent 与 /var/lock，不需要 /usr /boot /etc 可写
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# docker CLI 需要访问 docker.sock，因此不能开 ProtectKernelTunables 之外的更严限制
+# （不启 PrivateDevices/ProtectKernelModules，避免影响 docker CLI 的常规调用）
+
+[Install]
+WantedBy=multi-user.target

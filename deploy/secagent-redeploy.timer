@@ -1,0 +1,26 @@
+# ============================================================
+# SecAgent 部署巡检定时器（每 5 分钟）
+# ------------------------------------------------------------
+# 一行安装命令（root，srv1）：
+#   install -m 644 deploy/secagent-redeploy.service deploy/secagent-redeploy.timer /etc/systemd/system/ \
+#     && install -m 755 scripts/srv1-redeploy.sh /opt/secagent/scripts/srv1-redeploy.sh \
+#     && systemctl daemon-reload && systemctl enable --now secagent-redeploy.timer
+#
+# 为什么 5 分钟、为什么带 RandomizedDelaySec：
+#   · 5 分钟 = 发布延迟上限，可接受；脚本幂等，无变更时几乎零开销
+#   · RandomizedDelaySec=45 让多个实例/多次重启不会在同一秒打 ACR
+#   · Persistent=true：机器关机错过的窗口，开机后补跑一次
+# 注意：OnCalendar 的 *:0/5 表示"每 5 分钟"，别写成 */5（那是"每 5 秒"的常见误写）
+# ============================================================
+[Unit]
+Description=每 5 分钟触发一次 SecAgent 发布指针巡检
+Documentation=file:/opt/secagent/RUNBOOK.md
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=45
+Persistent=true
+Unit=secagent-redeploy.service
+
+[Install]
+WantedBy=timers.target

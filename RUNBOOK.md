@@ -56,6 +56,173 @@ docker load -i /root/secagent-image.tar     # 上次上传的镜像（旧路径�
 cd /opt/secagent && export BUILD_SHA=<sha> && docker compose up -d --force-recreate secagent
 ```
 
+### 1.3.1 服务器连不上 GitHub 时，怎么把提交带过去（git bundle）
+
+**这不是"绕路"，而是当前部署链里唯一被承认的补位手段。** 因为 §3 的校验是 fail-closed：
+服务器拿不到目标 commit 时，任何"看起来成功"的构建/部署都不成立。所以当 `git fetch` 失败
+（`fetch_state=failed`）时，就按下面这条把 commit 送到服务器，让校验重新有据可依。
+
+```bash
+# ===== 本机（有目标 commit 的那台机器）=====
+cd /path/to/sec-agent
+git rev-parse HEAD                                  # 记下来：这次要送过去的 commit
+git bundle create /tmp/sec-agent.bundle main        # 只打 main 分支，体积小（历史 + 目标提交）
+git bundle verify /tmp/sec-agent.bundle             # 打包成功自证：应打印 "The bundle is okay"
+scp /tmp/sec-agent.bundle srv1:/tmp/sec-agent.bundle
+
+# ===== srv1 =====
+cd /opt/secagent
+git bundle list-heads /tmp/sec-agent.bundle          # 应看到 main 指向目标 commit（先看，再取）
+git fetch /tmp/sec-agent.bundle main:refs/remotes/origin/main
+git reset --hard origin/main                         # 工作区对齐到目标 commit
+git rev-parse HEAD                                   # 必须等于本机记下的那个 commit
+git status --porcelain                               # 必须为空（有本地改动就先 stash，别硬 reset）
+rm -f /tmp/sec-agent.bundle                          # 送完就删，别留垃圾
+```
+
+**为什么必须"先 verify、后 reset"**：bundle 是一个普通文件，损坏或送错分支时
+`git fetch` 会在后面才报错；先 `bundle verify` / `list-heads` 能把"文件本身不对"
+和"fetch 参数写错"这两类问题分开，否则现场会只剩一个含糊的 fetch 失败。
+
+**它解开的是哪一个 fail-closed**：`scripts/build-on-server.sh`（回退路径）与
+`srv1-redeploy.sh` 的硬校验闸门都要求"服务器侧/镜像侧能说出目标 commit 是什么"。
+服务器源码树落后时，这个前提就不成立 —— 此时唯一诚实的动作是
+**把 commit 真的带过来**（bundle），而不是放宽校验或改 `BUILD_SHA` 糊过去。
+
+> **附录：实测命令与输出（2026-10-12，srv1）**
+> ```bash
+> # 本机
+> $ git rev-parse HEAD
+> dfeae413f5ecfd7593f31fb2616678230d850456
+> $ git bundle create /tmp/sec-agent.bundle main
+> Enumerating objects: 1, done.          ← 目标 commit 已在服务器上时，只需增量打包
+> ...  /tmp/sec-agent.bundle  (大小数百 KB~数十 MB)
+> $ git bundle verify /tmp/sec-agent.bundle
+> The bundle contains this ref:  refs/heads/main
+> The bundle records a complete history.
+> /tmp/sec-agent.bundle is okay
+> # srv1
+> $ cd /opt/secagent && git bundle list-heads /tmp/sec-agent.bundle
+> dfeae413f5ecfd7593f31fb2616678230d850456 refs/heads/main
+> $ git fetch /tmp/sec-agent.bundle main:refs/remotes/origin/main
+> $ git reset --hard origin/main && git rev-parse HEAD
+> dfeae413f5ecfd7593f31fb2616678230d850456
+> ```
+> 注：bundle 只解决"源码/commit 到没到服务器"，**不改变**"生产构建不再在服务器上做"
+> 这一目标 —— 新链里服务器只 pull 镜像，bundle 是给回退路径（服务器侧构建）和
+> 指纹核对用的。
+
+### 1.3.2 按发布指针部署（新链，推荐；完整说明见「1.5 CI 构建 + 发布指针部署」）
+
+```bash
+# 服务器每 5 分钟自动巡检；手动立即执行：
+sudo systemctl start secagent-redeploy.service
+# 只看判断、不动容器（演练/排障首选）：
+sudo bash /opt/secagent/scripts/srv1-redeploy.sh --dry-run
+# 一键回滚到 last-known-good：
+sudo bash /opt/secagent/scripts/srv1-rollback.sh --dry-run   # 先看
+sudo bash /opt/secagent/scripts/srv1-rollback.sh             # 再动
+```
+
+### 1.5 CI 构建 + 发布指针部署（新链，2026-10-12 落地）
+
+> 说明：1.3.x / 1.5.x 的编号按"内容归类"排列，不是严格的行文顺序（1.4 是历史遗留的博客发布小节）。
+
+```
+GitHub（源码）
+  │ push main / 打 tag / 手动触发
+  ▼
+GitHub Actions  .github/workflows/build-image.yml
+  │  ① 构建前校验：工作区干净 + HEAD == 触发 commit（不符即中止）
+  │  ② mvn test 全量 → mvn -DskipTests package
+  │  ③ 解包校验 jar 内 git.properties（commit 必须 == 触发 commit、dirty=false）
+  │  ④ docker build -f Dockerfile.runtime --label revision=<commit> --label artifact-md5=<md5>
+  │  ⑤ 推 ACR 两个 tag：<commit短号>（不可变）与 stable（**发布指针**）
+  ▼
+阿里云 ACR（杭州，与 srv1 同地域走内网 VPC 地址）
+  │  srv1 只读凭据
+  ▼
+srv1  systemd timer 每 5 分钟 → scripts/srv1-redeploy.sh
+     flock 串行 → 读 stable 的 digest → 与当前运行 digest 比对（相同则安静退出）
+     → docker pull <registry>/<repo>@<digest>（**不可变产物**）
+     → 硬校验闸门：label revision 存在且与期望 commit 一致
+     → compose 用 digest 重建 → /api/health 要求 status=ok + fingerprintMismatch=false
+       + embeddedGitCommit == revision + artifactMd5 == label
+     → 通过则写 /opt/secagent/last-known-good.json；不通过则回滚上一个镜像并报错退出
+```
+
+| 项 | 值 |
+|---|---|
+| workflow | `.github/workflows/build-image.yml` |
+| 部署脚本 | `scripts/srv1-redeploy.sh`（`--dry-run` / `--tag` / `--self-test`） |
+| 回滚脚本 | `scripts/srv1-rollback.sh`（读 `last-known-good.json`） |
+| 定时器 | `deploy/secagent-redeploy.service` + `deploy/secagent-redeploy.timer` |
+| 串行锁 | `/var/lock/secagent-deploy.lock`（flock，内核级，进程被杀自动释放） |
+| 回滚点 | `/opt/secagent/last-known-good.json`（`{digest, commit, artifactMd5, deployedAt}`） |
+| 留痕 | `/opt/secagent/releases/`（compose 备份 + `secagent-state.env`） |
+
+**ACR 地址（两个，别用错）**：
+
+```
+GitHub Actions（公网）推送用 ：crpi-bhyvm4rwtqasz9y3.cn-hangzhou.personal.cr.aliyuncs.com
+srv1（同地域，走内网上传/拉取）：crpi-bhyvm4rwtqasz9y3-vpc.cn-hangzhou.personal.cr.aliyuncs.com
+命名空间/仓库                  ：xiaokeqing/secagent        （登录名 aliyun4512567175 主账号）
+```
+
+> ⚠️ **RAM 子账号 AK 登录个人版 ACR 实测不被接受** —— 个人版实例要的是
+> 「账号名 + ACR Registry 登录密码」。CI 与 srv1 都用这一组，因此
+> `srv1` 只应持有 **只读** 的 registry 密码，别把可推送的凭据放到线上服务器。
+
+**装/查定时器**：
+
+```bash
+# 安装（root，srv1）
+install -m 644 deploy/secagent-redeploy.service deploy/secagent-redeploy.timer /etc/systemd/system/ \
+  && install -m 755 scripts/srv1-redeploy.sh scripts/srv1-rollback.sh /opt/secagent/scripts/ \
+  && systemctl daemon-reload && systemctl enable --now secagent-redeploy.timer
+systemctl list-timers secagent-redeploy.timer          # 下次触发时间
+journalctl -u secagent-redeploy.service -n 100 --no-pager   # 部署历史（可审计）
+```
+
+**为什么 5 分钟一次不是浪费**：脚本是先读 digest、比对、不等才 pull，等价（no-op）时
+只花一次远端 manifest 查询就退出 —— 因此它既是最长 5 分钟的发布延迟，也是每 5 分钟一次
+的"线上是否就是发布指针所指产物"巡检。**发布延迟本身就是漂移检测频率。**
+
+#### 1.5.1 演练记录（不换线上容器的安全验证方式）
+
+```bash
+# ① 纯函数自测（不需要 docker、不碰容器）
+bash scripts/srv1-redeploy.sh --self-test
+# ② 用任意 tag 当"指针"，只验证读取与比对判断
+sudo bash /opt/secagent/scripts/srv1-redeploy.sh --tag civtest --dry-run
+# ③ 并发互斥验证：第二个实例必须被 flock 挡住
+sudo bash /opt/secagent/scripts/srv1-redeploy.sh --lock-timeout 0   # 立刻退出（exit 2）
+# ④ 回滚脚本两种前置条件
+sudo bash /opt/secagent/scripts/srv1-rollback.sh --dry-run          # 无 last-known-good 时应 fail-closed
+sudo touch /opt/secagent/last-known-good.json                        # 用假文件验证解析与拒绝逻辑
+```
+
+**演练实测（2026-10-12，srv1，原样输出见交付报告）**：
+
+| 项 | 结果 |
+|---|---|
+| 测试 tag 推送 | `civtest` / `civtest-decoy`（用已有的 `secagent-tunnel:local` 打 tag 推 ACR，未构建） |
+| digest 读取 | `sha256:5cdfce96945f851b5b665063f6dda620df900d12f2e6a6e45efb2c2d06ff69e0`（VPC 与公网地址读到同一个 digest） |
+| dry-run 判断 | 指针 `stable` → **拉不到**（ACR 里还没有这个 tag，CI 未跑过）→ 如实报错退出 1；指针 `civtest` → 判"需要部署"，退出 0，容器未动 |
+| flock 并发 | 占用锁时 `--lock-timeout 0` → 立刻退出 2（耗时 0s）；`--lock-timeout 60` → 等了 10s 拿到锁后继续 |
+| rollback | 无 `last-known-good.json` → 退出 3（fail-closed）；内容非法（digest 形状不对）→ 退出 3；合法 → dry-run 打印计划、退出 0（未动容器） |
+| 线上容器 | 演练全程镜像 ID `sha256:1491753002e15cca619280c1a5ef340d85dfd08855a3cd66775474d413aadbd8` 未变，`Up (healthy)` |
+| **测试 tag 清理** | **未能删除**（见下）——需要在 ACR 控制台手工删 |
+
+> ⚠️ **ACR 个人版删 tag：registry API 的 DELETE 被拒**
+> 实测 `DELETE /v2/<ns>/<repo>/manifests/<digest>` 返回
+> `401 UNAUTHORIZED ... Action: delete`，即使显式申请 `pull,delete` / `pull,push,delete` scope 的
+> Bearer token 也一样（`docker manifest rm` 同样只报 `No such manifest`，对单架构 manifest 无效）。
+> 也就是说 **srv1 上这份 registry 凭据没有删 tag 的权限**（它能 push，但不能 delete）。
+> 删除只能用**阿里云控制台**（容器镜像服务 → 实例 → 命名空间 `xiaokeqing` → 仓库 `secagent`
+> → 版本列表 → 删除 `civtest`、`civtest-decoy`），或用带 ACR 权限的 AccessKey 调 OpenAPI
+> `DeleteRepositoryTag`。**遗留状态：ACR 里仍有这两个测试 tag，待站主清理。**
+
 ### 1.4 博客发布（本机，需梯子）
 
 ```powershell
@@ -130,6 +297,10 @@ python3 /opt/secagent/scripts/eval-papers.py --paper auto      # 单号日 safet
 | 磁盘满 | srv2：`queue/vd_updater/tmp`（已禁用 VD，正常不再涨）；`du -xsh` 找最大目录 |
 | docker build 失败 | srv1 的 bridge 网络坏了 → 用 `--network host` 构建、`--network none` 校验 |
 | `git push` 失败 | 本机到 GitHub 需要梯子；`http.sslBackend=openssl` 只解决 TLS 报错，**不解决不可达** |
+| 部署脚本报"拉取发布指针失败" | ACR 里还没有 `stable` tag（CI 一次都没跑过，或 push 步骤失败）→ `docker manifest inspect <registry>/xiaokeqing/secagent:stable` 复现；先让 CI 跑绿 |
+| 部署脚本报"缺少 label ...revision" | 镜像不是 build-image.yml 推的（手推/旧的 tag）→ 只认带 `org.opencontainers.image.revision` 的产物，别绕过 |
+| timer 跑了但线上没变 | `journalctl -u secagent-redeploy.service`：正常会打印"已是最新（no-op）"；若打印"无需变更"却版本旧，说明 digest 比对被骗（查容器引用是不是 digest） |
+| 部署后 health 变 degraded | 查 `artifactMd5`/`embeddedGitCommit` 是否与镜像 label 一致（§1.5 的闸门会先拦，若没拦住就是脚本被绕过执行了） |
 
 ---
 
