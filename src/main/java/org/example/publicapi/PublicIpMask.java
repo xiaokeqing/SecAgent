@@ -86,7 +86,13 @@ public final class PublicIpMask {
         if (text == null || text.isEmpty()) {
             return text;
         }
-        java.util.regex.Matcher m = IPV4_IN_TEXT.matcher(text);
+        String out = replaceAll(text, IPV4_IN_TEXT);
+        out = replaceAll(out, IPV6_IN_TEXT);
+        return out;
+    }
+
+    private static String replaceAll(String text, java.util.regex.Pattern p) {
+        java.util.regex.Matcher m = p.matcher(text);
         StringBuilder sb = new StringBuilder();
         while (m.find()) {
             m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(String.valueOf(mask(m.group()))));
@@ -95,8 +101,31 @@ public final class PublicIpMask {
         return sb.toString();
     }
 
+    /**
+     * 自由文本里的 IPv4。
+     *
+     * <p><b>为什么不能再用 {@code \b}</b>：线上运行在 JDK 17 上，而 JDK 19 之前 {@code \b} 的
+     * "词字符"判定是 <b>Unicode 感知</b>的 —— 中文也算词字符。于是
+     * {@code 103.146.184.77和} 里 IP 后面紧跟一个汉字，<b>就没有词边界</b>，整条规则匹配失败，
+     * 这个 IP 会原样透出到公开回答里（2026-10-13 匿名抽检实测泄露过 3 个完整 IP，
+     * 而同一次响应里的 {@code outputFindings} 还写着 {@code ip-masked} —— 护栏以为掩过了）。
+     *
+     * <p>修法：用显式 lookaround 代替 {@code \b} ——
+     * {@code (?<![\d.])} 与 {@code (?![\d.])} 只在"前后不是数字或点"时成立，
+     * 与"什么算词字符"无关，因此中文、英文、标点相邻都能正确掩码；
+     * 同时 {@code 1.2.3.4.5}/{@code 103.146.184.771} 这种更长数字串不会被误切。
+     */
     private static final java.util.regex.Pattern IPV4_IN_TEXT =
-            java.util.regex.Pattern.compile("\\b(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\b");
+            java.util.regex.Pattern.compile("(?<![\\d.])(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})(?![\\d.])");
+
+    /**
+     * 自由文本里的 IPv6。
+     *
+     * <p>要求至少 4 组十六进制（{@code ::} 压缩写法的常见形式），
+     * 这样 {@code 10:20:30} 这类时间戳不会被误掩码（它只有 3 组数字）。
+     */
+    private static final java.util.regex.Pattern IPV6_IN_TEXT =
+            java.util.regex.Pattern.compile("(?<![0-9A-Fa-f:])((?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4})(?![0-9A-Fa-f:])");
 
     /**
      * 内网 / 保留网段判定。
