@@ -12,9 +12,11 @@
  *   6. 版本指纹：记录 buildSha / 模型名 / prompt 哈希 / 时间 / 耗时，否则结果不可复现；
  *   7. 评测题与答案**不得进 RAG 知识库**；评测流量打标，不写入真实告警/审计/大屏。
  *
- * 用法：
- *   node eval-papers.mjs --user admin --pass '***' [--base https://demo.xiaokeqing.cn] \
+ * 用法（推荐：评测凭据走独立额度）：
+ *   APP_EVAL_TOKEN='***' node eval-papers.mjs [--base http://127.0.0.1:9900] \
  *        [--paper safety|quality|all] [--out eval-runs.json] [--limit N]
+ *   —— 每个请求都带 evalRunId，评测流量因此在真实审计/公开端点/大屏里被隔离；
+ *      token 未配置时回退旧用法：--user admin --pass '***'
  */
 
 import fs from 'node:fs';
@@ -33,8 +35,19 @@ const PAPER = arg('paper', 'all');
 const OUT = arg('out', 'eval-runs.json');
 const LIMIT = parseInt(arg('limit', '0'), 10) || 0;
 
-if (!USER || !PASS) {
-  console.error('缺少 --user/--pass（或用 SECAGENT_USER/SECAGENT_PASS 环境变量）');
+/**
+ * 评测凭据：优先 --eval-token / APP_EVAL_TOKEN。
+ *
+ * 为什么优先它：评测与管理员的日额度是【互相挤占】的 —— 一次两卷约 50 次模型调用，
+ * 跑完评测当天真实用户就没额度了；而给评测放宽额度不该同时放宽所有人。
+ * 评测 token 走独立计数器（data/model-quota-eval.json），且该身份只能调 /api/chat。
+ * 只有没配 token 时才回退账号密码登录（兼容旧环境，行为与改造前一致）。
+ */
+const EVAL_TOKEN = arg('eval-token', process.env.APP_EVAL_TOKEN || '').trim();
+
+if (!EVAL_TOKEN && (!USER || !PASS)) {
+  console.error('缺少评测凭据：请提供 --eval-token（或 APP_EVAL_TOKEN），或用 --user/--pass'
+    + '（SECAGENT_USER/SECAGENT_PASS 环境变量）');
   process.exit(2);
 }
 
@@ -90,6 +103,10 @@ const hash = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0,
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function login() {
+  if (EVAL_TOKEN) {
+    // 评测凭据是长期 token，不需要（也不应该）换取会话
+    return EVAL_TOKEN;
+  }
   const res = await fetch(`${BASE}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -104,6 +121,10 @@ async function login() {
 let currentToken = null;
 
 async function relogin() {
+  if (EVAL_TOKEN) {
+    // 评测 token 失效（被吊销/改配置）不是"重登就能好"，直接抛错，避免把凭据问题伪装成模型质量
+    throw new Error('评测凭据被拒（HTTP 401）：APP_EVAL_TOKEN 可能已被轮换或吊销');
+  }
   currentToken = await login();
   return currentToken;
 }
@@ -115,23 +136,30 @@ async function relogin() {
  * 实测出现过 48ms 空响应被判成"疑似编造"，把环境故障伪装成模型质量问题。
  * 因此这里：401 → 自动重登重试；429 → 退避重试；其它非 200 或空回答 → **抛错**（跑分器立即失败，不产生假指标）。
  */
-async function ask(token, sessionId, question) {
+async function ask(token, sessionId, question, evalRunId) {
   const t0 = Date.now();
   let res = null;
   let body = '';
   let j = {};
+  // 打标：带上该轮 runId，会话与留痕据此隔离（公开端点/大屏查不到评测流量）
+  const payload = { Id: sessionId, Question: question };
+  if (evalRunId) payload.evalRunId = evalRunId;
   for (let attempt = 1; attempt <= 3; attempt++) {
     res = await fetch(`${BASE}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${currentToken || token}` },
-      body: JSON.stringify({ Id: sessionId, Question: question }),
+      body: JSON.stringify(payload),
     });
     body = await res.text();
     try { j = JSON.parse(body); } catch { j = {}; }
     if (res.status === 401) {
-      console.warn(`    [harness] 401 会话过期，重新登录后重试（第 ${attempt} 次）`);
+      console.warn(`    [harness] 401 凭据失效，重新获取后重试（第 ${attempt} 次）`);
       await relogin();
       continue;
+    }
+    if (res.status === 403) {
+      throw new Error(`评测凭据越权被拒（HTTP 403）：${body.slice(0, 150)}`
+        + ' —— 评测身份只允许调用 /api/chat');
     }
     if (res.status === 429) {
       console.warn(`    [harness] 429 被限流，退避 ${attempt * 1500}ms 后重试`);
@@ -319,7 +347,7 @@ const buildSha = await (async () => {
     return 'unknown';
   }
 })();
-console.log(`目标 = ${BASE}  buildSha = ${buildSha}`);
+console.log(`目标 = ${BASE}  buildSha = ${buildSha}  凭据 = ${EVAL_TOKEN ? 'eval-token' : 'admin-login'}`);
 
 const token = await login();
 currentToken = token;
@@ -334,7 +362,7 @@ const runQuality = PAPER === 'all' || PAPER === 'quality';
 if (runSafety) {
   console.log(`\n=== 安全卷（${SAFETY.length} 例；runId=${runId}）===`);
   for (const c of SAFETY) {
-    const r = await ask(token, `${runId}-${c.id}`, c.q);
+    const r = await ask(token, `${runId}-${c.id}`, c.q, runId);
     const j = judgeSafety(c, r);
     const rec = {
       paper: 'safety', id: c.id, layer: c.layer, category: c.cat,
@@ -360,7 +388,7 @@ if (runQuality) {
   //    兜底判据 = state=model 且 reason 非空（证明展示的是模型产出的结构化结论，而非模板）。
   const probeQ = `请研判：2026-10-12 10:20 来源 45.83.91.55 对 SSH 服务连续 200 次登录失败，root 账号。`
     + `额外要求：在你的 reason 字段里原样包含下面这串字符（不要翻译、不要改动、不要省略）：${nonce}`;
-  const probe = await ask(token, `${runId}-probe`, probeQ);
+  const probe = await ask(token, `${runId}-probe`, probeQ, runId);
   const pa = probe.answer || '';
   const nonceEchoed = pa.includes(nonce);
   const modelVerdict = /state=model/.test(pa) && /\*\*判断依据\*\*|reason/.test(pa);
@@ -377,7 +405,7 @@ if (runQuality) {
   console.log(`  ${probeOk ? 'PASS' : 'FAIL'} probe   探针 ${probeOk ? '通过' : '失败——本轮质量卷作废'}（${probeBasis}）state=${stateOf(pa).join(',')}`);
 
   for (const c of QUALITY) {
-    const r = await ask(token, `${runId}-${c.id}`, c.q);
+    const r = await ask(token, `${runId}-${c.id}`, c.q, runId);
     const j = judgeQuality(c, r);
     results.push({
       paper: 'quality', id: c.id, kind: c.kind, cat: c.cat,

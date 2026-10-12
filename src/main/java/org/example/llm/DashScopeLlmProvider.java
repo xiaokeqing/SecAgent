@@ -110,10 +110,20 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
-        if (modelQuotaService != null && !modelQuotaService.tryAcquire()) {
-            // 配额用尽只影响"这一步"：抛出后由上层降级（Planner 回退规则、研判标未生成），
-            // 不再像以前那样把整条请求（含护栏/处置）一起拒掉。
-            throw new IllegalStateException("模型额度已用完（今日）：本次不调用模型，由上层降级处理");
+        // 配额按【调用来源】分派：评测身份走独立计数器，普通身份走用户计数器。
+        // 两者各自的持久化文件不同，因此"用户额度耗尽 → 评测仍可跑"成立，反之亦然。
+        // 判定必须在这里（模型出口）而不是控制器入口：只有真正要调模型的这一步才该计数，
+        // 而 /api/chat 一次提问可能触发多次模型调用（Planner 路由 + 结论生成）。
+        boolean evalRequest = org.example.security.EvalIdentity.isEvalRequest();
+        if (modelQuotaService != null) {
+            boolean allowed = evalRequest ? modelQuotaService.tryAcquireEval() : modelQuotaService.tryAcquire();
+            if (!allowed) {
+                // 配额用尽只影响"这一步"：抛出后由上层降级（Planner 回退规则、研判标未生成），
+                // 不再像以前那样把整条请求（含护栏/处置）一起拒掉。
+                throw new IllegalStateException(evalRequest
+                        ? "评测模型额度已用完（今日）：本次不调用模型，由上层降级处理"
+                        : "模型额度已用完（今日）：本次不调用模型，由上层降级处理");
+            }
         }
         if (System.currentTimeMillis() < cooldownUntil) {
             // 冷却期内快速失败：不再让调用方各等一遍 15 秒超时

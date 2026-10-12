@@ -99,6 +99,17 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
     @Autowired
     private KnowledgePendingService knowledgePendingService;
 
+    /** 响应护栏（只读判定用）。可空注入，便于单测。 */
+    @Autowired(required = false)
+    private org.example.security.ResponseGuard responseGuard;
+
+    /**
+     * 评测留痕（评测模拟处置只写这里，<b>不写真实处置审计</b>）。
+     * 可空注入：便于单测，也不会因为缺这个 Bean 就让编排起不来。
+     */
+    @Autowired(required = false)
+    private org.example.eval.EvalAuditService evalAuditService;
+
     @Value("${spring.ai.dashscope.api-key:sk-placeholder}")
     private String dashScopeApiKey;
 
@@ -647,6 +658,14 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
 
     /** RESPONDER 处置执行员：工具=SecurityActionTools（内部强制护栏/审批/审计）+ 时间 */
     private AgentStepResult runResponder(DispatchDecision d, String userInput, long start, Map<AgentRole, String> bodies) {
+        // ---------- 评测身份：一律走"模拟"路径，绝不下发真实动作 ----------
+        // 理由：评测会反复问"请封禁 xxx"来测护栏与路由。如果评测身份能真下发，
+        // 跑一轮评测就可能把真实 IP 封掉 —— 安全评测本身变成事故来源。
+        // 这里在【工具调用之前】分叉，所以 ResponseGuard/审批/审计/BlockRecordStore
+        // 一个都不会被碰到（不封禁、不落库、不写真实审计）。
+        if (org.example.security.EvalIdentity.isEvalRequest()) {
+            return runResponderSimulated(d, userInput, start, bodies);
+        }
         String reason = "多智能体协同处置：" + userInput;
         String resultText;
         String title;
@@ -680,8 +699,101 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         return step;
     }
 
-    private String assembleFinalAnswer(String question, DispatchDecision d, AgentStepResult specialist,
-                                      Map<AgentRole, String> bodies) {
+    /**
+     * 评测身份的 RESPONDER：<b>只模拟、不下发</b>。
+     *
+     * <h3>为什么必须单独一条路径</h3>
+     * 评测用例里本来就有"请封禁 192.0.2.66 / 127.0.0.1 / 169.254.169.254 / 10.0.0.1"，
+     * 目的是测<b>护栏会不会拦</b>。如果评测身份能真下发，跑一轮评测就可能封掉真实地址。
+     * 所以这里在调用 {@link SecurityActionTools} 之前就分叉：
+     * <ul>
+     *   <li>只做<b>只读</b>的护栏判定（{@code ResponseGuard.validateBlock}），不执行任何动作；</li>
+     *   <li>不写 {@code ResponseActionService} 的审计、不登记封禁记录、不触碰审批；</li>
+     *   <li>留痕写评测专属文件（{@link org.example.eval.EvalAuditService}），带 evalRunId。</li>
+     * </ul>
+     * 回答里如实标注"评测身份：仅模拟，不实际执行"，并保持与真实路径一致的
+     * {@code 【…】结果：… / 目标：… / 模式：… / 说明：…} 形状，评测判定器无需特判。
+     */
+    private AgentStepResult runResponderSimulated(DispatchDecision d, String userInput, long start,
+                                                  Map<AgentRole, String> bodies) {
+        String evalRunId = org.example.security.EvalIdentity.currentRunId();
+        String actionName;
+        String target;
+        String guardReason;
+        String mode;
+
+        if ("lockAccount".equals(d.actionType)) {
+            actionName = "锁定账号";
+            target = d.account == null ? "（未指定）" : d.account;
+            guardReason = "评测身份不执行账号锁定，一律仅模拟";
+            mode = "SIMULATED";
+        } else if ("killProcess".equals(d.actionType)) {
+            actionName = "结束进程";
+            target = (d.pid != null && !d.pid.isEmpty()) ? d.pid : (d.processName == null ? "（未指定）" : d.processName);
+            guardReason = "评测身份不执行进程结束，一律仅模拟";
+            mode = "SIMULATED";
+        } else {
+            actionName = "封禁IP";
+            target = d.ip == null ? "（未指定）" : d.ip;
+            // 只读护栏判定：这是评测真正要观测的信号（受保护地址是否被拦），不产生任何副作用
+            guardReason = evalGuardReason(d.ip, d.durationMinutes);
+            mode = guardReason != null ? "BLOCKED" : "SIMULATED";
+        }
+
+        boolean blocked = guardReason != null;
+        String title = "处置执行：模拟（评测身份按设计不下发动作）";
+        String resultText = "【" + actionName + "】结果：" + (blocked ? "未执行（被护栏拦截）" : "未执行（评测身份仅模拟）") + "\n"
+                + "目标：" + target + "\n"
+                + "模式：" + mode + "\n"
+                + "说明：" + (blocked
+                        ? "评测身份：仅模拟，不实际执行 —— 该目标命中保护策略，真实链路同样会被护栏拦截（" + guardReason + "）"
+                        : "评测身份：仅模拟，不实际执行 —— 未向任何真实主机下发动作");
+        if (evalRunId != null) {
+            resultText = resultText + "\n评测轮次：" + evalRunId;
+        }
+
+        try {
+            if (evalAuditService != null) {
+                evalAuditService.append(evalRunId, actionName, target,
+                        blocked ? "护栏判定=" + guardReason : "护栏判定=放行（但评测身份不下发）", mode);
+            }
+        } catch (Exception e) {
+            logger.warn("[MultiAgent] 评测留痕写入失败（不影响评测）: {}", e.getMessage());
+        }
+
+        String summary = "评测身份：仅模拟，不实际执行"
+                + (blocked ? "（命中护栏，判定为拦截）" : "（护栏判定为放行）");
+        String body = "## 处置结果（评测模式）\n"
+                + "> **评测身份：仅模拟，不实际执行** —— 本次没有向任何真实主机下发封禁/锁定/结束进程动作。\n"
+                + "> 结论生成方式：**规则解析**（动作类型与参数来自编排层规则解析，非模型产出）\n"
+                + "> state=rule-based-eval-simulated\n\n"
+                + "评测流量按设计只测「路由 + 护栏判定 + 回答形状」，不产生真实处置副作用；"
+                + "留痕写在评测专属文件（不进入真实处置审计、不进入公开端点、不影响大屏计数）：\n\n"
+                + "```\n" + clip(resultText, 800) + "\n```\n\n"
+                + (blocked ? "**护栏判定：命中保护策略**，真实链路同样会被拦截并未下发。"
+                          : "**护栏判定：放行**（但评测身份依旧不下发动作）。");
+
+        AgentStepResult step = new AgentStepResult(AgentRole.RESPONDER.getDisplayName(), AgentRole.RESPONDER.name(),
+                "responder_agent", title, summary, clip(resultText, 1500),
+                System.currentTimeMillis() - start, true);
+        bodies.put(AgentRole.RESPONDER, body);
+        return step;
+    }
+
+    /** 只读护栏判定：返回拦截原因；未命中返回 null。护栏 Bean 缺失时按"无法判定"返回 null（不假装拦截） */
+    private String evalGuardReason(String ip, Integer durationMinutes) {
+        if (responseGuard == null || ip == null) {
+            return null;
+        }
+        try {
+            return responseGuard.validateBlock(ip, durationMinutes);
+        } catch (Exception e) {
+            logger.warn("[MultiAgent] 评测护栏判定异常（按未拦记录）: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private String assembleFinalAnswer(String question, DispatchDecision d, AgentStepResult specialist, Map<AgentRole, String> bodies) {
         StringBuilder sb = new StringBuilder();
         sb.append("## 多智能体协同结果\n\n");
         sb.append("> 调度员判定本次任务为【").append(d.role.getDisplayName()).append("】，由对应专职智能体执行。\n\n");

@@ -100,6 +100,19 @@ services:
                  "response":{"self-assets":"${SECAGENT_SELF_ASSETS:-}"}},
          "vector":{"kb":{"auto-index":${VECTOR_KB_AUTO_INDEX:-false}}}}
 
+      # ===== 评测身份（独立凭据 + 独立额度 + 流量打标）=====
+      # 为什么必须显式写在这里，而不是只依赖 env_file:
+      #   env_file 是"运行时兜底"—— .env 里漏了 APP_EVAL_TOKEN 时容器照样起来，
+      #   评测身份静默关闭（app.eval.token 为空即功能关闭），外部看不出任何异常；
+      #   下一轮评测又会退回管理员账号密码，于是"跑完评测当天用户没额度"这个
+      #   老问题会悄悄回来。显式声明 + 下面的默认空值把这条依赖写在部署面上。
+      #
+      # 空值时的行为：评测身份关闭，行为与改造前一致（不影响任何现有功能）。
+      # 一旦配置，该 token 只能调 /api/chat，且模型调用走 data/model-quota-eval.json
+      # 这个独立计数器 —— 用户额度 50/天 不会被评测跑卷吃光。
+      # 生成：openssl rand -hex 32，写入 /opt/secagent/.env（权限 600），不要进 git。
+      APP_EVAL_TOKEN: "${APP_EVAL_TOKEN:-}"
+
       TZ: Asia/Shanghai
 
     volumes:

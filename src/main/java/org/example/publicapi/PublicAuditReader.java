@@ -24,11 +24,13 @@ import java.util.Map;
  * 就等于把"能封 IP 的对象"挂到了公开接口的调用栈上。
  * <p>
  * 审计留痕本身就是两个 JSON 文件（{@code blocked-ips.json} / {@code response-audit.json}），
- * 这里只做<b>读取 + 脱敏</b>，不写、不改、不删：
+ * 这里只做<b>读取 + 脱敏 + 隔离</b>，不写、不改、不删：
  * <ul>
  *   <li>IP 一律掩码到网段（{@link PublicIpMask}）；</li>
  *   <li>只输出白名单字段（操作者、动作、结果、时间、审计 ID），
- *       不返回 detail 里的原始文本（可能含内网信息）。</li>
+ *       不返回 detail 里的原始文本（可能含内网信息）；</li>
+ *   <li><b>评测流量（actor 以 {@code eval-} 开头）一律丢弃</b> —— 公网端点是"真实使用"的展示面，
+ *       评测记录混进来会让封禁/处置计数凭空上涨（而实际什么都没封）。</li>
  * </ul>
  */
 @Component
@@ -40,10 +42,13 @@ public class PublicAuditReader {
     @Value("${app.public-api.data-dir:/app/data}")
     private String dataDir;
 
-    /** 封禁记录（最近若干条，已掩码） */
+    /** 封禁记录（最近若干条，已掩码；评测记录已丢弃） */
     public List<Map<String, Object>> blocks(int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (JsonNode n : readArray("blocked-ips.json")) {
+            if (isEvalRecord(n)) {
+                continue;
+            }
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", text(n, "id"));
             m.put("ip", PublicIpMask.mask(text(n, "ip")));
@@ -63,10 +68,13 @@ public class PublicAuditReader {
         return out.size() > limit ? out.subList(0, Math.max(1, limit)) : out;
     }
 
-    /** 处置审计流水（最近若干条，已掩码） */
+    /** 处置审计流水（最近若干条，已掩码；评测记录已丢弃） */
     public List<Map<String, Object>> actions(int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (JsonNode n : readArray("response-audit.json")) {
+            if (isEvalRecord(n)) {
+                continue;
+            }
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", text(n, "id"));
             m.put("time", text(n, "time"));
@@ -114,6 +122,23 @@ public class PublicAuditReader {
     }
 
     // ==================== 工具 ====================
+
+    /**
+     * 是否为评测流量记录。
+     *
+     * <p>判据取两个显式标记，任一命中即隔离：
+     * {@code evalRunId}（评测脚本的 runId）非空，或 {@code actor} 以 {@code eval-} 开头。
+     * 这里用"白名单式的正向判据"而不是靠人记得别写评测数据 ——
+     * 真实处置审计里正常不会有这两个标记，所以过滤不会误伤。
+     */
+    static boolean isEvalRecord(JsonNode n) {
+        JsonNode runId = n.path("evalRunId");
+        if (!runId.isMissingNode() && !runId.isNull() && !runId.asText("").isBlank()) {
+            return true;
+        }
+        String actor = n.path("actor").asText("");
+        return actor.startsWith(org.example.security.EvalIdentity.ACTOR_PREFIX);
+    }
 
     private List<JsonNode> readArray(String fileName) {
         List<JsonNode> out = new ArrayList<>();

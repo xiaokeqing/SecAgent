@@ -73,8 +73,22 @@ public class ChatController {
 
     /** 在总预算内执行编排；超时抛 {@link IllegalStateException}（由调用处转成"未生成"响应） */
     private MultiAgentResult callWithDeadline(String question, List<Map<String, String>> history) {
-        java.util.concurrent.Future<MultiAgentResult> future =
-                ORCHESTRATOR_POOL.submit(() -> multiAgentCoordinator.routeAndRun(question, history));
+        // 编排跑在线程池上，评测标注必须带进去；跑完必须清掉。
+        // 用 InheritableThreadLocal 载体可以"继承"，但线程池会复用线程 ——
+        // 不在任务末尾显式清空，下一个普通请求就可能被当成评测请求
+        // （免费额度 + 动作真下发），而且没有任何报错。
+        final boolean evalRequest = org.example.security.EvalIdentity.isEvalRequest();
+        final String runId = org.example.security.EvalIdentity.currentRunId();
+        java.util.concurrent.Future<MultiAgentResult> future = ORCHESTRATOR_POOL.submit(() -> {
+            if (evalRequest) {
+                org.example.security.EvalIdentity.beginEvalRequest(runId);
+            }
+            try {
+                return multiAgentCoordinator.routeAndRun(question, history);
+            } finally {
+                org.example.security.EvalIdentity.endEvalRequest();
+            }
+        });
         try {
             return future.get(chatDeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
@@ -123,9 +137,42 @@ public class ChatController {
      * 与 /chat_react 逻辑一致，但直接返回完整结果而非流式输出
      */
     @PostMapping("/chat")
-    public ResponseEntity<ApiResponse<ChatResponse>> chat(@RequestBody ChatRequest request) {
+    public ResponseEntity<ApiResponse<ChatResponse>> chat(@RequestBody ChatRequest request,
+                                                          jakarta.servlet.http.HttpServletRequest httpRequest) {
+        // ---------- 评测身份（app.eval.token）----------
+        // 由 ApiTokenInterceptor 识别后写入 secagent.role=EVAL。这里做两件事：
+        //   ① 打标：把评测脚本的 evalRunId 写进会话与线程上下文（便于隔离与追溯）；
+        //   ② 标注"本次是评测请求"：模型配额走独立计数器，RESPONDER 走模拟路径。
+        // 作用域只覆盖本次请求的编排，finally 里必须清掉 —— 编排跑在复用线程池上，
+        // 残留会让下一个普通请求被当成评测（等于白送额度）。
+        boolean evalRequest = httpRequest != null
+                && org.example.security.Role.EVAL.equals(httpRequest.getAttribute("secagent.role"));
+        String evalRunId = evalRequest
+                ? org.example.security.EvalIdentity.normalizeRunId(request.getEvalRunId())
+                : null;
+        if (evalRequest) {
+            org.example.security.EvalIdentity.beginEvalRequest(evalRunId);
+        }
         try {
-            logger.info("收到对话请求 - SessionId: {}, Question: {}", request.getId(), request.getQuestion());
+            logger.info("收到对话请求 - SessionId: {}, Question: {}, {}",
+                    request.getId(), request.getQuestion(),
+                    evalRequest ? ("评测身份 runId=" + evalRunId) : "普通身份");
+            return doChat(request, evalRunId);
+        } finally {
+            if (evalRequest) {
+                org.example.security.EvalIdentity.endEvalRequest();
+            }
+        }
+    }
+
+    private ResponseEntity<ApiResponse<ChatResponse>> doChat(ChatRequest request, String evalRunId) {
+        try {
+            // 配额检查已下移到 LlmProvider（模型出口），评测身份在同一个出口走【独立计数器】：
+            // 原先在这里"超限直接拒绝整条请求"，导致配额用尽时连【规则路由 + 护栏 + 审计 + 处置】
+            // 这些不依赖模型的能力也一起失效（实测：纯处置请求 25ms 被拒、护栏未生效）。
+            // 现在只有真正要调模型的那一步受配额影响，上层按既有降级路径处理。
+            // 因此这里刻意【不】额外占一次评测额度 —— 否则一次提问计两次，
+            // 计数含义就与用户额度不一致了（用户额度按模型调用次数计）。
 
             // 参数校验
             if (request.getQuestion() == null || request.getQuestion().trim().isEmpty()) {
@@ -133,13 +180,8 @@ public class ChatController {
                 return ResponseEntity.ok(ApiResponse.success(ChatResponse.error("问题内容不能为空")));
             }
 
-            // 配额检查已下移到 LlmProvider（模型出口）：
-            // 原先在这里"超限直接拒绝整条请求"，导致配额用尽时连【规则路由 + 护栏 + 审计 + 处置】
-            // 这些不依赖模型的能力也一起失效（实测：纯处置请求 25ms 被拒、护栏未生效）。
-            // 现在只有真正要调模型的那一步受配额影响，上层按既有降级路径处理。
-
-            // 获取或创建会话
-            SessionInfo session = getOrCreateSession(request.getId());
+            // 获取或创建会话（评测请求把 runId 打在会话上，便于隔离与追溯）
+            SessionInfo session = getOrCreateSession(request.getId(), evalRunId);
             
             // 获取历史消息
             List<Map<String, String>> history = session.getHistory();
@@ -470,6 +512,7 @@ public class ChatController {
                 response.setSessionId(sessionId);
                 response.setMessagePairCount(session.getMessagePairCount());
                 response.setCreateTime(session.createTime);
+                response.setEvalRunId(session.getEvalRunId());
                 return ResponseEntity.ok(ApiResponse.success(response));
             } else {
                 return ResponseEntity.ok(ApiResponse.error("会话不存在"));
@@ -484,6 +527,14 @@ public class ChatController {
     // ==================== 辅助方法 ====================
 
     private SessionInfo getOrCreateSession(String sessionId) {
+        return getOrCreateSession(sessionId, null);
+    }
+
+    /**
+     * 取/建会话。{@code evalRunId} 非空时写到会话上（评测流量打标），
+     * 供 {@code /api/chat/session/{id}} 与排障日志区分该会话是不是评测产生的。
+     */
+    private SessionInfo getOrCreateSession(String sessionId, String evalRunId) {
         if (sessionId == null || sessionId.isEmpty()) {
             sessionId = UUID.randomUUID().toString();
         }
@@ -492,6 +543,9 @@ public class ChatController {
         final String sid = sessionId;
         SessionInfo session = sessions.computeIfAbsent(sid, SessionInfo::new);
         session.touch();
+        if (evalRunId != null) {
+            session.markEval(evalRunId);
+        }
         return session;
     }
 
@@ -526,6 +580,8 @@ public class ChatController {
         private final long createTime;
         // 最近访问时间，用于 TTL 过期清理与 LRU 淘汰
         private volatile long lastAccessTime;
+        /** 评测轮次标记：非 null 表示本会话由评测脚本产生（打标/隔离用） */
+        private volatile String evalRunId;
         private final ReentrantLock lock;
 
         public SessionInfo(String sessionId) {
@@ -539,6 +595,16 @@ public class ChatController {
         /** 更新最近访问时间 */
         public void touch() {
             this.lastAccessTime = System.currentTimeMillis();
+        }
+
+        /** 打上评测轮次标记（评测脚本的 runId） */
+        public void markEval(String runId) {
+            this.evalRunId = runId;
+        }
+
+        /** 评测轮次；普通会话为 null */
+        public String getEvalRunId() {
+            return evalRunId;
         }
 
         public long getLastAccessTime() {
@@ -636,6 +702,15 @@ public class ChatController {
         @com.fasterxml.jackson.annotation.JsonAlias({"question", "QUESTION"})
         private String Question;
 
+        /**
+         * 评测轮次标记（可选）。评测脚本生成形如 {@code EVAL-xxxxxx} 的 runId 后随请求带上，
+         * 用于把该会话与留痕标记为评测流量（公开端点与真实审计据此隔离）。
+         * 普通前端不传，行为不变。
+         */
+        @com.fasterxml.jackson.annotation.JsonProperty(value = "evalRunId")
+        @com.fasterxml.jackson.annotation.JsonAlias({"evalRunId", "eval_run_id", "EvalRunId"})
+        private String evalRunId;
+
     }
 
     /**
@@ -660,6 +735,8 @@ public class ChatController {
         private String sessionId;
         private int messagePairCount;
         private long createTime;
+        /** 评测轮次标记；普通会话为 null */
+        private String evalRunId;
     }
 
     /**

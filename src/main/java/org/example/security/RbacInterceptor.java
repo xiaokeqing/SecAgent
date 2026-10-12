@@ -63,8 +63,10 @@ public class RbacInterceptor implements HandlerInterceptor {
             return writeError(response, HttpStatus.UNAUTHORIZED, "未授权访问：请先登录");
         }
         if (role != Role.ADMIN) {
-            logger.warn("分析员 {} 尝试访问管理员接口 {}，已拒绝",
-                    request.getAttribute("secagent.user"), path);
+            // EVAL（评测身份）走的也是这条：它的调用范围在 ApiTokenInterceptor 里已收敛到
+            // /api/chat，这里是第二道锁 —— 万一将来放开路径，处置类端点仍然进不来。
+            logger.warn("角色 {}（用户 {}）尝试访问管理员接口 {}，已拒绝",
+                    role, request.getAttribute("secagent.user"), path);
             return writeError(response, HttpStatus.FORBIDDEN, "权限不足：该操作仅管理员可执行");
         }
         return true;

@@ -140,13 +140,30 @@ app:
   # 【刻意与业务限流/配额分开】：否则"为了本地调试把上限调大"会顺手把公网端点一起放宽，
   # 而这件事不会有任何报错。
   public-api:
-    requests-per-minute: 20   # 比业务限流更严；进程内按 IP 固定窗口
+    requests-per-minute: 20   # 比业务限流更严；进程内按 IP 固定窗口（304 也计入，不因 ETag 免费）
     cache-seconds: 15         # 应用内快照 TTL，同时作为 Cache-Control: max-age 下发
     expose-build-sha: true    # 只暴露开源仓库的提交号，与 /api/health 同一口径
+    # 公网端点的 CORS 白名单（精确匹配，不回显非白名单来源）。
+    # 为什么不复用 app.cors.allowed-origins：公网端点是匿名可达面，
+    # "为了本地调试放宽界面来源"不该顺手放宽它 —— 两件事要在配置层就分开。
+    allowed-origins: https://xiaokeqing.cn,https://www.xiaokeqing.cn,http://localhost:1313,http://127.0.0.1:1313
   # 每日模型调用配额，防止成本失控
   quota:
     enabled: true
     daily-limit: 200
+    # ===== 评测身份独立额度（app.eval.token 识别的身份专用）=====
+    # 为什么独立：评测跑一轮安全卷+质量卷约 50 次模型调用，而用户日额度是 200（线上 compose 里是 50）——
+    # 共用一份额度就会出现"跑完评测当天真实用户不可用"。给评测放宽不该同时放宽所有人。
+    eval-daily-limit: ${APP_QUOTA_EVAL_DAILY_LIMIT:60}
+    eval-store-file: data/model-quota-eval.json
+  # ===== 评测身份（独立凭据 + 流量打标 + RESPONDER 模拟）=====
+  # token 从环境变量注入；【未配置则该功能完全关闭】，行为与改造前一致。
+  # 绝不写默认值：写死一个默认 token 等于把评测身份变成公开后门。
+  eval:
+    token: ${APP_EVAL_TOKEN:}
+    enabled: true
+    # 评测留痕独立文件（不写进 response-audit.json，公网端点与真实审计都看不到）
+    audit-file: data/response-audit.eval.json
   # 构建信息：由 docker-compose 通过环境变量注入。
   # 健康接口返回它，整体检查用它比对线上与仓库是否一致 ——
   # 这是为了检测「部署漂移」（改了代码但忘了部署）。

@@ -46,6 +46,12 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
     @org.springframework.beans.factory.annotation.Autowired
     private AuthService authService;
 
+    /**
+     * 评测身份（可空注入，便于单测；未配置 {@code app.eval.token} 时它自己就是关闭的）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private EvalIdentity evalIdentity;
+
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler)
             throws Exception {
@@ -61,6 +67,21 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
         }
 
         String path = request.getRequestURI();
+
+        // 0) 评测身份（app.eval.token）：必须在会话校验【之前】判定。
+        //    如果放在之后，"评测 token 恰好等于某个会话 token"这种极端巧合会走成管理员，
+        //    而这个身份的设计前提就是"权限比分析员更小"，不能被任何路径提升。
+        if (evalIdentity != null && evalIdentity.matches(request)) {
+            if (!EvalIdentity.pathAllowed(path)) {
+                logger.warn("拒绝评测身份访问受限端点: {} {}（评测身份只允许 {}）",
+                        request.getMethod(), path, EvalIdentity.ALLOWED_PATH);
+                return writeError(response, HttpStatus.FORBIDDEN,
+                        "评测身份只允许调用 " + EvalIdentity.ALLOWED_PATH + "，不能执行处置/审批/策略/数据写入操作");
+            }
+            request.setAttribute("secagent.user", EvalIdentity.USERNAME);
+            request.setAttribute("secagent.role", Role.EVAL);
+            return true;
+        }
 
         // 登录接口直接放行，否则无法获取 Token
         if (LOGIN_PATH.equals(path)) {
@@ -96,12 +117,17 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
         }
 
         logger.warn("拒绝未授权访问: {} {}", request.getMethod(), path);
-        response.setStatus(HttpStatus.UNAUTHORIZED.value());
+        return writeError(response, HttpStatus.UNAUTHORIZED, "未授权访问：缺少或错误的 API Token");
+    }
+
+    /** 统一的失败响应（401 未授权 / 403 越权共用同一形状，避免两套错误体） */
+    private boolean writeError(HttpServletResponse response, HttpStatus status, String message) throws Exception {
+        response.setStatus(status.value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding("UTF-8");
         Map<String, Object> body = new HashMap<>();
-        body.put("code", 401);
-        body.put("message", "未授权访问：缺少或错误的 API Token");
+        body.put("code", status.value());
+        body.put("message", message);
         objectMapper.writeValue(response.getWriter(), body);
         return false;
     }

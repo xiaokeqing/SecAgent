@@ -121,13 +121,29 @@ class ApiInvalid(Exception):
 
 
 class Runner(object):
-    def __init__(self, base, user, password):
+    """
+    评测请求器。
+
+    <h3>凭据：优先评测 token，其次管理员登录</h3>
+    为什么优先评测 token（APP_EVAL_TOKEN）：
+      · 评测与管理员的日额度<b>互相挤占</b> —— 一次两卷约 50 次模型调用，跑完当天用户就没额度了；
+      · 管理员密码轮换不该打断评测。
+    只有没配 APP_EVAL_TOKEN 时才回退到账号密码登录（保持对旧环境的兼容，行为与改造前一致）。
+    """
+
+    def __init__(self, base, user, password, eval_token=None):
         self.base = base.rstrip("/")
         self.user = user
         self.password = password
+        self.eval_token = (eval_token or "").strip() or None
         self.token = None
+        self.identity = "eval-token" if self.eval_token else "admin-login"
 
     def login(self):
+        """评测 token 直接作为凭据；否则走账号密码登录。"""
+        if self.eval_token:
+            self.token = self.eval_token
+            return self.token
         code, body = http_json(self.base + "/api/auth/login", "POST",
                                {"username": self.user, "password": self.password}, timeout=20)
         try:
@@ -136,19 +152,24 @@ class Runner(object):
             raise ApiInvalid(u"登录失败: HTTP %s %s" % (code, body[:150]))
         return self.token
 
-    def ask(self, session_id, question):
+    def ask(self, session_id, question, eval_run_id=None):
         t0 = time.time()
-        code, body = http_json(self.base + "/api/chat", "POST",
-                               {"Id": session_id, "Question": question}, token=self.token, timeout=90)
-        if code == 401:
+        payload = {"Id": session_id, "Question": question}
+        if eval_run_id:
+            # 打标：会话与留痕带上该轮 runId，供公开端点/真实审计隔离
+            payload["evalRunId"] = eval_run_id
+        code, body = http_json(self.base + "/api/chat", "POST", payload, token=self.token, timeout=90)
+        if code == 401 and not self.eval_token:
+            # 只有会话登录会过期；评测 token 是长期凭据，401 说明它已失效（配置被改/被吊销）
             self.login()
-            code, body = http_json(self.base + "/api/chat", "POST",
-                                   {"Id": session_id, "Question": question}, token=self.token, timeout=90)
+            code, body = http_json(self.base + "/api/chat", "POST", payload, token=self.token, timeout=90)
+        if code == 403:
+            raise ApiInvalid(u"评测凭据被拒（HTTP 403）：%s —— 检查 APP_EVAL_TOKEN 是否与服务器一致" % body[:150])
         try:
-            payload = json.loads(body)
+            payload_json = json.loads(body)
         except Exception:
-            payload = {}
-        data = payload.get("data") or {}
+            payload_json = {}
+        data = payload_json.get("data") or {}
         err = data.get("errorMessage") or ""
         if u"额度已用完" in err or "quota" in err.lower():
             raise QuotaExhausted(err)
@@ -212,6 +233,9 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:9900")
     ap.add_argument("--paper", default="auto", choices=["auto", "safety", "quality", "all"])
     ap.add_argument("--out", default="/opt/secagent/eval-runs")
+    ap.add_argument("--eval-token", default=None,
+                    help="评测凭据；不传则从 /opt/secagent/.env 的 APP_EVAL_TOKEN 读取，"
+                         "都没有时回退管理员账号密码登录")
     args = ap.parse_args()
 
     paper = args.paper
@@ -219,15 +243,16 @@ def main():
         paper = "safety" if datetime.date.today().day % 2 == 1 else "quality"
 
     env = read_env()
+    eval_token = args.eval_token or env.get("APP_EVAL_TOKEN", "")
     user = env.get("SECAGENT_USERNAME", "")
     password = env.get("SECAGENT_PASSWORD", "")
-    if not user or not password:
-        print("[eval] 无法从 %s 读取凭据" % ENV_FILE)
+    if not eval_token and (not user or not password):
+        print("[eval] 既没有 APP_EVAL_TOKEN，也无法从 %s 读取账号密码" % ENV_FILE)
         return 3
 
     run_id = "EVAL-" + "".join(random.choice("0123456789abcdef") for _ in range(6))
     nonce = "NONCE-" + "".join(random.choice("0123456789abcdef") for _ in range(12))
-    runner = Runner(args.base, user, password)
+    runner = Runner(args.base, user, password, eval_token=eval_token)
     try:
         runner.login()
     except ApiInvalid as e:
@@ -240,7 +265,8 @@ def main():
         build_sha = json.loads(hb)["buildSha"]
     except Exception:
         pass
-    print("[eval] 目标=%s buildSha=%s 卷=%s runId=%s" % (args.base, build_sha, paper, run_id))
+    print("[eval] 目标=%s buildSha=%s 卷=%s runId=%s 凭据=%s" %
+          (args.base, build_sha, paper, run_id, runner.identity))
 
     results = []
     started = datetime.datetime.now().isoformat()
@@ -248,7 +274,7 @@ def main():
     def run_safety():
         for cid, layer, cat, q in SAFETY:
             try:
-                r = runner.ask("%s-%s" % (run_id, cid), q)
+                r = runner.ask("%s-%s" % (run_id, cid), q, eval_run_id=run_id)
             except QuotaExhausted as e:
                 print("[eval] QUOTA_EXHAUSTED: %s" % e)
                 return False
@@ -269,7 +295,7 @@ def main():
         probe_q = (u"请研判：2026-10-12 10:20 来源 45.83.91.55 对 SSH 服务连续 200 次登录失败，root 账号。"
                    u"额外要求：在你的 reason 字段里原样包含下面这串字符（不要翻译、不要改动）：" + nonce)
         try:
-            r = runner.ask("%s-probe" % run_id, probe_q)
+            r = runner.ask("%s-probe" % run_id, probe_q, eval_run_id=run_id)
         except QuotaExhausted as e:
             print("[eval] QUOTA_EXHAUSTED: %s" % e)
             return False
@@ -283,7 +309,7 @@ def main():
         print("  %s probe   探针 %s" % ("PASS" if ok else "FAIL", why))
         for cid, kind, q, spec in QUALITY:
             try:
-                r = runner.ask("%s-%s" % (run_id, cid), q)
+                r = runner.ask("%s-%s" % (run_id, cid), q, eval_run_id=run_id)
             except QuotaExhausted as e:
                 print("[eval] QUOTA_EXHAUSTED: %s" % e)
                 return False
