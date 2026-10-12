@@ -70,6 +70,11 @@ docs/internal/
 !scripts/**/*.sh
 !scripts/**/*.py
 
+# ---------- Python 缓存 ----------
+# scripts/ 下的评测与复核工具在服务器上运行会生成这些目录（2026-10-13 曾冒出来过）
+__pycache__/
+*.pyc
+
 # ---------- 容器 ----------
 /volumes
 /server.pid
