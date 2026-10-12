@@ -38,6 +38,25 @@ public class DashScopeLlmProvider implements LlmProvider {
     @Value("${app.llm.max-tokens:800}")
     private int maxTokens;
 
+    /**
+     * 单次模型调用的硬超时（毫秒）。默认 15 秒。
+     *
+     * <p><b>为什么必须在代码层限时</b>：实测断网时（iptables DROP，连接既不成功也不被拒绝）
+     * SDK 自身的超时是 180 秒（{@code spring.ai.dashscope.chat.options.timeout}），
+     * 结果是 /api/chat 挂满 3 分钟、客户端什么都收不到 —— 比"静默回退模板"更糟。
+     * 这里用有界等待保证：超时就按 fail-closed 终止，让上层走"未生成（模型不可用）"分支。
+     */
+    @Value("${app.llm.timeout-ms:15000}")
+    private long timeoutMs;
+
+    /** 调用线程池（守护线程，避免超时后残留线程阻塞退出） */
+    private static final java.util.concurrent.ExecutorService POOL =
+            java.util.concurrent.Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "llm-provider-call");
+                t.setDaemon(true);
+                return t;
+            });
+
     @Autowired
     private ChatService chatService;
 
@@ -67,13 +86,28 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
-        DashScopeApi api = chatService.createDashScopeApi();
-        DashScopeChatModel model = chatService.createChatModel(api, temperature, maxTokens, 0.1);
-        ReactAgent agent = ReactAgent.builder()
-                .name("llm_provider")
-                .model(model)
-                .systemPrompt(systemPrompt)
-                .build();
-        return chatService.executeChat(agent, userPrompt);
+        java.util.concurrent.Future<String> future = POOL.submit(() -> {
+            DashScopeApi api = chatService.createDashScopeApi();
+            DashScopeChatModel model = chatService.createChatModel(api, temperature, maxTokens, 0.1);
+            ReactAgent agent = ReactAgent.builder()
+                    .name("llm_provider")
+                    .model(model)
+                    .systemPrompt(systemPrompt)
+                    .build();
+            return chatService.executeChat(agent, userPrompt);
+        });
+        try {
+            return future.get(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            future.cancel(true);
+            logger.warn("模型调用超时（{} ms），按 fail-closed 终止", timeoutMs);
+            throw new java.io.IOException("模型调用超时（" + timeoutMs + " ms）：已终止，不返回任何结论");
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception ex) {
+                throw ex;
+            }
+            throw new java.io.IOException("模型调用失败: " + cause);
+        }
     }
 }
