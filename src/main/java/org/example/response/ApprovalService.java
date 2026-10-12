@@ -68,8 +68,21 @@ public class ApprovalService {
         return out;
     }
 
-    /** 批准：真正执行对应动作，返回执行结果 */
-    public synchronized Map<String, Object> approve(String id, String actor) {
+    /**
+     * 批准：真正执行对应动作，返回执行结果。
+     *
+     * <h3>锁的范围（C3 重构点）</h3>
+     * 原来是 {@code synchronized} 方法 —— 临界区里包含
+     * {@code auditService.append()}（整份审计文件落盘）与
+     * {@code dispatch()}（可能真的走 SSH，最长十几秒）。
+     * 于是"批准一张单"会把整个审批服务锁住，其它审批/驳回全部排队等待，
+     * 长尾表现为"审批面板点了没反应"。
+     * <p>
+     * 现在只把"检查状态 + 置为 APPROVED"放进该单据自己的锁里（纯内存、纳秒级），
+     * 审计落盘与真实执行都在锁外。并发点两次"批准"仍然只有一个能成功
+     * （状态机在锁内完成 CAS），不会重复下发处置动作。
+     */
+    public Map<String, Object> approve(String id, String actor) {
         Order o = orders.get(id);
         Map<String, Object> resp = new LinkedHashMap<>();
         if (o == null) {
@@ -77,14 +90,19 @@ public class ApprovalService {
             resp.put("message", "审批单不存在: " + id);
             return resp;
         }
-        if (!"PENDING".equals(o.getStatus())) {
-            resp.put("success", false);
-            resp.put("message", "审批单已处理，状态: " + o.getStatus());
-            return resp;
+        synchronized (o) {
+            if (!"PENDING".equals(o.getStatus())) {
+                resp.put("success", false);
+                resp.put("message", "审批单已处理，状态: " + o.getStatus());
+                return resp;
+            }
+            // 只改内存：抢到 PENDING → APPROVED 的那个线程才继续往下做 I/O 与执行
+            o.setStatus("APPROVED");
+            o.setDecidedBy(actor);
+            o.setDecidedAt(LocalDateTime.now().format(FMT));
         }
-        o.setStatus("APPROVED");
-        o.setDecidedBy(actor);
-        o.setDecidedAt(LocalDateTime.now().format(FMT));
+
+        // ==== 以下都在锁外：审计落盘 + 真实执行（SSH 可能耗时）====
         auditService.append(ResponseAudit.of(actor, "approve", o.getTarget(),
                 "管理员批准处置：" + o.getReason(), o.getRiskLevel(), "MOCK", true,
                 "审批单 " + o.getId()));
@@ -100,8 +118,12 @@ public class ApprovalService {
         return resp;
     }
 
-    /** 驳回：不执行 */
-    public synchronized Map<String, Object> reject(String id, String actor) {
+    /**
+     * 驳回：不执行。
+     *
+     * <p>与 {@link #approve} 同因同治：锁内只做状态 CAS，审计落盘在锁外。
+     */
+    public Map<String, Object> reject(String id, String actor) {
         Order o = orders.get(id);
         Map<String, Object> resp = new LinkedHashMap<>();
         if (o == null) {
@@ -109,14 +131,16 @@ public class ApprovalService {
             resp.put("message", "审批单不存在: " + id);
             return resp;
         }
-        if (!"PENDING".equals(o.getStatus())) {
-            resp.put("success", false);
-            resp.put("message", "审批单已处理，状态: " + o.getStatus());
-            return resp;
+        synchronized (o) {
+            if (!"PENDING".equals(o.getStatus())) {
+                resp.put("success", false);
+                resp.put("message", "审批单已处理，状态: " + o.getStatus());
+                return resp;
+            }
+            o.setStatus("REJECTED");
+            o.setDecidedBy(actor);
+            o.setDecidedAt(LocalDateTime.now().format(FMT));
         }
-        o.setStatus("REJECTED");
-        o.setDecidedBy(actor);
-        o.setDecidedAt(LocalDateTime.now().format(FMT));
         auditService.append(ResponseAudit.of(actor, "reject", o.getTarget(),
                 "管理员驳回处置：" + o.getReason(), o.getRiskLevel(), "BLOCKED", false,
                 "审批单 " + o.getId()));
@@ -162,8 +186,14 @@ public class ApprovalService {
         private Map<String, Object> params;
         private String requestedBy;
         private String createdAt;
-        /** PENDING / APPROVED / REJECTED */
-        private String status;
+        /**
+         * PENDING / APPROVED / REJECTED。
+         *
+         * <p>加 {@code volatile}：状态在"该单据自己的锁"里改，而
+         * {@link #listPending()} 与控制器是在锁外读它的 —— 不加就会出现
+         * "刚批准的单还挂在待审批列表里"这种可见性问题。
+         */
+        private volatile String status;
         private String decidedBy;
         private String decidedAt;
         private String executedMode;

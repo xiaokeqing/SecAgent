@@ -37,14 +37,26 @@ public class ResponseController {
     private static final int LONG_BLOCK_MINUTES = 120;
 
     // ===== 自动策略开关（启动时取自 yml，运行时可改） =====
+    // 加 volatile：状态在 policyLock 里改，读它的请求线程（getPolicy/block/lock/kill）
+    // 大多不持锁 —— 不加会出现"改了策略但下一个请求还按旧策略走"的可见性问题。
     @Value("${response.auto-block-enabled:true}")
-    private boolean autoBlockEnabled;
+    private volatile boolean autoBlockEnabled;
     @Value("${response.auto-lock-account:false}")
-    private boolean autoLockAccount;
+    private volatile boolean autoLockAccount;
     @Value("${response.auto-kill-process:false}")
-    private boolean autoKillProcess;
+    private volatile boolean autoKillProcess;
     @Value("${response.high-risk-require-approval:true}")
-    private boolean highRiskRequireApproval;
+    private volatile boolean highRiskRequireApproval;
+
+    /**
+     * 策略锁：<b>只保护四个开关的内存更新</b>。
+     *
+     * <p>原来 {@code putPolicy} 是 {@code synchronized} 方法，临界区里包含
+     * {@code auditService.append()}（整份审计文件序列化 + 落盘）。
+     * 结果是一次"改策略"会阻塞本控制器所有同步方法（包括封 IP/杀进程的入口）。
+     * 现在锁内只做内存写入，审计落盘在锁外。
+     */
+    private final Object policyLock = new Object();
 
     public ResponseController(ResponseActionService actionService,
                               ApprovalService approvalService,
@@ -87,18 +99,22 @@ public class ResponseController {
     }
 
     @PutMapping("/policy")
-    public synchronized Map<String, Object> putPolicy(@RequestBody(required = false) Map<String, Object> body,
-                                                     HttpServletRequest req) {
-        if (body != null) {
-            if (body.get("autoBlockEnabled") != null) autoBlockEnabled = Boolean.parseBoolean(String.valueOf(body.get("autoBlockEnabled")));
-            if (body.get("autoLockAccount") != null) autoLockAccount = Boolean.parseBoolean(String.valueOf(body.get("autoLockAccount")));
-            if (body.get("autoKillProcess") != null) autoKillProcess = Boolean.parseBoolean(String.valueOf(body.get("autoKillProcess")));
-            if (body.get("highRiskRequireApproval") != null) highRiskRequireApproval = Boolean.parseBoolean(String.valueOf(body.get("highRiskRequireApproval")));
+    public Map<String, Object> putPolicy(@RequestBody(required = false) Map<String, Object> body,
+                                         HttpServletRequest req) {
+        String snapshot;
+        synchronized (policyLock) {
+            // 锁内只改内存（纳秒级）；审计落盘在锁外做
+            if (body != null) {
+                if (body.get("autoBlockEnabled") != null) autoBlockEnabled = Boolean.parseBoolean(String.valueOf(body.get("autoBlockEnabled")));
+                if (body.get("autoLockAccount") != null) autoLockAccount = Boolean.parseBoolean(String.valueOf(body.get("autoLockAccount")));
+                if (body.get("autoKillProcess") != null) autoKillProcess = Boolean.parseBoolean(String.valueOf(body.get("autoKillProcess")));
+                if (body.get("highRiskRequireApproval") != null) highRiskRequireApproval = Boolean.parseBoolean(String.valueOf(body.get("highRiskRequireApproval")));
+            }
+            snapshot = "block=" + autoBlockEnabled + ";lock=" + autoLockAccount
+                    + ";kill=" + autoKillProcess + ";requireApproval=" + highRiskRequireApproval;
         }
         auditService.append(ResponseAudit.of(actor(req), "policy-update", "-",
-                "更新自动处置策略", "LOW", "MOCK", true,
-                "block=" + autoBlockEnabled + ";lock=" + autoLockAccount
-                        + ";kill=" + autoKillProcess + ";requireApproval=" + highRiskRequireApproval));
+                "更新自动处置策略", "LOW", "MOCK", true, snapshot));
         return getPolicy();
     }
 

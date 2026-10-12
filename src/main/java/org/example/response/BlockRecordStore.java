@@ -41,6 +41,19 @@ public class BlockRecordStore {
     /** 内存封禁记录，新记录在尾部 */
     private final List<BlockRecord> records = new CopyOnWriteArrayList<>();
 
+    /**
+     * 状态锁：<b>只保护内存状态</b>（登记/标记解封/取快照）。
+     *
+     * <p>与 {@link AuditService} 同因同治：原来 {@code register/markUnblocked} 是
+     * {@code synchronized} 且在锁内 {@code flush()}，锁被整份文件的写盘占住，
+     * 并发处置的尾延迟等于一次磁盘写。现在锁内只改内存。
+     */
+    private final Object stateLock = new Object();
+
+    /** 落盘锁：让"快照 + 序列化 + 原子替换"顺序执行，避免乱序写覆盖掉新记录 */
+    private final java.util.concurrent.locks.ReentrantLock writeLock =
+            new java.util.concurrent.locks.ReentrantLock();
+
     @PostConstruct
     public void init() {
         Path p = Paths.get(blocksFilePath);
@@ -60,9 +73,9 @@ public class BlockRecordStore {
         }
     }
 
-    /** 登记一条新生效的封禁记录并持久化 */
-    public synchronized BlockRecord register(String ip, int durationMinutes, String source,
-                                            String actor, String auditId, String mode) {
+    /** 登记一条新生效的封禁记录并持久化（锁内只改内存，落盘在锁外） */
+    public BlockRecord register(String ip, int durationMinutes, String source,
+                                String actor, String auditId, String mode) {
         BlockRecord r = new BlockRecord();
         r.setId("BLK-" + UUID.randomUUID().toString().substring(0, 8));
         r.setIp(ip);
@@ -74,22 +87,30 @@ public class BlockRecordStore {
         r.setCreatedAt(now.format(FMT));
         r.setExpiresAt(now.plusMinutes(durationMinutes).format(FMT));
         r.setUnblocked(false);
-        records.add(r);
-        flush();
+        synchronized (stateLock) {
+            records.add(r);
+        }
+        persist();
         logger.info("登记封禁记录 {}：IP={} 时长={}min 到期={} 来源={}", r.getId(), ip, durationMinutes, r.getExpiresAt(), source);
         return r;
     }
 
-    /** 标记某条记录为已解封并持久化 */
-    public synchronized void markUnblocked(String id, String unblockMode) {
-        for (BlockRecord r : records) {
-            if (r.getId().equals(id) && !r.isUnblocked()) {
-                r.setUnblocked(true);
-                r.setUnblockedAt(LocalDateTime.now().format(FMT));
-                r.setUnblockMode(unblockMode);
-                flush();
-                return;
+    /** 标记某条记录为已解封并持久化（锁内只改内存，落盘在锁外） */
+    public void markUnblocked(String id, String unblockMode) {
+        boolean changed = false;
+        synchronized (stateLock) {
+            for (BlockRecord r : records) {
+                if (r.getId().equals(id) && !r.isUnblocked()) {
+                    r.setUnblocked(true);
+                    r.setUnblockedAt(LocalDateTime.now().format(FMT));
+                    r.setUnblockMode(unblockMode);
+                    changed = true;
+                    break;
+                }
             }
+        }
+        if (changed) {
+            persist();
         }
     }
 
@@ -123,16 +144,19 @@ public class BlockRecordStore {
         return due;
     }
 
-    private void flush() {
+    /** 落盘：持落盘锁 → 状态锁内取快照（纯内存） → 锁外序列化 + 原子替换 */
+    private void persist() {
+        writeLock.lock();
         try {
-            Path p = Paths.get(blocksFilePath);
-            File parent = p.toFile().getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
+            List<BlockRecord> snapshot;
+            synchronized (stateLock) {
+                snapshot = new ArrayList<>(records);
             }
-            Files.write(p, objectMapper.writeValueAsBytes(records));
+            AtomicJsonFile.write(objectMapper, blocksFilePath, snapshot);
         } catch (Exception e) {
             logger.error("封禁记录写回失败：{}", e.getMessage());
+        } finally {
+            writeLock.unlock();
         }
     }
 }
