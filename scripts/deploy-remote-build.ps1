@@ -50,7 +50,8 @@ if (-not (Test-Path $jar)) { Write-Error "找不到 jar: $jar"; exit 1 }
 # 2) 只上传源码产物与构建脚本（不上传镜像）
 Step "2/4" "上传 jar / Dockerfile / 服务器构建脚本"
 scp -o ConnectTimeout=20 $jar "${SshHost}:/tmp/sec-agent.jar" | Out-Null
-scp -o ConnectTimeout=20 (Join-Path $repo 'Dockerfile') "${SshHost}:$RemoteDir/Dockerfile" | Out-Null
+# 必须上传 Dockerfile.runtime（单阶段、直接用上传的 jar）而不是 Dockerfile（多阶段、会在镜像内用服务器源码编译）
+scp -o ConnectTimeout=20 (Join-Path $repo 'Dockerfile.runtime') "${SshHost}:$RemoteDir/Dockerfile.runtime" | Out-Null
 scp -o ConnectTimeout=20 (Join-Path $repo 'scripts\build-on-server.sh') "${SshHost}:$RemoteDir/scripts/build-on-server.sh" | Out-Null
 Write-Host "    上传完成（jar 约 $([math]::Round((Get-Item $jar).Length/1MB,0)) MB；不再传 311MB 镜像）"
 

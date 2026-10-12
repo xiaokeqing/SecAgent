@@ -30,13 +30,33 @@ if [ ! -f Dockerfile ]; then
   exit 2
 fi
 
-echo "==> 1/4 放置 jar（Dockerfile 期望路径 target/）"
-mkdir -p target
-install -m 644 "$JAR" target/sec-agent-1.0-SNAPSHOT.jar
-ls -lh target/*.jar | tail -1
+echo "==> 1/4 放置 jar（放 runtime/ —— target/ 被 .dockerignore 排除，会导致 COPY 失败）"
+mkdir -p runtime
+install -m 644 "$JAR" runtime/app.jar
+ls -lh runtime/app.jar | tail -1
 
-echo "==> 2/4 服务器侧构建镜像（docker build --network=host）"
-docker build --network=host -t secagent:local . 2>&1 | tail -6
+echo "==> 2/4 服务器侧构建镜像（Dockerfile.runtime：直接用上传的 jar，不在镜像内编译源码）"
+JAR_MD5="$(md5sum runtime/app.jar | awk '{print $1}')"
+echo "  上传 jar MD5 = $JAR_MD5"
+docker build --network=host -f Dockerfile.runtime -t secagent:local . 2>&1 | tail -6
+
+# 【硬校验】镜像内产物必须等于上传的 jar。
+# 不加这一步就会重演实测过的坑：多阶段 Dockerfile 在镜像内用【服务器旧源码】编译，
+# 结果 BUILD_SHA 显示新版本、容器里跑的是旧代码（app.jar MD5 与上传 jar 不符）。
+# 实现方式：docker run --network none 里直接 md5sum 产物。
+# 注意两个坑：
+#   ① 不能用 `docker cp <cid>:/app/app.jar -` —— 它输出的是 **tar 流**，不是文件原文，
+#      算出来的哈希与 jar 本体必然不同（这一点我自己先踩了一次）；
+#   ② 不能用默认网络 —— srv1 的 bridge 网络异常（建端点报 network does not exist），
+#      用 --network none 可绕开。
+IMAGE_MD5="$(docker run --rm --network none --entrypoint md5sum secagent:local /app/app.jar 2>/dev/null | awk '{print $1}')"
+[ -z "$IMAGE_MD5" ] && IMAGE_MD5="unavailable"
+echo "  镜像内 jar MD5 = $IMAGE_MD5"
+if [ "$JAR_MD5" != "$IMAGE_MD5" ]; then
+  echo "  [X] 镜像内产物与上传 jar 不一致（或无法校验）—— 中止部署（防『部署旧代码』）"
+  exit 3
+fi
+echo "  [OK] 产物校验通过：镜像内 jar == 上传 jar"
 
 echo "==> 3/4 写入版本指纹并重建容器"
 echo -n "$SHA" > /root/build-sha.txt

@@ -1,0 +1,59 @@
+# ============================================================
+# 服务器侧运行时镜像（单阶段：**直接用上传的 jar，不编译源码**）
+# ------------------------------------------------------------
+# 为什么需要它（实测踩到的坑）：
+#   原来的 Dockerfile 是多阶段构建：COPY pom.xml + COPY src → 在镜像内 mvn 编译。
+#   而服务器连不上 GitHub（fetch_state=failed），它的 src/ 停留在旧版本 →
+#   于是"服务器侧构建"每次产出的都是【旧代码】，而 BUILD_SHA 环境变量却显示新版本号，
+#   形成"指纹是新的、代码是旧的"这种最危险的假象（实测：容器内 app.jar MD5 与上传 jar 不符）。
+#
+# 本文件只做一件事：把本机编译好的 jar 原样放进运行时镜像。
+# 配合 build-on-server.sh 里的【MD5 硬校验】（镜像内 /app/app.jar 必须等于上传 jar），
+# 从机制上保证"部署的产物就是编译出来的产物"。
+#
+# 用法：docker build --network=host -f Dockerfile.runtime -t secagent:local .
+# 前置：target/sec-agent-1.0-SNAPSHOT.jar 已由本机 mvn package 产出并上传
+# ============================================================
+FROM eclipse-temurin:17-jre-jammy
+
+# 中文字体是必需的，不是可选优化：
+#   EventPdfService 硬编码读取 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+#   （ttc 索引 3 = 简体中文，索引 5 = 等宽），缺失时导出的 PDF 中文会变成方块。
+# tzdata 用于把容器时区固定为 Asia/Shanghai，避免日志与审计时间错乱。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tzdata \
+      fonts-noto-cjk \
+      ca-certificates \
+      curl \
+      openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+ && ln -snf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && echo "Asia/Shanghai" > /etc/timezone \
+ && test -f /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+
+WORKDIR /app
+
+# 以非 root 用户运行：容器被拿下时限制影响面
+RUN groupadd -r secagent \
+ && useradd -r -g secagent -d /app -s /usr/sbin/nologin secagent
+
+# 只拷贝【本机编译好的 jar】——不再在镜像内编译，杜绝"用服务器旧源码编译"。
+# 路径刻意放在 runtime/ 而不是 target/：target/ 被 .dockerignore 排除
+# （实测：放 target/ 会导致 COPY 报 "not found"，构建直接失败）。
+COPY runtime/app.jar /app/app.jar
+COPY security-docs /app/security-docs
+
+RUN mkdir -p /app/data /app/uploads \
+ && chown -R secagent:secagent /app
+
+USER secagent
+
+EXPOSE 9900
+
+ENV JAVA_OPTS="-Xms256m -Xmx1g -XX:MaxMetaspaceSize=256m -XX:+UseSerialGC -XX:+ExitOnOutOfMemoryError -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/app/data -Duser.timezone=Asia/Shanghai -Dfile.encoding=UTF-8"
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+  CMD curl -fsS http://localhost:9900/api/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]
