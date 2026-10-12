@@ -498,4 +498,86 @@ curl -s http://127.0.0.1:9900/api/public/ask -X POST \
   3) 裁剪前后各跑一次演练对照，**告警无遗漏**才算通过（这是本项的验收门禁）
 ```
 
+---
 
+## 10. 公开端点的运维要点（P4，2026-10-12 上线）
+
+```
+端点（匿名可访问，走 https://demo.xiaokeqing.cn，CORS 白名单含 https://xiaokeqing.cn 与 localhost:1313）：
+  POST /api/public/ask   {"question":"..."}   question ≤600 字符、body ≤4000；一次性返回（非 SSE），服务端预算 20s
+  GET  /api/public/kb?q=…                     q ≤200 字符
+
+限额（三件事互相独立，别混为一谈）：
+  · 每 IP 每分钟：ask 6 次 / kb 20 次      → 超限 429 + Retry-After: 60
+  · 每 IP 并发：1                          → 超限 429 + reason=per-ip-concurrency-limit + Retry-After: 5
+  · 每日额度：公开池（生产 30/天）          → 独立计数器 data/model-quota-public.json，绝不吃用户池与评测池
+
+公开路径的硬约束（改动时必须保持）：
+  · 绝不触发任何真实处置动作：RESPONDER 在公开身份下只解释、不调工具（有测试用调用记录桩证明公开=0 次、内部=1 次）
+  · 不泄露：内网地址（→「内部地址」）、审计原文、密钥、系统提示词、上游报错详情（→「[上游错误详情已脱敏]」）
+  · 回答带机读 state 与 stateLabel；模型不可用/额度用尽如实写 failureReason，禁止模板冒充
+  · 检索不可用时 available:false + 空结果（不是 500）
+
+常见现象速查：
+  429 + 频率文案      → 正常限流，等 Retry-After
+  429 + 并发文案      → 同一来源有请求在飞，等上一条返回
+  generated=false     → 没有模型生成（看 state 与 failureReason，不要当成"系统坏了"）
+  available=false     → 向量检索不可用（如实降级，不补假数据）
+```
+
+## 11. Suricata：扫描检测的"可见性"真相与误报抑制（2026-10-13 实测）
+
+```
+【结论】多端口端口扫描的"漏报"在本环境【不是规则缺口，而是可见性缺口】：
+  从 srv1 对 srv2 扫 8 个端口（22/23/25/80/443/3306/8080/9200，间隔 600ms）：
+    · eve.json 里只出现 port 22 的 flow —— 其余 7 个端口的 SYN 在【云安全组】就被丢弃
+    · 传感器看不到的包，任何 Suricata 规则都检测不到
+    · 把规则目的地址放宽成 any 后确实会触发，但命中的是 10.0.0.10 -> 169.254.0.x 的出站流量 = 误报
+  因此：不再新增"低速多端口扫描"规则；SSH 层面的扫描是可见可检测的（ET SCAN sid 2001219）。
+
+【已做】误报抑制（运维批量登录不再刷告警）：
+  阈值文件（容器内 /etc/suricata/threshold.conf）：
+    threshold gen_id 1, sig_id 2001219, type threshold, track by_src, count 3, seconds 10
+  应用脚本：scripts/apply-suricata-scan-tuning.sh（在 srv2 上 root 执行）
+    --check     只校验当前配置（suricata -T）+ 打印 rule-files
+    --rollback  回滚到最近一次备份并校验
+    无参数      备份 → 写阈值 → 行级插入 threshold-file → suricata -T 放行 → 热加载/重启 → 失败自动回滚
+
+【这份 suricata.yaml 的三个坑（都踩过，已固化进脚本）】
+  1) 它是【单文件 bind mount】：`sed -i` 会 "cannot rename ... Device or resource busy"，
+     必须就地覆盖写（read → 改 → write 同一个文件）
+  2) 配置【必须以 `%YAML 1.1` 与 `---` 两行开头】：把 threshold-file 插到最顶端会被 Suricata 拒绝
+     （The configuration file must begin with the following two lines），要插在 `---` 之后
+  3) rule-files 追加新项要插到【块末尾】，不能紧跟 `rule-files:` 头行（否则顺序变成新项在前）
+  改完必须以 `suricata -T` 的【退出码】作为唯一放行条件（exit=0 才加载），失败立即回滚备份
+
+【想扩大检测面】需要让更多端口对传感器可见 → 云安全组放行（属维护窗口 + 站主决策，见清单 U6）
+```
+
+## 12. 部署链一键体检（2026-10-13 新增）
+
+```
+bash /opt/secagent/scripts/deploy-chain-check.sh          # 人读；有告警时退出码 1
+bash /opt/secagent/scripts/deploy-chain-check.sh --json    # 机器可读
+
+它核对四件事：
+  ① 线上指纹：/api/health 的 status / embeddedGitCommit / artifactMd5 / fingerprintMismatch
+  ② 发布指针：ACR `stable` 的 label revision 与 artifact-md5，与线上比对
+  ③ 自动发布：secagent-redeploy.timer 是否 active+enabled，服务最近一次 Result 与下次运行时间
+  ④ 回滚能力：last-known-good.json 是否有效、回滚镜像是否拉得动（dry-run，不重启任何容器）
+
+【2026-10-13 修掉的最后一处坏链】自动发布服务静默失败
+  症状：timer 每 5 分钟失败一次，日志是 ACR `unauthorized: authentication required`；
+        而人工在 shell 里执行同一个脚本却成功。
+  根因：unit 里的 `ProtectHome=yes` 使服务看不见 /root → docker CLI 读不到 /root/.docker/config.json
+        → 等于未登录。
+  修法：保留 ProtectHome=yes，改用独立凭据目录：
+        mkdir -p /etc/secagent/docker && cp /root/.docker/config.json /etc/secagent/docker/config.json
+        chmod 700 /etc/secagent/docker && chmod 600 /etc/secagent/docker/config.json
+        drop-in: /etc/systemd/system/secagent-redeploy.service.d/docker-config.conf
+                 [Service]
+                 Environment=DOCKER_CONFIG=/etc/secagent/docker
+        systemctl daemon-reload
+  实测：systemctl start secagent-redeploy.service → Result=success，服务自行完成
+        读 digest → pull → 重建 → 硬校验 → 健康核对 → 写 last-known-good。
+```
