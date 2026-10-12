@@ -52,6 +52,47 @@ public class ChatController {
     @Autowired
     private MultiAgentCoordinator multiAgentCoordinator;
 
+    /**
+     * 一次研判请求的总预算（毫秒）。
+     *
+     * <p><b>为什么必须在入口设 deadline</b>：实测表明，内部调用链上总会有"不可中断"的环节
+     * （例如 OkHttp 的 `connect` —— {@code future.cancel(true)} 对 socket 建连无效）。
+     * 只靠各层自己的超时，用户仍可能永远拿不到响应。入口有 deadline 才能保证：
+     * 无论内部卡在哪，请求都会在预算内返回一个<b>显式的"未生成"</b>，而不是挂死。
+     */
+    @org.springframework.beans.factory.annotation.Value("${app.chat.deadline-ms:25000}")
+    private long chatDeadlineMs;
+
+    /** 编排线程池（守护线程）：避免被卡住的编排把 Tomcat 工作线程一起拖住 */
+    private static final java.util.concurrent.ExecutorService ORCHESTRATOR_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(4, r -> {
+                Thread t = new Thread(r, "orchestrator");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /** 在总预算内执行编排；超时抛 {@link IllegalStateException}（由调用处转成"未生成"响应） */
+    private MultiAgentResult callWithDeadline(String question, List<Map<String, String>> history) {
+        java.util.concurrent.Future<MultiAgentResult> future =
+                ORCHESTRATOR_POOL.submit(() -> multiAgentCoordinator.routeAndRun(question, history));
+        try {
+            return future.get(chatDeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException e) {
+            future.cancel(true);
+            logger.warn("研判总预算（{} ms）用尽：按 fail-closed 终止并返回『未生成』", chatDeadlineMs);
+            throw new IllegalStateException("研判总预算用尽（" + chatDeadlineMs + " ms）");
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IllegalStateException(String.valueOf(cause));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("研判被中断");
+        }
+    }
+
     @Autowired
     private ToolCallbackProvider tools;
 
@@ -107,7 +148,7 @@ public class ChatController {
             logger.info("开始多智能体协同编排（Planner 调度 → 专职智能体执行 → 汇总）");
 
             // 多智能体协同：编排层负责路由与工具调用，离线/失败自动降级，单个智能体失败不整体崩
-            MultiAgentResult multiResult = multiAgentCoordinator.routeAndRun(request.getQuestion(), history);
+            MultiAgentResult multiResult = callWithDeadline(request.getQuestion(), history);
             String fullAnswer = multiResult.getFinalAnswer();
 
             // 更新会话历史
@@ -117,6 +158,15 @@ public class ChatController {
 
             return ResponseEntity.ok(ApiResponse.success(ChatResponse.success(fullAnswer, multiResult.getSteps())));
 
+        } catch (IllegalStateException e) {
+            // 总预算用尽/编排不可用：显式回"未生成"，绝不退回模板或含糊报错
+            logger.warn("研判未生成（fail-closed）：{}", e.getMessage());
+            return ResponseEntity.ok(ApiResponse.success(ChatResponse.success(
+                    "## 研判结论\n"
+                            + "> 结论生成方式：**未生成**（研判总预算用尽或依赖不可用，按 fail-closed 终止）\n\n"
+                            + "本次没有产生结论，也没有回退模板拼装。原因：" + e.getMessage()
+                            + "\n\n> 可稍后重试；若持续出现，请查看服务端日志中的依赖超时记录。",
+                    null)));
         } catch (Exception e) {
             logger.error("对话失败", e);
             // 不向客户端回传内部异常细节（可能含接口地址、堆栈或密钥信息）
