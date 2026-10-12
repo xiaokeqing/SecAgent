@@ -362,8 +362,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         if (verdict != null) {
             summary = "模型已基于知识库片段生成结构化结论（generatedBy=" + llmProvider.id() + "/" + llmProvider.modelName() + "）";
             body = "## 研判结论\n"
-                    + "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n"
-                    + "> state=model\n\n"
+                    + "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n\n"
                     + verdict + "\n\n"
                     + "---\n\n## 知识库参考（未经 AI 加工）\n\n" + untrustedBlock(rag, 800);
         } else {
@@ -501,6 +500,9 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                         + (reason.isEmpty() ? "" : "\n\n**原因**：" + reason);
             }
             StringBuilder sb = new StringBuilder();
+            // state 只在这里出现一次（唯一来源）：正常结论=model；unknown 分支=input-insufficient。
+            // 头部只写"结论生成方式"的人类可读说明，不再重复 state，避免一个响应解析出两个状态。
+            sb.append("> state=model\n\n");
             if (conceptQuestion) {
                 sb.append("> 输入类型识别：**概念问答**（无具体事件要素）—— 只给解释与防护建议，不产出事件定级与处置动作。\n\n");
             }
@@ -632,7 +634,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 + "\n\n**当前活动告警：**\n\n" + untrustedBlock(alerts, 600)
                 + "\n\n### 证据解读\n"
                 + (verdict != null
-                        ? "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n> state=model\n\n" + verdict
+                        ? "> 结论生成方式：**模型真生成**（generatedBy=" + llmProvider.id() + " / " + llmProvider.modelName() + "）\n\n" + verdict
                         : "> 结论生成方式：**未生成**（模型不可用或输出未通过 schema 校验）\n> state=model-failed\n\n"
                           + "按 fail-closed 原则**不做出定性、不给出定级与处置动作**。"
                           + "取证只负责「工具看到了什么」，定性需模型可用后由研判路径给出。");
@@ -665,7 +667,8 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 : (success ? "处置动作已执行（含 MOCK 模拟/审计留痕）" : "处置未执行");
         String body = "## 处置结果\n"
                 + "> 结论生成方式：**规则解析**（动作类型与参数来自编排层规则解析，非模型产出；"
-                + "**模型不参与处置拍板**，且模型不可用时本层不会产生任何处置动作）\n\n"
+                + "**模型不参与处置拍板**，且模型不可用时本层不会产生任何处置动作）\n"
+                + "> state=rule-based\n\n"
                 + "处置执行员已通过安全工具发起动作，工具内部强制经过 ResponseGuard 白名单护栏、高危人工审批与全量审计：\n\n"
                 + "```\n" + clip(resultText, 800) + "\n```\n\n"
                 + (blocked ? "**护栏生效**：该目标命中保护策略，动作被拦截并未下发，符合安全预期。"
