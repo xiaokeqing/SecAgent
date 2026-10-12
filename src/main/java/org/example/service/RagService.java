@@ -36,6 +36,20 @@ public class RagService {
     @Autowired
     private org.example.security.PromptInjectionGuard promptInjectionGuard;
 
+    /**
+     * RAG 流式生成的总超时（毫秒）。
+     *
+     * <p><b>实测教训</b>：流式生成走 {@code generation.streamCall(param)} +
+     * {@code result.blockingForEach(...)} 消费，此前<b>没有任何超时</b> ——
+     * 断网时 {@code blockingForEach} 永久阻塞，研判请求挂死。
+     * 这是出站调用统一规范缺失的第三处（前两处：chat 的 180s readTimeout、embedding 无超时）。
+     *
+     * <p>注意它与前两处的修法不同：{@code streamCall} 是<b>立即返回 Flowable</b>，
+     * 真正 I/O 在订阅/消费阶段，所以不能用"有界等待 Future"，必须在流上挂 deadline。
+     */
+    @org.springframework.beans.factory.annotation.Value("${app.llm.rag-timeout-ms:15000}")
+    private long ragTimeoutMs;
+
     @Value("${dashscope.api.key}")
     private String apiKey;
 
@@ -201,7 +215,9 @@ public class RagService {
 
         logger.info("开始调用AI模型流式接口...");
         
-        Flowable<GenerationResult> result = generation.streamCall(param);
+        // 流上挂 deadline：断网/对端慢时不再永久阻塞（blockingForEach 不会自己超时）
+        Flowable<GenerationResult> result = generation.streamCall(param)
+                .timeout(ragTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
         
         StringBuilder reasoningContent = new StringBuilder();
         StringBuilder finalContent = new StringBuilder();
