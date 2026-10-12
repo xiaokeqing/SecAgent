@@ -497,7 +497,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             String reason = clip(n.path("reason").asText(""), 400);
 
             if (unknown) {
-                return "**模型判定：依据不足，不做定性。**\n\n不给出攻击类型与处置建议（unknown=true）。"
+                return "> state=input-insufficient\n\n**模型判定：依据不足，不做定性。**\n\n不给出攻击类型与处置建议（unknown=true）。"
                         + (reason.isEmpty() ? "" : "\n\n**原因**：" + reason);
             }
             StringBuilder sb = new StringBuilder();
