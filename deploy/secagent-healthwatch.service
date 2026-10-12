@@ -1,0 +1,47 @@
+# ============================================================
+# SecAgent 健康看门狗（systemd service）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-healthwatch.timer（每 2 分钟）
+# 做什么：跑 scripts/srv1-health-watchdog.sh —— 核对 /api/health 的
+#         status 与 fingerprintMismatch；连续 3 次不健康（≈6 分钟）且
+#         当前提交 != last-known-good 时，回滚到 last-known-good（带 30 分钟冷却，
+#         并与 srv1-redeploy.sh 争用同一把 /var/lock/secagent-deploy.lock）。
+#
+# 为什么需要它（补的是最后一条没被验证过的路径）：
+#   srv1-redeploy.sh 只保证"部署动作成功"（拉取/重建/硬校验/一次健康核对）。
+#   如果新版本【起来之后过一会儿才暴露问题】（内存泄漏、依赖失效、向量库损坏），
+#   发布流程已经结束、没人再管 —— 这条路径此前从未被验证过。
+#
+# 安装（root，srv1；注意 DOCKER_CONFIG 与其他 unit 一致）：
+#   install -m 644 deploy/secagent-healthwatch.service deploy/secagent-healthwatch.timer /etc/systemd/system/ \
+#     && install -m 755 scripts/srv1-health-watchdog.sh /opt/secagent/scripts/srv1-health-watchdog.sh \
+#     && systemctl daemon-reload && systemctl enable --now secagent-healthwatch.timer
+# 查看/手工跑：
+#   systemctl list-timers secagent-healthwatch.timer
+#   journalctl -u secagent-healthwatch.service -n 50 --no-pager
+#   bash /opt/secagent/scripts/srv1-health-watchdog.sh --status
+#   bash /opt/secagent/scripts/srv1-health-watchdog.sh --dry-run   # 只判断、不回滚
+# ============================================================
+[Unit]
+Description=SecAgent 健康看门狗（连续不健康则回滚到 last-known-good）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-health-watchdog.sh
+# 回滚本身要拉镜像+重建+等健康，给足时间；但正常检查是毫秒级
+TimeoutStartSec=600
+Nice=10
+# 看门狗只做 curl + docker inspect，资源占用很小
+MemoryMax=300M
+CPUQuota=30%
+# 与 secagent-redeploy.service 同样的坑：ProtectHome=yes 会挡住 /root，
+# docker CLI 需要显式指定凭据目录，否则回滚时会 unauthorized。
+Environment=DOCKER_CONFIG=/etc/secagent/docker
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
