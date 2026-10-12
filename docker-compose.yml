@@ -47,6 +47,9 @@ services:
       # 健康接口返回它，整体检查拿它跟仓库 HEAD 比对 ——
       # 这样"忘了部署"（部署漂移）会自己暴露，不靠人记得。
       BUILD_SHA: "${BUILD_SHA:-unknown}"
+      # 双指纹（P0-4）：不只看"声称的版本"，还看服务器源码与真实产物
+      APP_BUILD_SOURCE_SHA: "${SOURCE_SHA:-unknown}"
+      APP_BUILD_ARTIFACT_MD5: "${ARTIFACT_MD5:-unknown}"
       BUILD_TIME: "${BUILD_TIME:-unknown}"
       # SSH 直连封禁（处置的首选路径）
       BLOCK_SSH_ENABLED: "${BLOCK_SSH_ENABLED:-true}"
