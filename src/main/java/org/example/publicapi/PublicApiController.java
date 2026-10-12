@@ -208,8 +208,19 @@ public class PublicApiController {
         data.put("readOnly", true);
         data.put("summary", auditReader.summary());
         data.put("blocks", auditReader.blocks(20));
-        data.put("actions", auditReader.actions(30));
+        data.put("actions", maskActionText(auditReader.actions(30)));
         return data;
+    }
+
+    /** 审计流水的文本字段（reason）也过一遍 IP 掩码 —— 文本里可能内嵌 IP */
+    private static List<Map<String, Object>> maskActionText(List<Map<String, Object>> in) {
+        for (Map<String, Object> m : in) {
+            Object reason = m.get("reason");
+            if (reason != null) {
+                m.put("reason", PublicIpMask.maskAll(String.valueOf(reason)));
+            }
+        }
+        return in;
     }
 
     /** 把 [{key,count}] 里的 key 当 IP 掩码 */
@@ -238,7 +249,9 @@ public class PublicApiController {
                     x.put("time", m.get("time"));
                     x.put("kind", m.get("kind"));
                     x.put("srcIp", PublicIpMask.mask(m.get("srcIp") == null ? null : String.valueOf(m.get("srcIp"))));
-                    x.put("detail", m.get("detail"));
+                    // detail 是规则描述原文，里面内嵌了完整 IP —— 必须过一遍文本掩码，
+                    // 否则前面结构化字段掩得再干净，这里照样漏（实测漏过一次）
+                    x.put("detail", PublicIpMask.maskAll(m.get("detail") == null ? null : String.valueOf(m.get("detail"))));
                     out.add(x);
                 }
             }
