@@ -102,27 +102,13 @@ BK="$APP_HOST/etc/suricata.yaml.bak-$TS"
 cp -a "$YAML_HOST" "$BK"
 ok "备份 → $BK"
 
-echo "==> 2/6 写本机规则 $RULE_NAME（低速多端口扫描）"
-mkdir -p "$RULES_HOST"
-# 【踩坑修正】不能用 $HOME_NET 当目的地址：这份精简配置里 HOME_NET 是容器内网地址
-# （HOME_NET: "[10.0.0.10]"），而对外暴露的是公网 IP —— 用 $HOME_NET 会导致规则加载了却永不匹配。
-# 这里自动探测本机全局 IPv4（排除 docker/内网网段），把规则目的地址写成那个 IP；探测不到才退化为 any。
-HOST_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
-          | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' | head -n1 || true)
-if [ -n "$HOST_IP" ]; then
-  DST="[$HOST_IP]"
-  ok "规则目的地址 = 本机公网 IP $HOST_IP"
-else
-  DST="any"
-  warn "探测不到全局 IPv4 → 规则目的地址退化为 any（可能把出站连接也算进来）"
-fi
-cat > "$RULES_HOST/$RULE_NAME" <<EOF
-# 本机补充规则（2026-10-12，P3 演练驱动）：现有 ET SCAN 偏 SSH 高频场景，
-# 8 端口 × 单次 × 600ms 这类低速扫描会漏 → 用阈值规则补上。by_src 计数，阈值内只报一次。
-# 注意：这份配置的 \$HOME_NET 是容器内网地址，不能用于匹配对外的公网流量，故此处直接写本机公网 IP。
-alert tcp any any -> $DST any (msg:"LOCAL 低速率多端口扫描 (by_src)"; flags:S; threshold: type both, track by_src, count 6, seconds 20; classtype:attempted-recon; sid:1000001; rev:1;)
-EOF
-ok "规则文件已写入（宿主机 $RULES_HOST/$RULE_NAME，目的地址 $DST）"
+echo "==> 2/6 不新增扫描规则（实测结论：这是可见性缺口，不是规则缺口）"
+# 【2026-10-12 实测结论】原计划新增"低速多端口扫描"规则，应用后复测发现：
+#   · 从 srv1 对 srv2 扫 8 个端口，只有 22 端口的分组真正到达网卡（eve.json 只有 port 22 的 flow），
+#     其余 7 个端口在云安全组就被丢弃 → 传感器看不到的包，任何规则都检测不到 → **可见性缺口**；
+#   · 把规则目的地址放宽成 any 后确实会触发，但命中的是 10.0.0.10 -> 169.254.0.x 的出站流量，属【误报】。
+# 因此本脚本不再写入新规则，只做下面这件确有价值的事：压 ET SCAN(sid 2001219) 的运维误报。
+ok "跳过新增规则（原因见脚本注释：可见性缺口 + any 会误报）；只应用阈值抑制"
 
 echo "==> 3/6 写阈值文件（压 sid $SID_FP 的误报）"
 docker exec "$CT" sh -c "cat > $TH_IN_CT" <<EOF
@@ -132,44 +118,18 @@ threshold gen_id 1, sig_id $SID_FP, type threshold, track by_src, count 3, secon
 EOF
 ok "阈值文件已写入容器 $TH_IN_CT"
 
-echo "==> 4/6 行级修改 suricata.yaml（保留原文与注释，只插两行）"
+echo "==> 4/6 行级修改 suricata.yaml（只在 --- 之后插一行 threshold-file）"
 python3 - "$YAML_HOST" "$RULE_NAME" "$TH_IN_CT" <<'PY'
-# 为什么不用 yaml.safe_dump：
-#   那会把整份配置重新序列化 —— 注释全丢、引号/缩进风格被改写，风险远大于"插两行"的收益。
-#   这里只做两处文本插入，其余一个字符都不动。
 import sys, io, re
 path, rule_name, th_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with io.open(path, 'r', encoding='utf-8') as f:
-    lines = f.readlines()
+    text = f.read()
 
-out, inserted_rule = [], False
-i = 0
-while i < len(lines):
-    line = lines[i]
-    out.append(line)
-    if re.match(r'^rule-files:\s*$', line) and not inserted_rule:
-        # 先探明该块内已有的子项（缩进与范围），新项追加到【块末尾】而不是紧跟在头行后面
-        j, indent = i + 1, '  '
-        while j < len(lines) and re.match(r'^\s*-\s+', lines[j]):
-            indent = re.match(r'^(\s*)', lines[j]).group(1)
-            j += 1
-        if not any(rule_name in l for l in lines[i:j]):
-            # 把块内已有行整体抄进 out，然后追加新项，最后跳过这些行
-            for k in range(i + 1, j):
-                out.append(lines[k])
-            out.append('%s- %s\n' % (indent, rule_name))
-            inserted_rule = True
-            i = j
-            continue
-    i += 1
-
-text = ''.join(out)
 inserted_th = False
 if not re.search(r'^threshold-file:', text, re.M):
     # 【踩坑修正】不能插到文件最顶端：Suricata 要求配置必须以
     #   %YAML 1.1 与 ---  这两行开头，否则报
     #   "The configuration file must begin with the following two lines"。
-    # 所以插到文档起始标记 --- 之后。
     ls = text.splitlines(True)
     idx = 0
     for k, l in enumerate(ls):
@@ -182,9 +142,9 @@ if not re.search(r'^threshold-file:', text, re.M):
 
 with io.open(path, 'w', encoding='utf-8') as f:
     f.write(text)
-print("      插入 rule-files 项:", inserted_rule, "| 插入 threshold-file:", inserted_th)
+print("      插入 threshold-file:", inserted_th)
 PY
-ok "配置已就地写回（只插两行）"
+ok "配置已就地写回"
 
 echo "==> 5/6 校验（不合格立即回滚）"
 if ! validate_conf; then
