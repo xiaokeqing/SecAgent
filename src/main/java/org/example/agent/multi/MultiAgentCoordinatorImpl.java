@@ -45,6 +45,30 @@ import java.util.regex.Pattern;
 @Component
 public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
 
+    /**
+     * 工单创建的旁路线程池。
+     *
+     * <p><b>为什么要旁路</b>：`KnowledgePendingService` 的 submit/approve 是
+     * {@code synchronized}，而 approve 内部会做向量化（网络调用）。断网实测时，
+     * 锁持有者卡在向量化上，其它请求全部排队等锁、且<b>等锁这条路绕过了所有出站守卫</b> ——
+     * 表现为"23 秒后再无日志、请求永不返回"。
+     * 工单本身只是"顺手记一笔"，不该让研判请求为它阻塞，所以改成异步。
+     */
+    private static final java.util.concurrent.ExecutorService TICKET_POOL =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "kb-ticket");
+                t.setDaemon(true);
+                return t;
+            });
+
+    private void createPendingTicketAsync(String userInput, String summary) {
+        try {
+            TICKET_POOL.submit(() -> createPendingTicket(userInput, summary));
+        } catch (Exception e) {
+            logger.warn("待补充知识工单旁路提交失败（不影响研判结果）: {}", e.getMessage());
+        }
+    }
+
     private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER =
             new com.fasterxml.jackson.databind.ObjectMapper();
 
@@ -319,7 +343,7 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         if (ragError || ragEmpty) {
             String why = ragError ? "知识库检索工具不可用（未能生成查询向量）" : "知识库未检索到相关条目";
             String summary = why + "；本次不输出研判结论（无依据不推断）";
-            createPendingTicket(userInput, summary);
+            createPendingTicketAsync(userInput, summary);
             String body = "## 研判结论\n"
                     + "> 结论生成方式：**未生成**（" + why + "）\n\n"
                     + "没有可用依据，按 fail-closed 原则**不给出结论**；已自动创建「待补充知识」工单。\n\n"
