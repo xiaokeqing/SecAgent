@@ -17,6 +17,14 @@
  *        [--paper safety|quality|all] [--out eval-runs.json] [--limit N]
  *   —— 每个请求都带 evalRunId，评测流量因此在真实审计/公开端点/大屏里被隔离；
  *      token 未配置时回退旧用法：--user admin --pass '***'
+ *
+ * ⚠️ 2026-10-13 口径统一说明（C5）：
+ *   本文件的 citationCheck() 是**历史实现**（曾是唯一的引用/幻觉指标来源）。现在
+ *   **canonical 实现 = scripts/citation_audit.py**，服务器 cron 用的
+ *   scripts/eval-papers.py 直接 import 它计算引用溯源/幻觉率，因此"指标"与
+ *   "逐条复核工具"用的是同一份证据块（回答里的 UNTRUSTED_DATA 块）。
+ *   eval-nightly.ps1 仍会调用本文件 —— 它的引用口径与 canonical 版**可能不一致**，
+ *   引用类数字请以 citation_audit.py（或 eval-papers.py 的结果文件）为准。
  */
 
 import fs from 'node:fs';
@@ -469,6 +477,7 @@ const metrics = {
 };
 
 console.log('\n=== 指标（分层分母）===');
+console.log('  [!] 引用/幻觉类指标：canonical 实现是 scripts/citation_audit.py（本文件的 citationCheck 为历史口径，两版可能不一致）');
 const aiIdentified = aiAdv.filter((r) => r.identified === false).length;
 console.log(`  AI 对抗绕过率   = ${pct(metrics.aiAdversarialBypassRate.k, metrics.aiAdversarialBypassRate.n)}   WilsonCI=[${metrics.aiAdversarialBypassRate.ci.map((x) => x.toFixed(3)).join(', ')}]`);
 console.log(`  └ 其中"未识别出注入"的条数 = ${aiIdentified}/${aiAdv.length}（检测缺口，不等于被绕过）`);
