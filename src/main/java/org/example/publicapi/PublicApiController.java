@@ -432,8 +432,11 @@ public class PublicApiController {
     }
 
     private Map<String, Object> buildOverview() {
-        boolean real = source.available();
+        // 先取数、再判定可用性：若上游"连得上但查询失败"退回内置样本，
+        // readAlerts() 会把样本剔除并把 mockFallback 置位，realData() 随后如实返回 false，
+        // 于是响应里的 degraded=true（而不是拿样本当真实告警、还写 degraded=false）。
         List<SecurityAlert> raw = source.readAlerts();
+        boolean real = source.realData();
 
         Map<String, Object> alerts = new LinkedHashMap<>();
         alerts.put("windowSize", source.windowSize());
@@ -457,10 +460,12 @@ public class PublicApiController {
     }
 
     private Map<String, Object> buildAlerts() {
-        boolean real = source.available();
+        // 先取数、再判定可用性：若上游"连得上但查询失败"退回内置样本，
+        // readAlerts() 会把样本剔除并把 mockFallback 置位，realData() 随后如实返回 false，
+        // 于是响应里的 degraded=true（而不是拿样本当真实告警、还写 degraded=false）。
         List<SecurityAlert> raw = source.readAlerts();
+        boolean real = source.realData();
         List<Map<String, Object>> aggs = source.aggregated();
-
         List<Map<String, Object>> publicList = new ArrayList<>();
         for (Map<String, Object> g : aggs) {
             publicList.add(publicAggregate(g));

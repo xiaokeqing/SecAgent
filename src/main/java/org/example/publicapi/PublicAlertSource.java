@@ -69,22 +69,81 @@ public class PublicAlertSource {
     }
 
     /**
+     * 最近一次 {@link #readAlerts()} 是否<b>没有拿到真实数据</b>：上游查询抛异常（例如 read timeout），
+     * 或整批退回内置样本。
+     *
+     * <p>为什么需要它：{@code mode()} 是按"链路是否连得上"判断的，而 WazuhService 在
+     * <b>连得上但查询失败</b>时既可能抛错、也可能把内置样本返回给上层。
+     * 那个窗口里 mode 仍是 REAL，若只看 mode，公网就会把样本当真实攻击记录展示、
+     * 或者显示"0 条告警"并写 {@code degraded=false} —— 2026-10-13 演练实测到了这个窗口。
+     */
+    private volatile boolean lastReadUnavailable = false;
+
+    /** 公网口径的"真实可用"：链路是 REAL <b>且</b> 最近一次取数确实拿到了真实数据。 */
+    public boolean realData() {
+        return available() && !lastReadUnavailable;
+    }
+
+    /**
      * 读取原始告警（仅 REAL 时）。
      *
-     * @return 告警列表；非 REAL 或读取异常时返回空列表（fail-closed，不返回样本）
+     * @return 告警列表；非 REAL、读取异常、或整批都是内置样本时返回空列表（fail-closed）
      */
     public List<SecurityAlert> readAlerts() {
         if (!available()) {
+            lastReadUnavailable = false;
             logger.info("公网只读端点：数据源为 {}，返回空数据（不展示内置样本）", mode());
             return new ArrayList<>();
         }
         try {
             List<SecurityAlert> list = wazuhGateway.recentAlerts(WINDOW);
-            return list == null ? new ArrayList<>() : list;
+            if (list == null || list.isEmpty()) {
+                lastReadUnavailable = false;
+                return new ArrayList<>();
+            }
+            // 【fail-closed：按每条告警自带的 extra.mock 剔除样本】
+            // 不能只看 mode：WazuhService 在"连得上但查询失败"时会退回内置样本，
+            // 而样本长得很像真告警（SSH 暴力破解 / SQL 注入 / Webshell，IP 用 203.0.113.x 文档地址），
+            // 混在真实流里从界面上根本看不出来。内部告警大屏早就按 mode 做过一次剔除，
+            // 但那个窗口它同样漏 —— 所以这里按"事实标记"剔除，与 mode 无关。
+            List<SecurityAlert> real = new ArrayList<>();
+            int mock = 0;
+            for (SecurityAlert a : list) {
+                if (isMockAlert(a)) {
+                    mock++;
+                } else {
+                    real.add(a);
+                }
+            }
+            lastReadUnavailable = real.isEmpty() && mock > 0;
+            if (mock > 0) {
+                logger.warn("公网只读端点：从上游结果中剔除 {} 条内置样本告警（fail-closed：不把样本当真实攻击记录展示）",
+                        mock);
+            }
+            return real;
         } catch (Exception e) {
-            logger.warn("公网只读端点取告警失败，返回空数据：{}", e.getMessage());
+            // 查询抛异常（典型：read timeout）同样属于"没有拿到真实数据" —— 必须让 degraded 生效，
+            // 否则会变成"超时了却报告数据源可用 + 0 条告警"，比直接说不可用更误导。
+            lastReadUnavailable = true;
+            logger.warn("公网只读端点取告警失败，返回空数据并判为不可用：{}", e.getMessage());
             return new ArrayList<>();
         }
+    }
+
+    /** 判断一条告警是否为内置样本（WazuhService / SuricataService 都会打 {@code extra.mock=true}）。 */
+    private boolean isMockAlert(SecurityAlert a) {
+        if (a == null) {
+            return false;
+        }
+        Map<String, Object> extra = a.getExtra();
+        if (extra == null) {
+            return false;
+        }
+        Object m = extra.get("mock");
+        if (m instanceof Boolean) {
+            return (Boolean) m;
+        }
+        return m != null && "true".equalsIgnoreCase(String.valueOf(m));
     }
 
     /** 聚合去重后的告警列表（与自用界面同一套聚合口径，避免两个页面数字对不上） */
