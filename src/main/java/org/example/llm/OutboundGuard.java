@@ -52,6 +52,22 @@ public class OutboundGuard {
         return t;
     });
 
+    /** 每个依赖的在飞上限：防止卡住的调用无限堆积（小机雪崩路径） */
+    @Value("${app.outbound.max-inflight-per-dependency:2}")
+    private int maxInflightPerDependency;
+
+    private final Map<String, java.util.concurrent.Semaphore> bulkheads = new ConcurrentHashMap<>();
+
+    private java.util.concurrent.Semaphore bulkhead(String key) {
+        return bulkheads.computeIfAbsent(key, k -> new java.util.concurrent.Semaphore(maxInflightPerDependency));
+    }
+
+    /** 该依赖当前占用名额（用于自检日志与页面提示） */
+    public int inFlight(String key) {
+        java.util.concurrent.Semaphore s = bulkheads.get(key);
+        return s == null ? 0 : maxInflightPerDependency - s.availablePermits();
+    }
+
     /** 该依赖是否处于冷却期（熔断 open） */
     public boolean coolingDown(String key) {
         Long until = cooldownUntil.get(key);
@@ -85,6 +101,12 @@ public class OutboundGuard {
             throw new IllegalStateException("依赖 " + key + " 处于冷却期（剩余 " + remain + " ms），直接 fail-closed");
         }
         Future<T> future = POOL.submit(call);
+        java.util.concurrent.Semaphore sem = bulkhead(key);
+        if (!sem.tryAcquire()) {
+            // 该依赖在飞已满：直接失败，不再排队堆积（队列堆积 = 雪崩前兆）
+            future.cancel(true);
+            throw new IllegalStateException("依赖 " + key + " 并发已满（上限 " + maxInflightPerDependency + "），直接 fail-closed");
+        }
         try {
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
@@ -99,6 +121,8 @@ public class OutboundGuard {
                 throw ex;
             }
             throw new IllegalStateException("依赖 " + key + " 调用失败: " + cause);
+        } finally {
+            sem.release();
         }
     }
 
