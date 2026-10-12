@@ -54,11 +54,15 @@ $mvn = 'F:\Maven\apache-maven-3.9.12-bin\apache-maven-3.9.12\bin\mvn.cmd'
 if (-not $mvn -or -not (Test-Path $mvn)) { $mvn = 'mvn' }
 
 # 从 jar 里读出 git.properties（构建时由 git-commit-id-maven-plugin 固化进去）
+# 注意：Spring Boot repackage 之后的 fat jar 里，classes 在 BOOT-INF/classes/ 下，
+# 所以条目名是 BOOT-INF/classes/git.properties（运行时 classpath 上仍然是 git.properties）。
 function Get-JarGitProperties([string]$jarPath) {
   Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
   $zip = [System.IO.Compression.ZipFile]::OpenRead($jarPath)
   try {
-    $entry = $zip.Entries | Where-Object { $_.FullName -eq 'git.properties' } | Select-Object -First 1
+    $entry = $zip.Entries |
+      Where-Object { $_.FullName -eq 'BOOT-INF/classes/git.properties' -or $_.FullName -eq 'git.properties' } |
+      Select-Object -First 1
     if (-not $entry) { return $null }
     $sr = New-Object System.IO.StreamReader($entry.Open(), [System.Text.Encoding]::UTF8)
     try { $text = $sr.ReadToEnd() } finally { $sr.Dispose() }
