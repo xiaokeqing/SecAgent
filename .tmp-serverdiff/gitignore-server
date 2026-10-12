@@ -1,0 +1,85 @@
+# ============================================================
+# SecAgent .gitignore
+# ------------------------------------------------------------
+# 原则：构建产物、IDE 配置、运行时文件、敏感信息一律不入库；
+#       但「开箱即用」所需的样例数据要随仓库提供。
+# ============================================================
+
+# ---------- 构建产物 ----------
+target/
+build/
+dist/
+out/
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.classpath
+.project
+.settings/
+.apt_generated
+.factorypath
+.springBeans
+.sts4-cache
+/nbproject/private/
+/nbbuild/
+/nbdist/
+
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 日志 ----------
+*.log
+logs/
+
+# ---------- 运行时产生（不入库）----------
+uploads/
+data/*
+# 例外：以下为「开箱即用」所需的演示数据，随仓库提供
+!data/vector-store.json
+!data/security-events.json
+
+# ---------- 敏感信息：绝不入库 ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+secrets/
+*application-local.yml
+*application-local.yaml
+
+# ---------- 内部资料：不公开 ----------
+docs/internal/
+
+# ---------- 临时脚本 ----------
+# 默认忽略随手写的临时脚本，但保留 PoC 与部署脚本
+*.sh
+*.py
+!docs/poc/*.sh
+!docs/poc/*.py
+!scripts/**/*.sh
+!scripts/**/*.py
+
+# ---------- 容器 ----------
+/volumes
+/server.pid
+
+# ---------- 其他 ----------
+*.bak
+*.tmp
+*.swp
+*~
+_backups/
+_deploy/
+*.tar.gz
+*.hprof

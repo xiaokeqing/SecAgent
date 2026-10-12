@@ -192,6 +192,58 @@
                 </configuration>
             </plugin>
             
+            <!--
+              源码指纹固化进 jar（构建来源校验链的一环）。
+
+              为什么必须有它：光有 artifactMd5 只能证明「跑的是上传的那个 jar」，
+              证明不了「那个 jar 是用哪个 commit 编出来的」。
+              而真实事故正是这个形状：老 Dockerfile 在镜像内用服务器上的旧 src 编译，
+              BUILD_SHA 环境变量（自述）显示新版本，容器里跑的是旧代码。
+
+              本插件在构建时把 git 信息写进 classes/git.properties，随 jar 一起发布 ——
+              于是「这个 jar 到底是哪个 commit 的产物」变成 jar 自带的、可读的证据，
+              而不是任何人（或任何环境变量）的自述。
+
+              fail-closed 两连：
+                · failOnNoGitDirectory=true          → 不是 git 工作区就别想构建出 jar
+                · failOnUnableToExtractRepoInfo=true → 拿不到 repo 信息别想构建出 jar
+              宁可构建失败，也不要产出一个"来源不明"的 jar。
+            -->
+            <plugin>
+                <groupId>io.github.git-commit-id</groupId>
+                <artifactId>git-commit-id-maven-plugin</artifactId>
+                <version>8.0.2</version>
+                <executions>
+                    <execution>
+                        <id>embed-git-properties</id>
+                        <phase>initialize</phase>
+                        <goals>
+                            <goal>revision</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <generateGitPropertiesFile>true</generateGitPropertiesFile>
+                    <generateGitPropertiesFilename>${project.build.outputDirectory}/git.properties</generateGitPropertiesFilename>
+                    <failOnNoGitDirectory>true</failOnNoGitDirectory>
+                    <failOnUnableToExtractRepoInfo>true</failOnUnableToExtractRepoInfo>
+                    <commitIdGenerationMode>flat</commitIdGenerationMode>
+                    <!-- 只留校验链用得上的字段：git.properties 会进 jar、进容器，
+                         没必要把 committer 邮箱之类也塞进去（仓库公开不等于要顺手散播）。 -->
+                    <includeOnlyProperties>
+                        <includeOnlyProperty>^git\.branch$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.commit\.id$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.commit\.id\.abbrev$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.dirty$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.build\.time$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.build\.version$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.commit\.time$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.commit\.message\.short$</includeOnlyProperty>
+                        <includeOnlyProperty>^git\.total\.commit\.count$</includeOnlyProperty>
+                    </includeOnlyProperties>
+                </configuration>
+            </plugin>
+
             <!-- Maven 编译器插件，配置 Lombok 注解处理器 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
