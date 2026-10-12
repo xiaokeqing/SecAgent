@@ -12,7 +12,14 @@
 #   "failed to create endpoint ... network bridge does not exist"；
 #   用 host 网络构建可绕开容器网络创建问题。
 #
-# 用法：build-on-server.sh <jar路径> <buildSha>
+# 用法：build-on-server.sh <jar路径> <buildSha>     # buildSha = 部署脚本算出的【目标 commit】
+#      ALLOW_DIRTY=1 bash build-on-server.sh ...   # 显式承认服务器工作区是脏的
+#
+# 【fail-closed】本脚本做的第一件事不是放 jar，而是校验源码：
+#   ① 目标 commit 必须在服务器仓库里真实存在（sha 写错一个字符就别想继续）
+#   ② 工作区 HEAD 必须正好等于目标 commit（不等 → 就是用旧源码构建）
+#   ③ 工作区必须干净（有未提交改动 → 源码无法用 commit 唯一定位）
+#   任一不满足 → 非零退出，且【不产生镜像、不重启容器】。
 # ============================================================
 set -euo pipefail
 
@@ -29,6 +36,56 @@ if [ ! -f Dockerfile ]; then
   echo "[X] 找不到 Dockerfile: $APP/Dockerfile"
   exit 2
 fi
+
+# ============================================================
+# 0/4 【fail-closed】源码校验 —— 必须在放 jar / 构建镜像 / 重启容器之前
+# ------------------------------------------------------------
+# 为什么放在最前面而且失败即非零退出：
+#   老 Dockerfile 是多阶段构建，会在镜像内用**服务器上的 src** 编译；
+#   只要服务器源码是旧的，就会产出「指纹是新的、代码是旧的」镜像 ——
+#   这正是真实事故的形状。所以「源码树干净且正好是目标 commit」是硬前置条件：
+#   不满足就连 jar 都不放、镜像不建、容器不动。
+#
+# 为什么用 git rev-parse --verify 而不是字符串比较短号：
+#   短号/全号长度不同、写错一个字符（deadbeef）在字符串比较里都只是"不一致"，
+#   但真正要区分的是「这个 commit 在本仓库里根本不存在」——
+#   那说明部署的人和服务器根本不是同一份历史，比"不一致"更严重。
+# ============================================================
+ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
+
+echo "==> 0/4 源码校验（fail-closed：不满足就绝不构建）"
+if [ -z "$SHA" ] || [ "$SHA" = "unknown" ]; then
+  echo "  [X] 没有目标 commit（第 2 个参数为空/unknown）—— 无法校验源码版本，中止"
+  exit 4
+fi
+if ! git -C "$APP" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "  [X] $APP 不是 git 工作区 —— 无法校验源码版本，中止"
+  exit 4
+fi
+TARGET_FULL="$(git -C "$APP" rev-parse --verify --quiet "${SHA}^{commit}" || true)"
+if [ -z "$TARGET_FULL" ]; then
+  echo "  [X] 目标 commit '$SHA' 在服务器仓库里不存在 —— 不能证明源码就是它编的，中止"
+  exit 4
+fi
+HEAD_FULL="$(git -C "$APP" rev-parse HEAD)"
+if [ "$TARGET_FULL" != "$HEAD_FULL" ]; then
+  echo "  [X] 源码 commit 不一致：工作区 HEAD=${HEAD_FULL} ≠ 目标 ${TARGET_FULL}（$SHA）"
+  echo "      继续构建就会产出『指纹是新的、代码是旧的』镜像 —— 中止（绝不继续用旧源码构建）"
+  exit 4
+fi
+DIRTY_LINES="$(git -C "$APP" status --porcelain)"
+if [ -n "$DIRTY_LINES" ]; then
+  if [ "$ALLOW_DIRTY" = "1" ]; then
+    echo "  [!] 工作区有未提交改动，但显式传了 ALLOW_DIRTY=1 → 放行（产物不能等价于任何 commit）"
+    echo "$DIRTY_LINES" | head -10 | sed 's/^/      /'
+  else
+    echo "  [X] 服务器工作区不干净（有未提交改动）—— 源码无法用 commit 唯一定位，中止"
+    echo "$DIRTY_LINES" | head -10 | sed 's/^/      /'
+    echo "      确认无误可显式放行：ALLOW_DIRTY=1 bash $0 <jar> $SHA"
+    exit 5
+  fi
+fi
+echo "  [OK] 源码校验通过：HEAD=$HEAD_FULL == 目标 commit，工作区$([ -n "$DIRTY_LINES" ] && echo '脏（已显式放行）' || echo '干净')"
 
 echo "==> 1/4 放置 jar（放 runtime/ —— target/ 被 .dockerignore 排除，会导致 COPY 失败）"
 mkdir -p runtime
@@ -76,7 +133,7 @@ export BUILD_SHA="$SHA"
 export ARTIFACT_MD5
 export SOURCE_SHA
 docker compose up -d --force-recreate secagent 2>&1 | tail -3
-sleep 30
+# 这里不盲目 sleep：下面 4/4 会轮询 health，一直到容器真的报出目标 commit 为止
 
 echo "==> 4/4 双指纹落盘 + 健康检查"
 # SOURCE_SHA 已在步骤 2 算好并 export（必须在 compose up 之前，否则容器里是 unknown）
@@ -104,5 +161,28 @@ elif [ "$SOURCE_SHA" != "$ORIGIN_SHA" ]; then
   echo "  [!] 源码【未】同步到 origin/main（$SOURCE_SHA ≠ $ORIGIN_SHA）—— 用的是旧源码，请确认符合预期"
 fi
 docker ps --format '  {{.Names}} | {{.Status}}' | head -3
-curl -s -m 15 http://127.0.0.1:9900/api/health | head -c 260
-echo ""
+
+# 部署后独立核对（不靠"看起来成功"）：
+#   等到 health 报出【目标 commit】，再断言 fingerprintMismatch=false、status=ok。
+# 为什么不能只 curl 一下就算过：事故形态就是"接口 200、一切正常"。
+HEALTH_JSON=""
+for _ in $(seq 1 36); do
+  HEALTH_JSON="$(curl -s -m 10 http://127.0.0.1:9900/api/health || true)"
+  if echo "$HEALTH_JSON" | grep -q "\"embeddedGitCommit\":\"${SHA}\""; then
+    break
+  fi
+  sleep 5
+done
+echo "  health: $HEALTH_JSON"
+POST_FAILED=0
+echo "$HEALTH_JSON" | grep -q "\"embeddedGitCommit\":\"${SHA}\"" \
+  || { echo "  [X] embeddedGitCommit != $SHA（jar 内固化的 commit 与本次发布的目标 commit 不一致）"; POST_FAILED=1; }
+echo "$HEALTH_JSON" | grep -q '"fingerprintMismatch":false' \
+  || { echo "  [X] fingerprintMismatch != false（见 health 的 fingerprintMismatchReason）"; POST_FAILED=1; }
+echo "$HEALTH_JSON" | grep -q '"status":"ok"' \
+  || { echo "  [X] status != ok（见 health 的 fingerprintIssues）"; POST_FAILED=1; }
+if [ "$POST_FAILED" != "0" ]; then
+  echo "  [X] 部署后核对未通过 —— 以非零退出（别把『看起来成功』当成功）"
+  exit 6
+fi
+echo "  [OK] 部署后核对通过：embeddedGitCommit = $SHA，fingerprintMismatch=false，status=ok"
