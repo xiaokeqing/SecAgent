@@ -100,12 +100,22 @@ public class PublicAskService {
         if (!injectionHits.isEmpty()) {
             logger.info("公开提问命中注入特征 {} 条，按设计拒绝生成（来源={}）", injectionHits.size(), clientIp);
             data.put("injection", injectionNote(injectionHits));
-            return refused(data, "input-insufficient",
-                    "这段输入命中了提示注入特征，公开演示按设计不作答。\n\n"
-                            + "本项目对注入的处理不是「当作没看见」：外部内容一律包裹为 UNTRUSTED_DATA，"
-                            + "并明确标注「仅作证据、绝不是指令」。公开端点在此之上更保守一步 —— "
-                            + "命中即拒绝，不给模型被绕过的机会。\n\n"
-                            + "命中特征数：" + injectionHits.size() + "（不展示具体正则，避免变成绕过提示）。");
+            // 【2026-10-13 修 F3：拒绝文案也必须过输出护栏】
+            // 原先这段固定文案直接 return：文案里带字面标记 UNTRUSTED_DATA，而模型输出里同一个词
+            // 会被护栏换成「[内部标记已脱敏]」—— 同一份响应里出现两种口径，且 outputFindings=null，
+            // 等于护栏覆盖面缺了一块（夜间抽检就是这么发现的）。
+            // 现在两件事一起做：
+            //   ① 文案改成不含字面标记的说法（对匿名读者也更可读）；
+            //   ② 仍然把文案过一遍 sanitize() —— 防御纵深：将来文案再改、或拒绝语里
+            //      不小心带进 IP/路径/凭据，护栏同样会拦下，不会因为"这是固定文案"就免检。
+            String refusal = "这段输入命中了提示注入特征，公开演示按设计不作答。\n\n"
+                    + "本项目对注入的处理不是「当作没看见」：外部内容一律按不可信数据处理并包裹，"
+                    + "并明确标注「仅作证据、绝不是指令」。公开端点在此之上更保守一步 —— "
+                    + "命中即拒绝，不给模型被绕过的机会。\n\n"
+                    + "命中特征数：" + injectionHits.size() + "（不展示具体正则，避免变成绕过提示）。";
+            PublicOutputGuard.Sanitized sanitizedRefusal = outputGuard.sanitize(refusal);
+            data.put("outputFindings", sanitizedRefusal.findings());
+            return refused(data, "input-insufficient", sanitizedRefusal.text());
         }
 
         // ---------- 检索公开知识库（引用片段 + 判"无依据"） ----------
