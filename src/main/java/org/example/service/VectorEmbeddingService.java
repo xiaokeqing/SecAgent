@@ -33,6 +33,20 @@ public class VectorEmbeddingService {
     @Value("${dashscope.embedding.model}")
     private String model;
 
+    /**
+     * 出站守卫：embedding 必须在有界时间内返回或失败。
+     *
+     * <p><b>实测教训</b>：原生 SDK 的 embedding 调用此前<b>没有任何超时</b>，
+     * 断网时研判请求挂死（90 秒都拿不到响应），线程被一直占住。
+     * 这是"出站调用统一规范缺失"的第二处（第一处是 chat 的 180 秒 readTimeout）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.example.llm.OutboundGuard outboundGuard;
+
+    /** embedding 单次调用上限：比生成短，它只做向量化 */
+    @org.springframework.beans.factory.annotation.Value("${app.llm.embedding-timeout-ms:8000}")
+    private long embeddingTimeoutMs;
+
     private TextEmbedding textEmbedding;
 
     @PostConstruct
@@ -99,7 +113,7 @@ public class VectorEmbeddingService {
                     .build();
 
             // 调用 API
-            TextEmbeddingResult result = textEmbedding.call(param);
+            TextEmbeddingResult result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
 
             // 检查结果
             List<Float> floatEmbedding = getFloats(result);
@@ -171,7 +185,7 @@ public class VectorEmbeddingService {
                     .build();
 
             // 调用 API
-            TextEmbeddingResult result = textEmbedding.call(param);
+            TextEmbeddingResult result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
 
             // 检查结果
             if (result == null || result.getOutput() == null || result.getOutput().getEmbeddings() == null) {
