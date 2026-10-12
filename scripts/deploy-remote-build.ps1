@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   去本机化的部署：本机只编译 jar，服务器自己构建镜像并重启。
   **构建前 fail-closed 校验源码，构建后校验 jar 的来源，部署后严格核对 health。**
@@ -105,7 +105,8 @@ if ($dirty.Count -gt 0) {
   Warn "工作区有 $($dirty.Count) 项未提交改动，但显式传了 -AllowDirty → 放行（这个 jar 不能等价于任何 commit）"
   $dirty | Select-Object -First 10 | ForEach-Object { Write-Host "      $_" }
 }
-Step "0/4" "[OK] 源码校验通过：HEAD == 目标 commit=$sha，工作区$($(if ($dirty.Count -gt 0) { '脏（已显式放行）' } else { '干净' }))"
+$worktreeState = if ($dirty.Count -gt 0) { '脏（已显式放行）' } else { '干净' }
+Step "0/4" "[OK] 源码校验通过：HEAD == 目标 commit=$sha，工作区$worktreeState"
 
 # 1) 本机编译（不需要 Docker）
 if (-not $SkipBuild) {
