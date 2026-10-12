@@ -108,6 +108,21 @@ public class PublicAlertSource {
         }
     }
 
+    /**
+     * 蜜罐战报（<b>未脱敏</b> —— 掩码由控制器在输出前做）。
+     *
+     * <p>fail-closed：取不到就返回 {@code available=false}，页面显示"数据源不可用"。
+     */
+    public Map<String, Object> honeypotSummary(int size) {
+        try {
+            Map<String, Object> m = wazuhGateway.honeypotSummary(size);
+            return m == null ? new java.util.LinkedHashMap<>() : m;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取蜜罐战报失败：{}", e.getMessage());
+            return new java.util.LinkedHashMap<>();
+        }
+    }
+
     public int windowSize() {
         return WINDOW;
     }

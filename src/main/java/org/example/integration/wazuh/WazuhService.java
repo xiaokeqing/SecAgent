@@ -210,6 +210,127 @@ public class WazuhService implements WazuhGateway {
         }
     }
 
+    /** 蜜罐规则描述里的取值（实测形状见下）；用全限定名避免再加 import */
+    private static final java.util.regex.Pattern RE_CRED =
+            java.util.regex.Pattern.compile("用户=(\\S+)\\s+口令=(\\S+)");
+    private static final java.util.regex.Pattern RE_SRC =
+            java.util.regex.Pattern.compile("来源=([0-9a-fA-F:.]+)");
+    private static final java.util.regex.Pattern RE_CLIENT =
+            java.util.regex.Pattern.compile("SSH 客户端版本 (\\S+)");
+
+    /**
+     * 蜜罐战报：从 indexer 取 Cowrie 告警后聚合（<b>返回未脱敏值</b>，掩码在公网边界做）。
+     *
+     * <p>实测规则形状（2026-10-12，共 9352 条）：
+     * <pre>
+     *   100100 蜜罐: 新的 SSH 连接来自 &lt;ip&gt;                          3127
+     *   100104 蜜罐: SSH 客户端版本 &lt;ver&gt; 来源=&lt;ip&gt;                  3122
+     *   100102 蜜罐: 攻击者"登录成功" 用户=&lt;u&gt; 口令=&lt;p&gt; 来源=&lt;ip&gt;  3113
+     *   100101 登录失败                                                    5
+     * </pre>
+     * 值直接写在 {@code rule.description} 里，所以在 Java 侧用正则抽取再聚合 ——
+     * 这些字段在 OpenSearch 里没法直接做 terms 聚合。
+     *
+     * <p><b>命令时间线没有数据源</b>：蜜罐规则里没有"命令执行"这一条，
+     * 因此 {@code commandsAvailable=false}。页面必须如实写"数据源未接"，
+     * 不能用别的字段拼一条看起来像命令时间线的东西。
+     */
+    @Override
+    public Map<String, Object> honeypotSummary(int size) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        out.put("commandsAvailable", false);
+
+        if (!available || client == null) {
+            return out;
+        }
+        try {
+            int want = Math.min(Math.max(size, 1), 2000);
+            String body = "{\"size\":" + want + ",\"sort\":[{\"@timestamp\":\"desc\"}],"
+                    + "\"query\":{\"term\":{\"rule.groups\":\"cowrie\"}}}";
+            JsonNode root = client.search("wazuh-alerts-*", body);
+
+            long connections = 0;
+            long logins = 0;
+            long loginFails = 0;
+            Map<String, Long> creds = new LinkedHashMap<>();
+            Map<String, Long> sources = new LinkedHashMap<>();
+            Map<String, Long> clients = new LinkedHashMap<>();
+            List<Map<String, Object>> timeline = new ArrayList<>();
+
+            for (JsonNode h : root.path("hits").path("hits")) {
+                JsonNode s = h.path("_source");
+                String ruleId = s.path("rule").path("id").asText("");
+                String desc = s.path("rule").path("description").asText("");
+                String ts = normalizeTime(s.path("@timestamp").asText(""));
+
+                if ("100100".equals(ruleId)) {
+                    connections++;
+                } else if ("100102".equals(ruleId)) {
+                    logins++;
+                } else if ("100101".equals(ruleId)) {
+                    loginFails++;
+                }
+
+                java.util.regex.Matcher mCred = RE_CRED.matcher(desc);
+                if (mCred.find()) {
+                    creds.merge(mCred.group(1) + " / " + mCred.group(2), 1L, Long::sum);
+                }
+                java.util.regex.Matcher mSrc = RE_SRC.matcher(desc);
+                String src = mSrc.find() ? mSrc.group(1) : "";
+                if (!src.isEmpty()) {
+                    sources.merge(src, 1L, Long::sum);
+                }
+                java.util.regex.Matcher mCli = RE_CLIENT.matcher(desc);
+                if (mCli.find()) {
+                    clients.merge(mCli.group(1), 1L, Long::sum);
+                }
+
+                if (timeline.size() < 40) {
+                    String kind = "100102".equals(ruleId) ? "登录成功"
+                            : "100101".equals(ruleId) ? "登录失败"
+                            : "100104".equals(ruleId) ? "客户端指纹" : "新连接";
+                    Map<String, Object> e = new LinkedHashMap<>();
+                    e.put("time", ts);
+                    e.put("kind", kind);
+                    e.put("srcIp", src);
+                    e.put("detail", desc);
+                    timeline.add(e);
+                }
+            }
+
+            out.put("available", true);
+            out.put("total", root.path("hits").path("total").path("value").asLong(0));
+            out.put("connections", connections);
+            out.put("logins", logins);
+            out.put("loginFails", loginFails);
+            out.put("topCredentials", topN(creds, 10));
+            out.put("topSources", topN(sources, 10));
+            out.put("topClients", topN(clients, 8));
+            out.put("timeline", timeline);
+            out.put("sampled", root.path("hits").path("hits").size());
+            return out;
+        } catch (Exception e) {
+            logger.warn("蜜罐战报查询失败（页面会显示数据源不可用）：{}", e.getMessage());
+            return out;
+        }
+    }
+
+    /** 取 Top N（按计数倒序） */
+    private static List<Map<String, Object>> topN(Map<String, Long> src, int n) {
+        List<Map<String, Object>> list = new ArrayList<>();
+        src.entrySet().stream()
+                .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+                .limit(n)
+                .forEach(e -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("key", e.getKey());
+                    m.put("count", e.getValue());
+                    list.add(m);
+                });
+        return list;
+    }
+
     /**
      * 处置通道是否可用 —— 与 {@link #isAvailable()} 语义不同，不要混用。
      *

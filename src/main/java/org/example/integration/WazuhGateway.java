@@ -44,6 +44,18 @@ public interface WazuhGateway {
     Map<String, Object> summary24h();
 
     /**
+     * 蜜罐战报：从 indexer 取 Cowrie 告警，聚合连接/登录计数、账号口令 Top、
+     * 来源分布与事件时间线。
+     *
+     * <p>返回<b>未脱敏</b>原始值 —— 掩码必须在公网边界（publicapi 包）做，内部界面可看完整值。
+     *
+     * <p><b>命令时间线当前没有数据源</b>：Wazuh 侧的蜜罐规则只覆盖
+     * 连接 / 客户端版本 / 登录成功 / 登录失败，没有"命令执行"规则，
+     * 因此 {@code commandsAvailable=false}，页面必须如实标注。
+     */
+    Map<String, Object> honeypotSummary(int size);
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）

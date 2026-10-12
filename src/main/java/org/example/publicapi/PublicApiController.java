@@ -75,6 +75,12 @@ public class PublicApiController {
 
     private final Snapshot overviewCache = new Snapshot();
     private final Snapshot alertsCache = new Snapshot();
+    private final Snapshot honeypotCache = new Snapshot();
+    private final Snapshot auditCache = new Snapshot();
+
+    /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
+    @Autowired
+    private PublicAuditReader auditReader;
 
     // ==================== 端点 ====================
 
@@ -147,7 +153,98 @@ public class PublicApiController {
         return ok(data, res);
     }
 
+    /** 蜜罐战报：连接/登录计数、账号口令 Top、来源分布（掩码）、事件时间线。 */
+    @GetMapping("/honeypot")
+    public ResponseEntity<Map<String, Object>> honeypot(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(honeypotCache.get(cacheSeconds, this::buildHoneypot), res);
+    }
+
+    /** 处置审计（只读）：封禁记录 + 审计流水，IP 全部掩码，不含原始 detail。 */
+    @GetMapping("/audit")
+    public ResponseEntity<Map<String, Object>> audit(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(auditCache.get(cacheSeconds, this::buildAudit), res);
+    }
+
     // ==================== 载荷组装 ====================
+
+    private Map<String, Object> buildHoneypot() {
+        Map<String, Object> raw = source.honeypotSummary(800);
+        boolean available = Boolean.TRUE.equals(raw.get("available"));
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", LocalDateTime.now().format(FMT));
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("available", available);
+        data.put("commandsAvailable", Boolean.TRUE.equals(raw.get("commandsAvailable")));
+        data.put("note", available
+                ? "IP 已掩码到网段；命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）"
+                : "蜜罐数据源不可达，本页不展示任何蜜罐数据");
+
+        if (available) {
+            data.put("total", raw.get("total"));
+            data.put("connections", raw.get("connections"));
+            data.put("logins", raw.get("logins"));
+            data.put("loginFails", raw.get("loginFails"));
+            data.put("sampled", raw.get("sampled"));
+            // 账号口令 Top 原样保留（那是攻击者试的弱口令，是战报的核心信息）
+            data.put("topCredentials", raw.get("topCredentials"));
+            data.put("topSources", maskKeys(raw.get("topSources")));
+            data.put("topClients", raw.get("topClients"));
+            data.put("timeline", maskTimeline(raw.get("timeline")));
+        }
+        return data;
+    }
+
+    private Map<String, Object> buildAudit() {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", LocalDateTime.now().format(FMT));
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("readOnly", true);
+        data.put("summary", auditReader.summary());
+        data.put("blocks", auditReader.blocks(20));
+        data.put("actions", auditReader.actions(30));
+        return data;
+    }
+
+    /** 把 [{key,count}] 里的 key 当 IP 掩码 */
+    private static List<Map<String, Object>> maskKeys(Object v) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (v instanceof List<?> l) {
+            for (Object o : l) {
+                if (o instanceof Map<?, ?> m) {
+                    Map<String, Object> x = new LinkedHashMap<>();
+                    x.put("key", PublicIpMask.mask(m.get("key") == null ? null : String.valueOf(m.get("key"))));
+                    x.put("count", m.get("count"));
+                    out.add(x);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** 时间线里的源 IP 掩码 */
+    private static List<Map<String, Object>> maskTimeline(Object v) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (v instanceof List<?> l) {
+            for (Object o : l) {
+                if (o instanceof Map<?, ?> m) {
+                    Map<String, Object> x = new LinkedHashMap<>();
+                    x.put("time", m.get("time"));
+                    x.put("kind", m.get("kind"));
+                    x.put("srcIp", PublicIpMask.mask(m.get("srcIp") == null ? null : String.valueOf(m.get("srcIp"))));
+                    x.put("detail", m.get("detail"));
+                    out.add(x);
+                }
+            }
+        }
+        return out;
+    }
 
     private Map<String, Object> buildOverview() {
         boolean real = source.available();

@@ -369,6 +369,33 @@ public class WazuhClient {
         }
     }
 
+    /**
+     * 通用只读 indexer 查询（蜜罐战报等公开只读端点用）。
+     *
+     * <p>刻意只接受<b>查询体</b>、只走 {@code _search}：不给调用方留写操作的口子，
+     * 也避免有人顺手把删改请求传进来。
+     *
+     * @param indexPattern 索引模式，如 {@code wazuh-alerts-*}
+     * @param bodyJson     OpenSearch 查询体
+     */
+    public JsonNode search(String indexPattern, String bodyJson) throws IOException {
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址");
+        }
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/" + indexPattern + "/_search")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .post(RequestBody.create(bodyJson, JSON))
+                .build();
+        try (Response resp = indexerHttp.newCall(req).execute()) {
+            String respBody = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 查询失败 HTTP " + resp.code() + ": " + snippet(respBody));
+            }
+            return mapper.readTree(respBody);
+        }
+    }
+
     /** 拉取 manager 日志（取证用）。 */
     public JsonNode fetchManagerLogs(String query, int limit) throws IOException {
         StringBuilder path = new StringBuilder("/manager/logs?limit=" + Math.max(1, limit));
