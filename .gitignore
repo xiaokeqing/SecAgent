@@ -83,3 +83,7 @@ _backups/
 _deploy/
 *.tar.gz
 *.hprof
+
+# 子代理/临时对比目录（不入库）
+.tmp-serverdiff/
+.tmp-*/
