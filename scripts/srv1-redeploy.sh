@@ -231,23 +231,21 @@ log "1/9 读取发布指针（$POINTER_REF 的 digest）"
 PTR_DIGEST=""
 PTR_SRC=""
 rm -f /tmp/secagent-ptr.json /tmp/secagent-ptr.err
-if docker manifest inspect "$POINTER_REF" >/tmp/secagent-ptr.json 2>/tmp/secagent-ptr.err; then
-  PTR_DIGEST=$(parse_manifest_digest </tmp/secagent-ptr.json)
-  PTR_SRC="docker manifest inspect"
+# 【2026-10-12 实测修正】docker manifest inspect 的输出里【不含 manifest 自身的 digest】：
+# 那个 JSON 里第一个 "digest" 是 **config 摘要**，拿它去 `docker pull repo@digest` 会被 ACR 拒绝
+# （表现为 500 Internal Server Error）。所以：
+#   ① 首选权威口径 = pull 该 tag 后取 RepoDigests（RepoDigests 里的就是 manifest digest）
+#   ② 次选 = docker manifest inspect --verbose 的 Descriptor.digest
+if docker pull "$POINTER_REF" >/tmp/secagent-ptr-pull.log 2>&1; then
+  PTR_DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$POINTER_REF" 2>/dev/null | parse_ref_digest)
+  PTR_SRC="docker pull + inspect RepoDigests"
 fi
-if [ -z "$PTR_DIGEST" ] && docker buildx imagetools inspect "$POINTER_REF" >/tmp/secagent-ptr.json 2>>/tmp/secagent-ptr.err; then
-  PTR_DIGEST=$(parse_manifest_digest </tmp/secagent-ptr.json)
-  PTR_SRC="docker buildx imagetools inspect"
+if [ -z "$PTR_DIGEST" ] && docker manifest inspect --verbose "$POINTER_REF" >/tmp/secagent-ptr.json 2>>/tmp/secagent-ptr.err; then
+  PTR_DIGEST=$(sed -n 's/.*"Descriptor"[^}]*"digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]\{64\}\)".*/\1/p' /tmp/secagent-ptr.json | head -1)
+  PTR_SRC="docker manifest inspect --verbose(Descriptor.digest)"
 fi
 if [ -z "$PTR_DIGEST" ]; then
-  # 兜底：pull 后从 RepoDigests 取（需要凭据，srv1 已 docker login）
-  warn "manifest 查询拿不到 digest，改用 pull 兜底：$(head -c 200 /tmp/secagent-ptr.err 2>/dev/null)"
-  if docker pull "$POINTER_REF" >/tmp/secagent-ptr-pull.log 2>&1; then
-    PTR_DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$POINTER_REF" 2>/dev/null | parse_ref_digest)
-    PTR_SRC="docker pull + inspect RepoDigests"
-  else
-    die "拉取发布指针失败：$(tail -3 /tmp/secagent-ptr-pull.log 2>/dev/null)" 1
-  fi
+  die "拿不到发布指针的 digest（ACR 里该 tag 是否已推送？err: $(head -c 200 /tmp/secagent-ptr.err 2>/dev/null))" 1
 fi
 is_digest "$PTR_DIGEST" || die "发布指针 digest 形状不对（'$PTR_DIGEST'）—— 拒绝继续（fail-closed）" 1
 ok "发布指针 digest = $PTR_DIGEST   （来源：$PTR_SRC）"
