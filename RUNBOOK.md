@@ -581,3 +581,78 @@ bash /opt/secagent/scripts/deploy-chain-check.sh --json    # 机器可读
   实测：systemctl start secagent-redeploy.service → Result=success，服务自行完成
         读 digest → pull → 重建 → 硬校验 → 健康核对 → 写 last-known-good。
 ```
+
+---
+
+## 13. 健康看门狗与发布前体检（2026-10-13 新增）
+
+### 13.1 健康看门狗：补上"部署后起来才不健康"的自动回滚
+
+```
+问题：srv1-redeploy.sh 只保证"部署动作成功"（拉取/重建/硬校验/一次健康核对）。
+      若新版本【起来之后过一会儿才暴露问题】（内存泄漏、依赖失效、向量库损坏），发布流程已结束、无人处置
+      —— 这条路径此前从未被验证过。
+
+做法：scripts/srv1-health-watchdog.sh + deploy/secagent-healthwatch.{service,timer}（每 2 分钟）
+  · 核对 /api/health 的 status 与 fingerprintMismatch（两者任一不对即"不健康"）
+  · 连续 3 次（≈6 分钟）不健康才动手 —— 避免单次抖动触发回滚
+  · 当前提交 == last-known-good 时不动（回滚无意义，只告警）
+  · 30 分钟回滚冷却 —— 避免回滚风暴
+  · 与 srv1-redeploy.sh 争用同一把 flock（/var/lock/secagent-deploy.lock）—— 避免"发布"与"回滚"并发操作容器
+  · 计数状态保存在 /opt/secagent/releases/health-watchdog.state
+
+用法：
+  bash /opt/secagent/scripts/srv1-health-watchdog.sh --status     # 看状态与计数
+  bash /opt/secagent/scripts/srv1-health-watchdog.sh --dry-run    # 只判断、只记录，不回滚
+  bash /opt/secagent/scripts/srv1-health-watchdog.sh              # 真实检查（可能触发回滚）
+  journalctl -u secagent-healthwatch.service -n 50 --no-pager
+
+实测（三条路径都验过）：
+  健康路径        → 「健康：OK commit=… vectors=318」退出码 0
+  坏 URL 连击 3 次 → 正确输出「决定回滚：现状 commit=… → last-known-good commit=…」（--dry-run 不动作）
+  systemd 单元    → Result=success；timer active/enabled
+
+【踩坑·值得记住】探针第一次写成 `python3 - <<'PY'`，heredoc 抢占了 stdin，
+  管道传进来的响应体根本没被读到 → **连健康的接口都被判成"响应不是 JSON"**，计数一路飙到 6/3。
+  一个会误判的看门狗比没有看门狗更危险 —— 所以这类"会自己动手"的脚本必须先 `--dry-run` 验证判断逻辑，
+  再启用 timer。修法：改用 `python3 -c`（stdin 留给管道）。
+```
+
+### 13.2 发布前体检：把"临时值必须回收"变成一条命令
+
+```
+bash /opt/secagent/scripts/preflight-release.sh              # 发布用：七项全绿才放行（有阻塞项退出码 1）
+bash /opt/secagent/scripts/preflight-release.sh --allow-dev  # 开发期用：额度未回收只提示不阻塞
+
+七项检查：
+  1) 生产额度是否已回收（三处交叉验证：容器内环境变量 / /opt/secagent/.env / 公开端点回显的 quota.limit）
+  2) 代码侧模板是否生产值（.env.example 必须是 50/60/30，且不得出现 sk- 前缀值 —— 否则 CI 的 gitleaks 会红）
+  3) 线上指纹一致（status=ok 且 fingerprintMismatch=false）
+  4) 发布指针与线上一致（ACR stable 的 label revision == 线上 embeddedGitCommit）
+  5) 两个 timer 是否在工作（secagent-redeploy / secagent-healthwatch 都要 active+enabled）
+  6) 回滚基准有效（last-known-good.json 存在且其镜像拉得动）
+  7) 仓库工作区干净（避免"以为发布了、其实改动没提交"）
+
+U2（回收开发期额度）的完整执行方法：
+  1) 改 /opt/secagent/.env：DAILY_QUOTA 与 APP_QUOTA_* 三行改回 50 / 60 / 30
+  2) 【必须】用 `sudo bash /opt/secagent/scripts/srv1-redeploy.sh` 重建容器
+     （不要用 docker compose up —— 那会把容器引用从 digest 换成本地镜像，破坏不可变产物）
+  3) `bash /opt/secagent/scripts/preflight-release.sh`（不带 --allow-dev）应全绿
+```
+
+### 13.3 服务器源码树会过期 —— 体检第 2 项因此误报过
+
+```
+症状：体检报「.env.example 额度不是 50/60/30」+「出现 sk- 前缀值」，
+      但仓库里那份明明是好的。
+根因：srv1 的源码树（/opt/secagent）停在 970a1c2（P4 那轮同步的提交），
+      旧的 .env.example 正是"带 sk- 占位值 + 开发期额度"的版本 —— 报的是【服务器上的旧文件】。
+修法：按 §1.3.1 用 git bundle 把服务器树同步到最新 main：
+  git bundle create /tmp/secagent.bundle main           # 本地
+  scp /tmp/secagent.bundle srv1:/tmp/
+  cd /opt/secagent && git fetch /tmp/secagent.bundle main:refs/remotes/origin/main && git reset --hard refs/remotes/origin/main
+  注意：部署状态文件（last-known-good.json、releases/、.ci-override.yml）在 .git/info/exclude 里，
+       reset --hard 不会删它们（同步后已核对仍在）。
+教训：凡是"检查仓库文件"的体检项，都要先确认【被检查的那份文件到底是哪一份】——
+      本地工作区、服务器源码树、镜像内 jar，三者可能不是同一个版本。
+```
