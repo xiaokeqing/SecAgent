@@ -247,23 +247,29 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         }
     }
 
-    /** 仅在线时调用：让 Planner 模型输出一个角色名；任何异常都返回 null 触发回退 */
+    /**
+     * 仅在线时调用：让 Planner 模型输出一个角色名；任何异常都返回 null 触发规则回退。
+     *
+     * <p><b>必须走 LlmProvider</b>：只有它带 15 秒硬超时。实测（断网模拟）时这里若直接
+     * new 模型 + {@code executeChat}，会一直挂到 SDK 的 180 秒超时，整个 /api/chat 卡死、
+     * 客户端收不到任何响应 —— 这正是"模型不可用"负向测试第一次没通过的原因。
+     * 走 provider 后 15 秒内必然返回（超时抛异常 → 回退规则路由）。
+     */
     private String askPlannerModel(String userInput, List<Map<String, String>> history) {
-        DashScopeApi api = chatService.createDashScopeApi();
-        DashScopeChatModel model = chatService.createChatModel(api, 0.0, 50, 0.1);
+        if (llmProvider == null || !llmProvider.available()) {
+            return null;
+        }
         String sys = "你是 SecAgent 的调度员PLANNER。根据用户意图只输出一个角色名："
                 + "FORENSICS(查日志/告警/取证)、ANALYST(知识/漏洞原理/防护规范)、RESPONDER(封禁/锁账号/杀进程)。"
                 + "只输出单词，不要解释。";
         try {
-            ReactAgent planner = ReactAgent.builder().name("planner_router")
-                    .model(model).systemPrompt(sys).build();
-            String out = chatService.executeChat(planner, userInput);
+            String out = llmProvider.generate(sys, userInput);
             if (out != null && !out.isBlank()) {
                 logger.info("[MultiAgent] Planner 模型路由输出: {}", out.trim());
                 return out.trim();
             }
         } catch (Exception e) {
-            logger.warn("[MultiAgent] Planner 模型调用异常: {}", e.getMessage());
+            logger.warn("[MultiAgent] Planner 模型调用异常（将回退规则路由）: {}", e.getMessage());
         }
         return null;
     }
