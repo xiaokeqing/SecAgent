@@ -104,12 +104,25 @@ ok "备份 → $BK"
 
 echo "==> 2/6 写本机规则 $RULE_NAME（低速多端口扫描）"
 mkdir -p "$RULES_HOST"
-cat > "$RULES_HOST/$RULE_NAME" <<'EOF'
+# 【踩坑修正】不能用 $HOME_NET 当目的地址：这份精简配置里 HOME_NET 是容器内网地址
+# （HOME_NET: "[10.0.0.10]"），而对外暴露的是公网 IP —— 用 $HOME_NET 会导致规则加载了却永不匹配。
+# 这里自动探测本机全局 IPv4（排除 docker/内网网段），把规则目的地址写成那个 IP；探测不到才退化为 any。
+HOST_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+          | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)' | head -n1 || true)
+if [ -n "$HOST_IP" ]; then
+  DST="[$HOST_IP]"
+  ok "规则目的地址 = 本机公网 IP $HOST_IP"
+else
+  DST="any"
+  warn "探测不到全局 IPv4 → 规则目的地址退化为 any（可能把出站连接也算进来）"
+fi
+cat > "$RULES_HOST/$RULE_NAME" <<EOF
 # 本机补充规则（2026-10-12，P3 演练驱动）：现有 ET SCAN 偏 SSH 高频场景，
 # 8 端口 × 单次 × 600ms 这类低速扫描会漏 → 用阈值规则补上。by_src 计数，阈值内只报一次。
-alert tcp any any -> $HOME_NET any (msg:"LOCAL 低速率多端口扫描 (by_src)"; flags:S; threshold: type both, track by_src, count 6, seconds 20; classtype:attempted-recon; sid:1000001; rev:1;)
+# 注意：这份配置的 \$HOME_NET 是容器内网地址，不能用于匹配对外的公网流量，故此处直接写本机公网 IP。
+alert tcp any any -> $DST any (msg:"LOCAL 低速率多端口扫描 (by_src)"; flags:S; threshold: type both, track by_src, count 6, seconds 20; classtype:attempted-recon; sid:1000001; rev:1;)
 EOF
-ok "规则文件已写入（宿主机 $RULES_HOST/$RULE_NAME）"
+ok "规则文件已写入（宿主机 $RULES_HOST/$RULE_NAME，目的地址 $DST）"
 
 echo "==> 3/6 写阈值文件（压 sid $SID_FP 的误报）"
 docker exec "$CT" sh -c "cat > $TH_IN_CT" <<EOF
@@ -134,22 +147,37 @@ i = 0
 while i < len(lines):
     line = lines[i]
     out.append(line)
-    m = re.match(r'^rule-files:\s*$', line)
-    if m and not inserted_rule:
-        # 探明该块内子项缩进（形如 "  - suricata.rules"）
+    if re.match(r'^rule-files:\s*$', line) and not inserted_rule:
+        # 先探明该块内已有的子项（缩进与范围），新项追加到【块末尾】而不是紧跟在头行后面
         j, indent = i + 1, '  '
         while j < len(lines) and re.match(r'^\s*-\s+', lines[j]):
             indent = re.match(r'^(\s*)', lines[j]).group(1)
             j += 1
         if not any(rule_name in l for l in lines[i:j]):
+            # 把块内已有行整体抄进 out，然后追加新项，最后跳过这些行
+            for k in range(i + 1, j):
+                out.append(lines[k])
             out.append('%s- %s\n' % (indent, rule_name))
             inserted_rule = True
+            i = j
+            continue
     i += 1
 
 text = ''.join(out)
 inserted_th = False
 if not re.search(r'^threshold-file:', text, re.M):
-    text = 'threshold-file: %s\n' % th_path + text
+    # 【踩坑修正】不能插到文件最顶端：Suricata 要求配置必须以
+    #   %YAML 1.1 与 ---  这两行开头，否则报
+    #   "The configuration file must begin with the following two lines"。
+    # 所以插到文档起始标记 --- 之后。
+    ls = text.splitlines(True)
+    idx = 0
+    for k, l in enumerate(ls):
+        if l.startswith('---'):
+            idx = k + 1
+            break
+    ls.insert(idx, 'threshold-file: %s\n' % th_path)
+    text = ''.join(ls)
     inserted_th = True
 
 with io.open(path, 'w', encoding='utf-8') as f:
