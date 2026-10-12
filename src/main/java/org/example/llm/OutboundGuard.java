@@ -59,7 +59,10 @@ public class OutboundGuard {
     private final Map<String, java.util.concurrent.Semaphore> bulkheads = new ConcurrentHashMap<>();
 
     private java.util.concurrent.Semaphore bulkhead(String key) {
-        return bulkheads.computeIfAbsent(key, k -> new java.util.concurrent.Semaphore(maxInflightPerDependency));
+        // 必须保证至少 1 个许可：配置缺失/为 0 时若建成 0 许可信号量，
+        // 该依赖会被永久判为"并发已满"而彻底不可用（被确定性安全卷测出来的真实缺陷）
+        int permits = Math.max(1, maxInflightPerDependency);
+        return bulkheads.computeIfAbsent(key, k -> new java.util.concurrent.Semaphore(permits));
     }
 
     /** 该依赖当前占用名额（用于自检日志与页面提示） */

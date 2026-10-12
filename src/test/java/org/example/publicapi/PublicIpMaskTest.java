@@ -51,7 +51,9 @@ class PublicIpMaskTest {
     void unknownInputBecomesStars() {
         assertEquals("***", PublicIpMask.mask("not-an-ip"));
         assertEquals("***", PublicIpMask.mask("1.2.3"));
-        assertNull(PublicIpMask.mask(null), "null 仍应是 null");
-        assertNull(PublicIpMask.mask("   "), "空白应是 null");
+        // 契约修正（2026-10-12）：与本文件文档注释一致 —— 认不出来就返回 ***，绝不透出 null。
+        // 由确定性安全卷 SafetyPaperDeterministicTest 钉住。
+        assertEquals("***", PublicIpMask.mask(null), "null 应归一成占位符");
+        assertEquals("***", PublicIpMask.mask("   "), "空白应归一成占位符");
     }
 }

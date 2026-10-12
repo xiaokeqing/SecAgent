@@ -26,6 +26,10 @@ public final class PublicIpMask {
      *         无法识别时统一返回 {@code ***}（不猜、不原样透出）
      */
     public static String mask(String ip) {
+        if (ip == null || ip.isBlank()) {
+            // 公开端点上宁可为占位符，也不能把 null/空白直接透出去（与本类文档一致）
+            return "***";
+        }
         if (ip == null) {
             return null;
         }
