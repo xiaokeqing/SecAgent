@@ -179,6 +179,23 @@ for i in $(seq 1 30); do
 done
 
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# 双指纹落盘 + 源码陈旧显式告警（B：源码同步健壮化）
+# 背景：上面的源码同步（git fetch/reset）失败时只 warn 一句就继续部署，
+# 于是可能出现「镜像是新版、服务器源码是旧版」而没人知道 —— 属静默降级。
+SOURCE_SHA="$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+ORIGIN_SHA="$(git -C "$APP_DIR" rev-parse --short origin/main 2>/dev/null || echo unknown)"
+{
+  echo "deployed_at=$(date -Is)"
+  echo "BUILD_SHA=${BUILD_SHA:-unknown}"
+  echo "SOURCE_SHA=$SOURCE_SHA"
+  echo "ORIGIN_MAIN_SHA=$ORIGIN_SHA"
+} > /opt/secagent/DEPLOY-FINGERPRINTS.txt
+ok "指纹落盘 DEPLOY-FINGERPRINTS.txt → BUILD=${BUILD_SHA:-unknown} SOURCE=$SOURCE_SHA ORIGIN=$ORIGIN_SHA"
+if [ "$SOURCE_SHA" != "$ORIGIN_SHA" ] && [ "$ORIGIN_SHA" != "unknown" ]; then
+  warn "源码【未】同步到 origin/main（服务器 $SOURCE_SHA ≠ 远端 $ORIGIN_SHA）—— 本次用的是旧源码，请确认符合预期"
+fi
+
 log "完成"
 # ------------------------------------------------------------
 echo
