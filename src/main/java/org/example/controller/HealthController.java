@@ -1,5 +1,7 @@
 package org.example.controller;
 
+import org.example.fingerprint.BuildFingerprint;
+import org.example.fingerprint.FingerprintVerifier;
 import org.example.vector.VectorStoreGateway;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -26,6 +28,23 @@ import java.util.Map;
  * 健康接口返回它、整体检查脚本拿它跟仓库 HEAD 比对 ——
  * 不一致就直接报出来，不依赖任何人记得。
  *
+ * <h3>为什么后来又要加「三方核对」</h3>
+ * 上面那套只解决了「忘了部署」，解决不了更阴的一种：<b>部署了，但部署的是旧代码</b>。
+ * 实测发生过 —— 老 Dockerfile 是多阶段构建，在镜像内用<b>服务器上的旧 src</b> 编译，
+ * 而 {@code buildSha} 只是容器里的环境变量（自述），于是"新版本号 + 旧代码"同时成立，
+ * 从外部看一切正常。
+ * <p>
+ * 所以现在分工明确：
+ * <ul>
+ *   <li>{@code buildSha}（env）= <b>自述</b>，只用于展示与对照，明确标注"非证据"；</li>
+ *   <li>{@code embeddedGitCommit}（jar 内 git.properties）= <b>证据</b>，
+ *       指明这个 jar 是哪个 commit 编出来的；</li>
+ *   <li>{@code artifactMd5}（部署脚本注入，将来来自镜像 label）= 产物指纹；
+ *       它证明跑的就是上传的那个 jar。</li>
+ * </ul>
+ * 三者对不上（或任何一项是 unknown）就把 {@code status} 降级为 {@code degraded}
+ * 并给出 {@code fingerprintMismatchReason} —— 健康接口不再无条件说 ok。
+ *
  * <h3>为什么可以放在免鉴权的健康接口里</h3>
  * 只暴露 commit 短号与构建时间，<b>不含任何敏感信息</b>。
  * 实际上"代码版本不敏感"本身就是一个判断：这套代码是开源的，
@@ -44,7 +63,7 @@ public class HealthController {
     @Value("${prometheus.mock-enabled:false}")
     private boolean prometheusMock;
 
-    /** 构建镜像时的 commit 短号（由 compose 通过 BUILD_SHA 注入），用于检测部署漂移 */
+    /** 构建镜像时的 commit 短号（由 compose 通过 BUILD_SHA 注入）—— 自述，非证据 */
     @Value("${app.build.sha:unknown}")
     private String buildSha;
 
@@ -66,22 +85,57 @@ public class HealthController {
     @Value("${app.build.time:unknown}")
     private String buildTime;
 
+    /**
+     * jar 内固化的构建来源指纹（classpath 上的 git.properties）。
+     *
+     * <p>只在 bean 构造时读<b>一次</b>：这东西跟着 jar 走，运行期不会变；
+     * 每次请求都读盘属于无意义的 IO。
+     *
+     * <p>读不到时返回 absent（各字段 unknown）—— 于是 health 会自报 degraded，
+     * 而不是像以前那样无条件 ok。
+     */
+    private final BuildFingerprint embeddedGit = BuildFingerprint.load(HealthController.class.getClassLoader());
+
     @GetMapping("/health")
     public Map<String, Object> health() {
+        // 三方核对（纯函数）：A=artifactMd5  B=embeddedGitCommit  C=期望 release commit(BUILD_SHA)
+        FingerprintVerifier.Verdict verdict =
+                FingerprintVerifier.verify(artifactMd5, embeddedGit.getCommitShort(),
+                        embeddedGit.getDirty(), buildSha);
+
         Map<String, Object> result = new HashMap<>();
-        result.put("status", "ok");
+        // status 不再无条件 ok：任何一项查不了/对不上，就是 degraded
+        result.put("status", verdict.getStatus());
+        result.put("fingerprintMismatch", verdict.isMismatch());
+        if (verdict.isMismatch()) {
+            result.put("fingerprintMismatchReason", verdict.getMismatchReason());
+        }
+        result.put("fingerprintIssues", verdict.getIssues());
         result.put("application", "SecAgent");
+
+        // buildSha 保留，但【降级为展示用】：它是环境变量自述，谁都能写，证明不了任何事
         result.put("buildSha", buildSha);
+        result.put("buildShaNote",
+                "环境变量自述（BUILD_SHA），仅展示/对照用，非证据 —— 不参与指纹核对；"
+                        + "真正的证据是 jar 内固化的 embeddedGitCommit");
+        result.put("expectedReleaseCommit", buildSha);
         result.put("buildTime", buildTime);
+
+        // 硬证据：来自 jar 内 git.properties（构建时固化，改不动除非改 jar）
+        result.put("embeddedGitCommit", embeddedGit.getCommitShort());
+        result.put("embeddedGitBranch", embeddedGit.getBranch());
+        result.put("embeddedGitDirty", embeddedGit.getDirty() == null ? "unknown" : embeddedGit.getDirty());
+        result.put("embeddedGitBuildTime", embeddedGit.getBuildTime());
+        result.put("embeddedGitCommitTime", embeddedGit.getCommitTime());
+        result.put("embeddedGitCommitMessage", embeddedGit.getCommitMessageShort());
+        result.put("embeddedGitPropertiesPresent", embeddedGit.isPresent());
+
         // 双指纹（P0-4）：不再只靠 buildSha 自述，能看出"跑的是哪个产物、哪份源码"
         result.put("sourceSha", sourceSha);
         result.put("artifactMd5", artifactMd5);
         result.put("fingerprint",
-                "buildSha=声称版本(env)｜sourceSha=服务器源码｜artifactMd5=镜像内 jar MD5(最硬)");
-        if (!"unknown".equals(buildSha) && "unknown".equals(artifactMd5)) {
-            result.put("fingerprintWarning",
-                    "缺少 artifactMd5 —— 不是服务器侧构建（或脚本未注入），无法验证产物与源码是否一致");
-        }
+                "embeddedGitCommit=jar 内固化的 commit(硬证据)｜artifactMd5=镜像内 jar MD5(硬证据)"
+                        + "｜buildSha=env 自述(非证据)｜sourceSha=服务器源码树");
         result.put("vectorStore", vectorStore.backend());
         result.put("documentVectors", vectorStore.count());
         result.put("logsMockEnabled", clsMock);
