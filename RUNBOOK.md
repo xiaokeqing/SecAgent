@@ -165,10 +165,33 @@ python3 /opt/secagent/scripts/eval-papers.py --paper auto      # 单号日 safet
 2. **单节点集群的首个副本会永远无法分配** —— 表现是 `_cluster/health` 变 `yellow`、
    `_cluster/allocation/explain` 说 `same_shard: NO`。
    修法：`PUT /<index>/_settings {"index.number_of_replicas":0}`（本例是 `.opendistro-ism-config`）。
-3. **ISIM 策略体用 JSON 文件传**（`--data-binary @/tmp/p.json`），别用命令行内联引号拼 JSON ——
+3. **ISM 策略体用 JSON 文件传**（`--data-binary @/tmp/p.json`），别用命令行内联引号拼 JSON ——
    嵌套引号很容易被 shell 吃掉一层，得到"能创建但内容不对"的策略。
 
+---
 
+## 6.6 配置版本化与恢复演练（2026-10-12 落地）
+
+```
+脚本：/usr/local/bin/config-snapshot.sh（仓库 scripts/config-snapshot.sh）
+定时：/etc/cron.d/secagent-config-snapshot —— 每周日 04:10，两台机器都挂了
+产物：/var/backups/secagent-config/<host>-<时间戳>.tar.gz（含 manifest.sha256，保留最近 10 份）
+演练：config-snapshot.sh --drill <包>  → 解包到临时目录逐文件校验 sha256（不碰线上配置）
+覆盖：ipset.conf / iptables rules.v4,v6 / 开机恢复 systemd 单元 / /etc/cron.d /
+      Wazuh ossec.conf / Suricata suricata.yaml + 规则 / 三个 compose /
+      /opt/secagent 的 compose+Dockerfile.runtime+DEPLOY-FINGERPRINTS / ISM 策略清单
+```
+**实测**：srv2 17 个文件、srv1 9 个文件，两机 `--drill` 均 `[OK] 全部文件校验通过`。
+
+**演练脚本自身踩的两个坑**（都是"跑一次演练"才发现的）：
+1. 清单条目相对 `<快照>/files` 生成，校验时必须 `cd` 到那一层，否则全部 `FAILED open or read`；
+2. 清单文件本身在上一层，引用要用绝对路径，相对名会 `No such file or directory`。
+
+> 教训：**"备份存在" ≠ "备份可用"**。不真跑一次恢复，你不会知道到底能不能恢复。
+
+---
+
+## 7. 本次事故清单（写在这里，避免重犯）
 
 | 事故 | 根因 | 现在的防线 |
 |---|---|---|
