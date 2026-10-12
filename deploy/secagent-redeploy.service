@@ -16,6 +16,12 @@
 #   install -m 644 deploy/secagent-redeploy.service deploy/secagent-redeploy.timer /etc/systemd/system/ \
 #     && install -m 755 scripts/srv1-redeploy.sh /opt/secagent/scripts/srv1-redeploy.sh \
 #     && systemctl daemon-reload && systemctl enable --now secagent-redeploy.timer
+#
+# 【必须一起做】给服务准备独立的 docker 凭据目录（见下面 Environment=DOCKER_CONFIG 的说明）：
+#   mkdir -p /etc/secagent/docker
+#   docker login <ACR-VPC-域名> -u <主账号> --password-stdin   # 先以 root 登录一次
+#   cp /root/.docker/config.json /etc/secagent/docker/config.json
+#   chmod 700 /etc/secagent/docker && chmod 600 /etc/secagent/docker/config.json
 # 查看：
 #   systemctl list-timers secagent-redeploy.timer
 #   journalctl -u secagent-redeploy.service -n 100 --no-pager
@@ -51,6 +57,11 @@ ProtectSystem=full
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
+# 【2026-10-13 实测踩坑】ProtectHome=yes 会让本服务看不到 /root（即读不到 /root/.docker/config.json），
+# docker CLI 于是变成"未登录"，每次都由 ACR 报 unauthorized: authentication required ——
+# 而人工在 shell 里执行同一脚本却是成功的（因为人工 shell 的 HOME 可访问）。症状隐蔽：timer 每 5 分钟静默失败。
+# 修法：保留 ProtectHome=yes，另外给服务一个独立的凭据目录（安装步骤里已列出创建命令）。
+Environment=DOCKER_CONFIG=/etc/secagent/docker
 # docker CLI 需要访问 docker.sock，因此不能开 ProtectKernelTunables 之外的更严限制
 # （不启 PrivateDevices/ProtectKernelModules，避免影响 docker CLI 的常规调用）
 
