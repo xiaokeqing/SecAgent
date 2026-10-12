@@ -147,7 +147,28 @@ python3 /opt/secagent/scripts/eval-papers.py --paper auto      # 单号日 safet
 
 ---
 
-## 7. 本次事故清单（写在这里，避免重犯）
+## 6.5 索引保留策略（ISM，2026-10-12 落地）
+
+```
+集群：单节点 OpenSearch（Wazuh indexer），经 srv1 容器内 wazuh-tunnel:9200 访问
+策略：secagent-alerts-30d     → wazuh-alerts-*            30 天后删除
+      secagent-stats-14d      → wazuh-statistics-* / wazuh-monitoring-*   14 天后删除
+两者都带 ism_template（priority 100）→ 新索引自动套用，无需人工挂
+查看：curl -sk -u "$WAZUH_INDEXER_USER:$WAZUH_INDEXER_PASS" \
+        https://wazuh-tunnel:9200/_plugins/_ism/explain/wazuh-*
+```
+
+**三个坑（都真踩过）**：
+1. **不要把 PUT 回显的结构当成 GET 的结构** —— PUT 回显是 `policy.policy.{...}`，GET 是 `policy.{...}`。
+   我按 PUT 的形状去解析 GET，读到空 `states`，误判成"策略体没被接受"，白折腾两轮。
+   → 核对策略必须用 `_plugins/_ism/explain`（权威：policy_id + state）或直接 `head -c` 看原始 JSON。
+2. **单节点集群的首个副本会永远无法分配** —— 表现是 `_cluster/health` 变 `yellow`、
+   `_cluster/allocation/explain` 说 `same_shard: NO`。
+   修法：`PUT /<index>/_settings {"index.number_of_replicas":0}`（本例是 `.opendistro-ism-config`）。
+3. **ISIM 策略体用 JSON 文件传**（`--data-binary @/tmp/p.json`），别用命令行内联引号拼 JSON ——
+   嵌套引号很容易被 shell 吃掉一层，得到"能创建但内容不对"的策略。
+
+
 
 | 事故 | 根因 | 现在的防线 |
 |---|---|---|
