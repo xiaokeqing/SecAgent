@@ -49,6 +49,24 @@ public class VectorEmbeddingService {
 
     private TextEmbedding textEmbedding;
 
+    /**
+     * 重建 embedding 客户端。
+     *
+     * <p><b>为什么必须重建（实测结论）</b>：{@code TextEmbedding} 是<b>单个长生命周期实例</b>，
+     * 内部持有一个 OkHttp 连接池。断网后池里留下不可用连接，仅靠"等冷却到期"<b>无法自愈</b> ——
+     * 实测：断网恢复并等过 60 秒冷却后，研判仍秒回"未生成"（embedding 依赖不可用），
+     * <b>只有重启进程才恢复</b>。对比 LLM 路径每次调用新建客户端，所以它能自愈。
+     * 因此这里在调用失败时丢弃旧实例，下次调用自然重建 → 真正的 half-open 自愈。
+     */
+    private synchronized void resetClient() {
+        try {
+            textEmbedding = new TextEmbedding();
+            logger.warn("已重建 embedding 客户端（原实例连接池可能在故障后不可用）");
+        } catch (Exception e) {
+            logger.warn("重建 embedding 客户端失败：{}", e.getMessage());
+        }
+    }
+
     @PostConstruct
     public void init() {
         // 验证 API Key：缺失时不阻断应用启动，仅让向量嵌入/模型问答功能降级，登录与基础界面仍可用
@@ -113,7 +131,14 @@ public class VectorEmbeddingService {
                     .build();
 
             // 调用 API
-            TextEmbeddingResult result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
+            TextEmbeddingResult result;
+            try {
+                result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
+            } catch (Exception ex) {
+                // 连接池可能已被故障污染：丢弃旧客户端，下次调用重建（自愈）
+                resetClient();
+                throw ex;
+            }
 
             // 检查结果
             List<Float> floatEmbedding = getFloats(result);
@@ -185,7 +210,14 @@ public class VectorEmbeddingService {
                     .build();
 
             // 调用 API
-            TextEmbeddingResult result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
+            TextEmbeddingResult result;
+            try {
+                result = outboundGuard.call("dashscope-embedding", embeddingTimeoutMs, () -> textEmbedding.call(param));
+            } catch (Exception ex) {
+                // 连接池可能已被故障污染：丢弃旧客户端，下次调用重建（自愈）
+                resetClient();
+                throw ex;
+            }
 
             // 检查结果
             if (result == null || result.getOutput() == null || result.getOutput().getEmbeddings() == null) {
