@@ -27,6 +27,18 @@ import java.nio.charset.StandardCharsets;
  *       使评测流量可打标、可隔离、可追溯。</li>
  * </ul>
  *
+ * <h3>第三个身份：公开演示（PUBLIC，P4 新增）</h3>
+ * 匿名可访问的 {@code POST /api/public/ask} 也需要在<b>模型出口</b>按来源分派额度，
+ * 因此复用同一个请求上下文机制，多加一个"公开演示"标注：
+ * <ul>
+ *   <li>模型调用走<b>第三个独立计数器</b>（{@code app.quota.public-daily-limit}，默认 30），
+ *       与用户额度、评测额度都互不挤占 —— 公开端点被刷爆不该让站主自己用不了；</li>
+ *   <li>该标注下 RESPONDER <b>只解释、不调任何工具</b>（匿名访客永远无法触发处置）；</li>
+ *   <li>它与评测标注<b>互斥</b>：{@link #markPublicRequest()} 会把评测标注清掉，
+ *       反之亦然。原因很直白 —— 两个都置上时"该记哪本账、该不该真下发"就没有答案了，
+ *       而这类歧义在代码里不会报错，只会静默记错账。</li>
+ * </ul>
+ *
  * <h3>为什么用 ThreadLocal 传"当前是不是评测请求"</h3>
  * 配额检查发生在模型出口 {@code DashScopeLlmProvider.generate()}，它在
  * 编排线程池里被调用 —— 那里拿不到 {@code HttpServletRequest}，
@@ -107,10 +119,13 @@ public class EvalIdentity {
      */
     private static final class Marker {
         volatile Boolean evalRequest;
+        /** 是否为匿名公开演示请求（{@code /api/public/ask}）。与 {@link #evalRequest} 互斥 */
+        volatile Boolean publicRequest;
         volatile String runId;
 
         void clear() {
             this.evalRequest = null;
+            this.publicRequest = null;
             this.runId = null;
         }
     }
@@ -148,9 +163,24 @@ public class EvalIdentity {
      *
      * <p>用于两件事：① 模型配额分派（评测走独立计数器）；
      * ② RESPONDER 是否走模拟路径（评测绝不真封禁）。
+     *
+     * <p><b>公开演示请求不算评测请求</b>：两者互斥（见 {@link #markPublicRequest()}），
+     * 这里再显式排除一次 —— 额度记错账、或匿名访客意外走上评测路径，
+     * 都不会有任何报错，只能靠这种"两个条件都查"的写法兜住。
      */
     public static boolean isEvalRequest() {
-        return Boolean.TRUE.equals(marker().evalRequest);
+        Marker m = marker();
+        return Boolean.TRUE.equals(m.evalRequest) && !Boolean.TRUE.equals(m.publicRequest);
+    }
+
+    /**
+     * 请求是否为<b>匿名公开演示请求</b>（{@code POST /api/public/ask}）。
+     *
+     * <p>判定它要做三件事：① 模型配额走公开演示的独立计数器；
+     * ② RESPONDER 只解释、不调任何工具；③ 与评测身份互斥。
+     */
+    public static boolean isPublicRequest() {
+        return Boolean.TRUE.equals(marker().publicRequest);
     }
 
     /** 当前请求的评测 runId；非评测请求返回 null */
@@ -165,6 +195,7 @@ public class EvalIdentity {
      */
     public static void beginEvalRequest(String runId) {
         Marker m = marker();
+        m.publicRequest = Boolean.FALSE;   // 互斥：评测请求绝不能同时被当成公开请求
         m.evalRequest = Boolean.TRUE;
         m.runId = (runId != null && !runId.isBlank()) ? runId.trim() : null;
     }
@@ -173,10 +204,28 @@ public class EvalIdentity {
     public static void beginUserRequest() {
         Marker m = marker();
         m.evalRequest = Boolean.FALSE;
+        m.publicRequest = Boolean.FALSE;
         m.runId = null;
     }
 
-    /** 清除线程上的评测标注 */
+    /**
+     * 标注"当前线程正在处理一个<b>匿名公开演示</b>请求"（P4 公开问答端点）。
+     *
+     * <p>必须与普通/评测请求一样在 {@code finally} 里用 {@link #endEvalRequest()} 清掉：
+     * 编排跑在复用线程池上，残留会让下一个用户请求记到公开额度上
+     * （或者反过来，让公开请求动用用户额度）—— 两者都不报错，只记错账。
+     *
+     * <p>它会把评测标注清掉：两个身份同时成立时"该记哪本账、RESPONDER 该不该真下发"
+     * 都没有答案，所以这里强制互斥，而不是让下游去猜优先级。
+     */
+    public static void markPublicRequest() {
+        Marker m = marker();
+        m.evalRequest = Boolean.FALSE;
+        m.publicRequest = Boolean.TRUE;
+        m.runId = null;
+    }
+
+    /** 清除线程上的身份标注（评测 / 公开演示都靠它清理） */
     public static void endEvalRequest() {
         marker().clear();
     }

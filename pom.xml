@@ -24,6 +24,15 @@
         <spring-ai.version>1.1.0</spring-ai.version>
         <spring-ai-alibaba.version>1.1.0.0-RC2</spring-ai-alibaba.version>
         <spring-ai-alibaba-extensions.version>1.1.0.0-RC2</spring-ai-alibaba-extensions.version>
+        <!--
+          Lombok 版本提到属性里，方便按本机 JDK 覆盖。
+          原因（实测）：Lombok 1.18.30 在 JDK 21+ 上会以
+          「ExceptionInInitializerError: com.sun.tools.javac.code.TypeTag :: UNKNOWN」直接编译失败 ——
+          这是注解处理器与新版 javac 内部 API 不兼容，不是本项目的代码问题。
+          开发机上是 JDK 25，所以本机要 -Dlombok.version=1.18.46 才能编译；
+          服务器与 CI 用 JDK 17，走默认值 1.18.46 同样没问题（1.18.46 向后兼容 17）。
+        -->
+        <lombok.version>1.18.46</lombok.version>
     </properties>
     <dependencyManagement>
         <dependencies>
@@ -143,7 +152,7 @@
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
-            <version>1.18.30</version>
+            <version>${lombok.version}</version>
             <scope>provided</scope>
         </dependency>
         
@@ -256,7 +265,8 @@
                         <path>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
-                            <version>1.18.30</version>
+                            <!-- 与上面的依赖同源（属性化），避免"依赖是新的、注解处理器还是旧的" -->
+                            <version>${lombok.version}</version>
                         </path>
                     </annotationProcessorPaths>
                 </configuration>

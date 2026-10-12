@@ -94,14 +94,26 @@ services:
       # self-assets 是「操作者知识」（我自己的公网资产有哪些），
       # 代码里猜不出来，必须由部署者按实际填。留空时应用会打告警日志提醒。
       SPRING_APPLICATION_JSON: >-
-        {"app":{"quota":{"daily-limit":${DAILY_QUOTA:-50}},
+        {"app":{"quota":{"daily-limit":${DAILY_QUOTA:-50},
+                         "eval-daily-limit":${APP_QUOTA_EVAL_DAILY_LIMIT:-60},
+                         "public-daily-limit":${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}},
                  "ratelimit":{"requests-per-minute":${RATE_LIMIT_PER_MINUTE:-30}},
                  "cors":{"allowed-origins":"${CORS_ALLOWED_ORIGINS:-http://localhost:9900}"},
                  "response":{"self-assets":"${SECAGENT_SELF_ASSETS:-}"}},
          "vector":{"kb":{"auto-index":${VECTOR_KB_AUTO_INDEX:-false}}}}
 
-      # ===== 评测身份（独立凭据 + 独立额度 + 流量打标）=====
-      # 为什么必须显式写在这里，而不是只依赖 env_file:
+      # ===== 三个额度池的上限（用户 / 评测 / 匿名公开演示，P4 起）=====
+      # ★ 开发期临时上限，发布前必须改回 50/60/30（见 RUNBOOK「发布前回收清单」）
+      # 为什么必须显式写在这里，而不是只靠 .env 的 env_file：
+      #   上面那段 SPRING_APPLICATION_JSON 的优先级【高于】环境变量绑定，
+      #   所以"在 .env 里加一行 APP_QUOTA_PUBLIC_DAILY_LIMIT"其实不会生效 ——
+      #   而它不会报错，只会静默沿用 compose 里写死的默认值。
+      #   这里显式透传，等于把"配置从哪来"钉在部署面上。
+      APP_QUOTA_DAILY_LIMIT: "${APP_QUOTA_DAILY_LIMIT:-50}"
+      APP_QUOTA_EVAL_DAILY_LIMIT: "${APP_QUOTA_EVAL_DAILY_LIMIT:-60}"
+      APP_QUOTA_PUBLIC_DAILY_LIMIT: "${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}"
+
+      # ===== 评测身份（独立凭据 + 独立额度 + 流量打标）=====      # 为什么必须显式写在这里，而不是只依赖 env_file:
       #   env_file 是"运行时兜底"—— .env 里漏了 APP_EVAL_TOKEN 时容器照样起来，
       #   评测身份静默关闭（app.eval.token 为空即功能关闭），外部看不出任何异常；
       #   下一轮评测又会退回管理员账号密码，于是"跑完评测当天用户没额度"这个

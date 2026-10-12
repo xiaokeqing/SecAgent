@@ -9,13 +9,17 @@ import org.example.core.model.SecurityAlert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
@@ -81,6 +85,174 @@ public class PublicApiController {
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
     @Autowired
     private PublicAuditReader auditReader;
+
+    // ==================== P4：公开 AI 问答 + 知识库公开只读检索 ====================
+
+    /** 公开问答业务实现（四道护栏 + state 归一化 + 输出脱敏） */
+    @Autowired
+    private PublicAskService publicAskService;
+
+    /** 公开知识库检索（复用向量检索，但只出白名单字段） */
+    @Autowired
+    private PublicKbService publicKbService;
+
+    /** 公开问答的独立限流器（默认 6 次/分钟，与只读端点的 20 次/分钟分开） */
+    @Autowired
+    @Qualifier("publicAskRateLimiter")
+    private PublicAskRateLimiter publicAskRateLimiter;
+
+    /**
+     * 公开知识库检索的限流器。
+     *
+     * <p>与问答共用 {@link PublicAskRateLimiter} 这个实现，但注入的是<b>另一个实例</b> ——
+     * 于是两者各自一份计数与各自一份上限（检索 20 次/分钟、问答 6 次/分钟）。
+     * 为什么不用同一个实例：共用一个桶意味着"多刷几次检索"会顺手把问答的额度也占掉，
+     * 而访客完全看不出这两件事为什么互相影响。
+     */
+    @Autowired
+    @Qualifier("publicKbRateLimiter")
+    private PublicAskRateLimiter publicKbRateLimiter;
+
+    /** 每 IP 并发 1 守卫（匿名重操作不能靠限流兜住） */
+    @Autowired
+    private PublicConcurrencyGuard publicConcurrencyGuard;
+
+    /** 单次公开问答的请求体长度上限（比服务内的字符上限略宽，挡住超大 body） */
+    @Value("${app.public-api.ask.max-body-chars:4000}")
+    private int maxBodyChars;
+
+    /**
+     * 公开 AI 问答：<b>匿名可访问</b>，但必须过四道护栏。
+     *
+     * <h3>为什么匿名还要做这么多事</h3>
+     * 公开的意义是"访客不用注册就能试一句"，代价是它会<b>调模型</b>（真金白银）。
+     * 所以这里同时上四把锁：输入注入防护、输出护栏、脱敏、配额与限流；
+     * 并且公开路径上的 RESPONDER <b>只解释、不调工具</b> —— 匿名访客永远无法触发处置。
+     *
+     * <h3>为什么用一次性返回而不是 SSE（第一步）</h3>
+     * 项目既有纪律是"不做匿名常驻连接"（{@link PublicCorsInterceptor} 同源的取舍）。
+     * 短连接 SSE 要另建一条只为公开页面服务的流式通道（含断连清理、背压、错误帧），
+     * 属于"能上但不是这次必须"的部分：先把四道护栏与配额隔离做扎实，
+     * 流式作为第二步单独上，避免把两件事的验收标准混在一起。
+     * 页面侧因此按"一次性请求 + 明确的等待态"实现，不假装在流式输出。
+     */
+    @PostMapping("/ask")
+    public ResponseEntity<Map<String, Object>> ask(@RequestBody(required = false) Map<String, Object> body,
+                                                   HttpServletRequest req,
+                                                   HttpServletResponse res) {
+        String ip = clientIp(req);
+
+        // ① 限流（每 IP 每分钟 N 次）—— 先于一切上游动作，包括并发登记
+        if (!publicAskRateLimiter.allow(ip)) {
+            return tooMany(res, publicAskRateLimiter, "公开问答请求过于频繁（每 IP 每分钟 "
+                    + publicAskRateLimiter.limitPerMinute() + " 次），请稍后再试");
+        }
+
+        // ② 并发 1（每 IP 同时只允许一个在飞）
+        if (!publicConcurrencyGuard.tryAcquire(ip)) {
+            res.setHeader(HttpHeaders.RETRY_AFTER, "5");
+            res.setHeader("X-Public-Concurrency", "1");
+            Map<String, Object> b = new LinkedHashMap<>();
+            b.put("code", 429);
+            b.put("message", "同一来源同时只允许 1 个公开问答请求在飞，请等上一条返回后再试");
+            b.put("reason", "per-ip-concurrency-limit");
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(b);
+        }
+
+        try {
+            String question = extractQuestion(body);
+            Map<String, Object> data = publicAskService.ask(question, ip);
+
+            // 一次性返回：公开问答的响应永不被边缘缓存（它是"这一次提问"的结果）
+            res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+            res.setHeader("X-Data-Source", "PUBLIC_ASK");
+            res.setHeader("X-RateLimit-Limit", String.valueOf(publicAskRateLimiter.limitPerMinute()));
+            res.setHeader("X-RateLimit-Remaining",
+                    String.valueOf(Math.max(0, publicAskRateLimiter.remaining(ip))));
+
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("code", 200);
+            out.put("message", "success");
+            out.put("data", data);
+            return ResponseEntity.ok(out);
+        } catch (Exception e) {
+            logger.warn("公开问答失败（已按 fail-closed 处理）：{}", e.getMessage());
+            Map<String, Object> b = new LinkedHashMap<>();
+            b.put("code", 500);
+            b.put("message", "公开问答暂时不可用，请稍后再试");
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(b);
+        } finally {
+            publicConcurrencyGuard.release(ip);
+        }
+    }
+
+    /**
+     * 公开知识库检索：<b>只读、匿名、掩码、限流</b>。
+     *
+     * <p>只返回经过白名单与脱敏的片段（标题 + 片段摘要 + 来源类型 + 可信度），
+     * 不返回原始内部路径与文件名；内部文档即使被语义命中也不会出现在这里
+     * （口径见 {@link org.example.knowledge.PublicKbVisibility}）。
+     */
+    @GetMapping("/kb")
+    public ResponseEntity<Map<String, Object>> kb(@RequestParam(value = "q", required = false) String q,
+                                                  HttpServletRequest req,
+                                                  HttpServletResponse res) {
+        String ip = clientIp(req);
+        if (!publicKbRateLimiter.allow(ip)) {
+            return tooMany(res, publicKbRateLimiter, "知识库检索请求过于频繁（每 IP 每分钟 "
+                    + publicKbRateLimiter.limitPerMinute() + " 次），请稍后再试");
+        }
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", LocalDateTime.now().format(FMT));
+        data.put("query", q == null ? "" : q.trim());
+        data.put("rule", publicKbService.ruleSummary());
+
+        String query = q == null ? "" : q.trim();
+        if (query.isEmpty()) {
+            data.put("results", List.of());
+            data.put("hitCount", 0);
+            data.put("available", true);
+            data.put("note", "未提供查询词（q）。");
+            return ok(data, res);
+        }
+        if (query.length() > 200) {
+            data.put("results", List.of());
+            data.put("hitCount", 0);
+            data.put("available", true);
+            data.put("note", "查询词过长（上限 200 字符）。");
+            return ok(data, res);
+        }
+
+        try {
+            List<Map<String, Object>> results = publicKbService.search(query);
+            data.put("results", results);
+            data.put("hitCount", results.size());
+            data.put("available", true);
+            data.put("note", results.isEmpty()
+                    ? "公开知识库未检索到相关片段（未命中就是未命中，不用别的数据顶替）。"
+                    : "片段已截断并脱敏；IP 已掩码，内部路径与凭据不出现在响应里。");
+        } catch (PublicKbService.PublicKbUnavailableException e) {
+            // fail-closed：检索不可用就如实说不可用，不回空列表冒充"没有相关内容"
+            data.put("results", List.of());
+            data.put("hitCount", 0);
+            data.put("available", false);
+            data.put("note", "知识库检索不可用（向量检索异常）：未返回任何内容，也不以内置样本顶替。");
+        }
+        return ok(data, res);
+    }
+
+    /** 请求体取问题：只认 {@code question} / {@code q} 两个键，其余一律忽略 */
+    private static String extractQuestion(Map<String, Object> body) {
+        if (body == null) {
+            return "";
+        }
+        Object v = body.get("question");
+        if (v == null) {
+            v = body.get("q");
+        }
+        return v == null ? "" : String.valueOf(v);
+    }
 
     // ==================== 端点 ====================
 
@@ -538,6 +710,27 @@ public class PublicApiController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("code", 429);
         body.put("message", "请求过于频繁，请稍后再试");
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
+    }
+
+    /**
+     * 429：带上"哪个限流器挡的、上限多少、还剩多少、多久能再试"。
+     *
+     * <p>为什么要多这几个字段：公开页面必须能显示人话（"请稍后再试"），
+     * 而排障时最需要知道的恰恰是"被哪一条规则挡的" —— 只回一个裸 429，
+     * 前端只能笼统提示，站主也只能靠猜。
+     */
+    private ResponseEntity<Map<String, Object>> tooMany(HttpServletResponse res,
+                                                        PublicAskRateLimiter limiter,
+                                                        String message) {
+        res.setHeader(HttpHeaders.RETRY_AFTER, "60");
+        res.setHeader("X-RateLimit-Limit", String.valueOf(limiter.limitPerMinute()));
+        res.setHeader("X-RateLimit-Remaining", "0");
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", 429);
+        body.put("message", message);
+        body.put("limitPerMinute", limiter.limitPerMinute());
+        body.put("retryAfterSeconds", 60);
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
     }
 

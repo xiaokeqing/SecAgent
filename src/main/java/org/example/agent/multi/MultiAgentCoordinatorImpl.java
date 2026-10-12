@@ -656,8 +656,51 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         return step;
     }
 
+    /**
+     * 匿名公开演示身份的 RESPONDER：<b>只解释，不调任何工具</b>（P4）。
+     *
+     * <h3>为什么不是"模拟下发"</h3>
+     * 评测身份走的是"模拟下发"（形状与真实下发一致，便于判分器比对）。
+     * 但公开访客根本不需要看到一个"如果真封会怎样"的执行框 ——
+     * 那既暴露内部动作形状，也容易被误读成"这个网站真的会按我说的封 IP"。
+     * 所以公开路径给的是<b>解释</b>：这条请求在内部会怎么走、由谁拍板、
+     * 为什么匿名访客不能触发它。措辞本身就是安全边界的一部分。
+     */
+    private AgentStepResult runResponderPublicExplanationOnly(DispatchDecision d, String userInput, long start,
+                                                              Map<AgentRole, String> bodies) {
+        String target = d.ip != null ? d.ip
+                : (d.account != null ? "账号 " + d.account
+                        : (d.pid != null ? "进程 " + d.pid : "（未给出明确目标）"));
+        String summary = "公开演示：处置类请求只解释、不执行（未调用任何工具）";
+        String body = "## 处置类请求：公开演示不执行\n"
+                + "> 结论生成方式：**规则解析**（动作类型与参数来自编排层规则解析，非模型产出）\n"
+                + "> state=rule-based\n\n"
+                + "检测到这次提问的意图是**自动处置**（目标：" + target + "）。\n\n"
+                + "公开演示端点按设计**不会执行任何处置动作**，原因有两条，都是刻意的：\n"
+                + "1. **匿名不可触发处置**：封禁 / 锁账号 / 杀进程在内部要求管理员角色 + 人工审批，"
+                + "并且全部写审计流水；如果公开页面能触发它，等于把这条边界公开出去了。\n"
+                + "2. **模型不参与处置拍板**：内部链路里「封哪个、封多久」由编排层规则解析产出，"
+                + "再经白名单与审批 —— 模型只负责研判，不负责动手。\n\n"
+                + "如果你想看这套护栏真的在跑，可以在博客「攻防靶场」里提交一段输入："
+                + "那边调用的是系统里真实运行的检测组件（只做检测、不产生处置）。";
+        AgentStepResult step = new AgentStepResult(AgentRole.RESPONDER.getDisplayName(), AgentRole.RESPONDER.name(),
+                "responder_agent", "处置请求：公开演示不执行（只解释）", summary,
+                "【公开演示】未调用 SecurityActionTools / 未写审计 / 未登记封禁记录。",
+                System.currentTimeMillis() - start, true);
+        bodies.put(AgentRole.RESPONDER, body);
+        return step;
+    }
+
     /** RESPONDER 处置执行员：工具=SecurityActionTools（内部强制护栏/审批/审计）+ 时间 */
     private AgentStepResult runResponder(DispatchDecision d, String userInput, long start, Map<AgentRole, String> bodies) {
+        // ---------- 匿名公开演示：一律只解释，绝不调任何工具 ----------
+        // 理由（P4 公开问答端点）：/api/public/ask 是匿名可达的。如果公开路径能走到
+        // SecurityActionTools，任何人说一句"请封禁 1.2.3.4"就能让这台机器对外下发真实处置 ——
+        // 这是公开端点最不能有的一条路径。这里在【工具调用之前】分叉，
+        // 因此 ResponseGuard / 审批 / 审计 / BlockRecordStore 一个都不会被碰到。
+        if (org.example.security.EvalIdentity.isPublicRequest()) {
+            return runResponderPublicExplanationOnly(d, userInput, start, bodies);
+        }
         // ---------- 评测身份：一律走"模拟"路径，绝不下发真实动作 ----------
         // 理由：评测会反复问"请封禁 xxx"来测护栏与路由。如果评测身份能真下发，
         // 跑一轮评测就可能把真实 IP 封掉 —— 安全评测本身变成事故来源。

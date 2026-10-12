@@ -43,6 +43,11 @@ class ChatControllerEvalContextTest {
 
     /**
      * 构造一个只做编排的控制器：模型出口不参与，所以这里用假的 coordinator 记录它看到的标注。
+     *
+     * <p>P4 起"线程池 + 有界等待 + 身份标注"搬到了
+     * {@link org.example.service.OrchestrationService}（公开端点必须与 /api/chat 共用同一条链路），
+     * 所以这里同时注入那一层 —— 否则控制器会在调用空对象时静默走进 catch 分支，
+     * 测试变成"永远绿的空测试"。
      */
     private ChatController controllerWith(java.util.function.Supplier<Boolean> seenByOrchestrator) throws Exception {
         ChatController c = new ChatController();
@@ -56,12 +61,24 @@ class ChatControllerEvalContextTest {
             assertTrue(seenByOrchestrator.get(), "编排线程必须看得到评测标注（否则配额会记错账）");
             assertTrue(EvalIdentity.currentRunId() != null || !seenByOrchestrator.get(),
                     "评测请求的 runId 也要带进编排线程");
+            assertFalse(EvalIdentity.isPublicRequest(),
+                    "公开演示标注不得泄漏到评测/普通请求上（额度会记错池子）");
             MultiAgentResult r = new MultiAgentResult(question);
             r.setFinalAnswer("测试答复");
             return r;
         };
         ReflectionTestUtils.setField(c, "multiAgentCoordinator", coordinator);
+        ReflectionTestUtils.setField(c, "orchestrationService", orchestrationWith(coordinator));
         return c;
+    }
+
+    /** 真实编排层（只是不接模型），用于验证身份标注穿过线程池 */
+    private org.example.service.OrchestrationService orchestrationWith(MultiAgentCoordinator coordinator)
+            throws Exception {
+        org.example.service.OrchestrationService svc = new org.example.service.OrchestrationService();
+        ReflectionTestUtils.setField(svc, "multiAgentCoordinator", coordinator);
+        ReflectionTestUtils.setField(svc, "defaultDeadlineMs", 5000L);
+        return svc;
     }
 
     @Test

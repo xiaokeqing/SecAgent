@@ -42,9 +42,18 @@ public class PublicCorsInterceptor implements HandlerInterceptor {
 
     private static final Logger logger = LoggerFactory.getLogger(PublicCorsInterceptor.class);
 
-    private static final String ALLOW_METHODS = "GET, OPTIONS";
+    /**
+     * 预检允许的方法。
+     *
+     * <p>必须带上 {@code POST}：P4 的公开问答（{@code POST /api/public/ask}）是浏览器发起的
+     * 跨域 JSON 请求，会先发预检；只回 {@code GET, OPTIONS} 的话预检不通过，
+     * 页面表现为"请求根本没发出去"（而 curl 测试一切正常，很容易误判成前端 bug）。
+     */
+    private static final String ALLOW_METHODS = "GET, POST, OPTIONS";
     private static final String ALLOW_HEADERS = "If-None-Match, Content-Type, Accept, Origin, CF-Connecting-IP, X-Forwarded-For";
-    private static final String EXPOSE_HEADERS = "ETag, Cache-Control, X-Data-Source, X-RateLimit-Limit";
+    private static final String EXPOSE_HEADERS =
+            "ETag, Cache-Control, X-Data-Source, X-RateLimit-Limit, Retry-After, "
+                    + "X-RateLimit-Remaining, X-Public-Concurrency";
     private static final String MAX_AGE = "3600";
 
     /** 允许的跨域来源（逗号分隔）。默认只有博客域名与本机预览端口，<b>不含通配符</b>。 */

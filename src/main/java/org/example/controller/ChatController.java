@@ -53,57 +53,46 @@ public class ChatController {
     private MultiAgentCoordinator multiAgentCoordinator;
 
     /**
+     * 编排入口（带总预算 + 身份标注）。
+     *
+     * <p>P4 起这里不再自己管线程池与超时：{@code /api/public/ask} 也必须走同一条编排链路，
+     * 而"复制一份编排"迟早会变成"两份编排、只修了一份的超时"。两个控制器现在都只是
+     * {@link org.example.service.OrchestrationService} 的调用方。
+     */
+    @Autowired
+    private org.example.service.OrchestrationService orchestrationService;
+
+    /**
      * 一次研判请求的总预算（毫秒）。
      *
      * <p><b>为什么必须在入口设 deadline</b>：实测表明，内部调用链上总会有"不可中断"的环节
      * （例如 OkHttp 的 `connect` —— {@code future.cancel(true)} 对 socket 建连无效）。
      * 只靠各层自己的超时，用户仍可能永远拿不到响应。入口有 deadline 才能保证：
      * 无论内部卡在哪，请求都会在预算内返回一个<b>显式的"未生成"</b>，而不是挂死。
+     *
+     * <p>P4 起实际的"有界等待"实现在 {@link org.example.service.OrchestrationService}
+     * （公开端点要与本接口共用同一条链路），这里只保留本接口自己的预算值。
      */
     @org.springframework.beans.factory.annotation.Value("${app.chat.deadline-ms:25000}")
     private long chatDeadlineMs;
 
-    /** 编排线程池（守护线程）：避免被卡住的编排把 Tomcat 工作线程一起拖住 */
-    private static final java.util.concurrent.ExecutorService ORCHESTRATOR_POOL =
-            java.util.concurrent.Executors.newFixedThreadPool(4, r -> {
-                Thread t = new Thread(r, "orchestrator");
-                t.setDaemon(true);
-                return t;
-            });
-
-    /** 在总预算内执行编排；超时抛 {@link IllegalStateException}（由调用处转成"未生成"响应） */
+    /**
+     * 在总预算内执行编排；超时抛 {@link org.example.service.OrchestrationService.OrchestrationTimeoutException}
+     * （由调用处转成"未生成"响应）。
+     *
+     * <p>保留这个薄封装是为了不动 {@code /api/chat} 的既有行为与异常语义
+     * （历史上这里抛 {@link IllegalStateException}，而超时类型是它的子类）。
+     */
     private MultiAgentResult callWithDeadline(String question, List<Map<String, String>> history) {
-        // 编排跑在线程池上，评测标注必须带进去；跑完必须清掉。
-        // 用 InheritableThreadLocal 载体可以"继承"，但线程池会复用线程 ——
-        // 不在任务末尾显式清空，下一个普通请求就可能被当成评测请求
-        // （免费额度 + 动作真下发），而且没有任何报错。
-        final boolean evalRequest = org.example.security.EvalIdentity.isEvalRequest();
-        final String runId = org.example.security.EvalIdentity.currentRunId();
-        java.util.concurrent.Future<MultiAgentResult> future = ORCHESTRATOR_POOL.submit(() -> {
-            if (evalRequest) {
-                org.example.security.EvalIdentity.beginEvalRequest(runId);
-            }
-            try {
-                return multiAgentCoordinator.routeAndRun(question, history);
-            } finally {
-                org.example.security.EvalIdentity.endEvalRequest();
-            }
-        });
         try {
-            return future.get(chatDeadlineMs, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (java.util.concurrent.TimeoutException e) {
-            future.cancel(true);
-            logger.warn("研判总预算（{} ms）用尽：按 fail-closed 终止并返回『未生成』", chatDeadlineMs);
-            throw new IllegalStateException("研判总预算用尽（" + chatDeadlineMs + " ms）");
-        } catch (java.util.concurrent.ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException re) {
-                throw re;
-            }
-            throw new IllegalStateException(String.valueOf(cause));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("研判被中断");
+            return orchestrationService.run(question, history, chatDeadlineMs);
+        } catch (org.example.service.OrchestrationService.OrchestrationTimeoutException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            // 编排内部受检异常：历史上这里统一转成 IllegalStateException，行为保持不变
+            throw new IllegalStateException(String.valueOf(e.getMessage() == null ? e : e.getMessage()), e);
         }
     }
 

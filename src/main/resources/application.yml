@@ -147,15 +147,40 @@ app:
     # 为什么不复用 app.cors.allowed-origins：公网端点是匿名可达面，
     # "为了本地调试放宽界面来源"不该顺手放宽它 —— 两件事要在配置层就分开。
     allowed-origins: https://xiaokeqing.cn,https://www.xiaokeqing.cn,http://localhost:1313,http://127.0.0.1:1313
+    # ===== P4：公开 AI 问答 / 公开知识库检索 =====
+    # 这两个端点【会花钱】（问答调对话模型、检索调 embedding），所以它们有自己的一套限流，
+    # 刻意不复用上面那 20 次/分钟：否则"为了页面刷新率把 20 改成 60"会顺手把花钱的端点也放宽 3 倍。
+    ask:
+      requests-per-minute: 6      # 每 IP 每分钟；这是频率上限，成本上限是下面 quota.public-daily-limit
+      max-question-chars: 600     # 公开演示只接受一句话提问，不接受整段日志
+      max-body-chars: 4000        # 请求体上限（挡住超大 body，防止用 body 撑内存）
+      deadline-ms: 20000          # 总预算；比 /api/chat 略短：匿名请求不该长时间占编排线程
+    kb:
+      requests-per-minute: 20     # 检索比问答便宜（只调 embedding），给到与只读端点同量级
+    # 公开知识库检索的【可见性口径】：不是"标记为内部的才隐藏"，而是"命中白名单才放行"。
+    # 依据是向量库元数据里的 _source / _file_name / _source_type（没有文档分类字段，这是最小实现）。
+    public-kb:
+      allowed-roots: security-docs,data/kb-approved   # 内置安全知识 + 人工审核通过的知识
+      allowed-source-types: community                 # 缺失即拒绝：没标注来源的文档不参与公开检索
+      denied-keywords: internal                       # 兜底黑名单（命中路径/来源类型即拒绝）
+      top-k: 3
+      snippet-chars: 300
   # 每日模型调用配额，防止成本失控
   quota:
     enabled: true
-    daily-limit: 200
+    daily-limit: ${APP_QUOTA_DAILY_LIMIT:200}
     # ===== 评测身份独立额度（app.eval.token 识别的身份专用）=====
     # 为什么独立：评测跑一轮安全卷+质量卷约 50 次模型调用，而用户日额度是 200（线上 compose 里是 50）——
     # 共用一份额度就会出现"跑完评测当天真实用户不可用"。给评测放宽不该同时放宽所有人。
     eval-daily-limit: ${APP_QUOTA_EVAL_DAILY_LIMIT:60}
     eval-store-file: data/model-quota-eval.json
+    # ===== 匿名公开演示独立额度（P4，/api/public/ask 专用）=====
+    # 为什么必须单独一本账：公开端点匿名可达，被刷爆是常态；共用用户额度会让站主自己用不了系统。
+    # 默认 30：够几十个访客各试一句，又不足以被当成免费模型接口刷。
+    # ★ 开发期临时放大到 300（见 RUNBOOK「开发期额度覆盖 / 发布前回收清单」）。
+    public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:30}
+    public-store-file: data/model-quota-public.json
+
   # ===== 评测身份（独立凭据 + 流量打标 + RESPONDER 模拟）=====
   # token 从环境变量注入；【未配置则该功能完全关闭】，行为与改造前一致。
   # 绝不写默认值：写死一个默认 token 等于把评测身份变成公开后门。

@@ -286,6 +286,27 @@ python3 /opt/secagent/scripts/eval-papers.py --paper auto      # 单号日 safet
 
 ---
 
+## 4.5 公开 AI 问答与知识库检索（P4 起，`/api/public/ask` + `/api/public/kb`）
+
+```
+POST /api/public/ask    匿名；每 IP 6 次/分钟 + 每 IP 并发 1 + 每日独立额度（生产 30）
+GET  /api/public/kb?q=  匿名；每 IP 20 次/分钟；只出白名单字段（标题/片段/来源类型/可信度）
+
+四道护栏：① PromptInjectionGuard（命中即拒绝，且问题包 UNTRUSTED_DATA）
+          ② 输出护栏（PublicOutputGuard：凭据/内部路径/内部标记/上游报错残留）
+          ③ 脱敏（IP 掩码到网段；内网段写"内部地址"；自由文本内嵌 IP 也覆盖）
+          ④ 配额与限流（用户/评测/公开三本账，公开池独立计数与文件）
+
+公开路径的硬约束：RESPONDER 只解释、不调任何工具（匿名永远无法触发处置）。
+行为验证（最强证据，不依赖日志）：
+  · 注入尝试 → state=input-insufficient，且编排未被调用；
+  · 正常提问但模型不可用 → state=model-failed，回答里明写"未生成"；
+  · 处置类提问（"请封禁 1.2.3.4"）→ 回答里出现"公开演示不执行"，且无审计 ID；
+  · 凭据形态串（sk-…、Bearer …、私钥块）在回答里被替换为 [凭据已脱敏]。
+```
+
+---
+
 ## 5. 排障速查（按症状）
 
 | 症状 | 先查什么 |
@@ -359,6 +380,65 @@ python3 /opt/secagent/scripts/eval-papers.py --paper auto      # 单号日 safet
 2. 清单文件本身在上一层，引用要用绝对路径，相对名会 `No such file or directory`。
 
 > 教训：**"备份存在" ≠ "备份可用"**。不真跑一次恢复，你不会知道到底能不能恢复。
+
+---
+
+## 6.7 开发期额度覆盖 / 发布前回收清单（P4 起）
+
+**为什么要有这一段**：开发期会把三个额度池临时调大，否则"改一行代码 → 重启 → 额度已用完"
+会被误当成代码问题。但**调大的是上限，不是关掉配额** —— 计数器与持久化文件照旧存在，
+所以万一出现死循环，仍有一条（更大的）保险丝。
+
+三个池子与它们的计数文件（三本账互不影响）：
+
+| 配置项 | 计数文件 | 生产值 | 开发期值 | 服务谁 |
+|---|---|---|---|---|
+| `app.quota.daily-limit`（`DAILY_QUOTA`） | `data/model-quota.json` | **50** | 300 | 站主 / 登录用户 |
+| `app.quota.eval-daily-limit`（`APP_QUOTA_EVAL_DAILY_LIMIT`） | `data/model-quota-eval.json` | **60** | 200 | 评测身份（`app.eval.token`） |
+| `app.quota.public-daily-limit`（`APP_QUOTA_PUBLIC_DAILY_LIMIT`） | `data/model-quota-public.json` | **30** | 300 | 匿名公开演示（`POST /api/public/ask`） |
+
+### 覆盖方式（两处都要改，否则不生效）
+
+```bash
+# srv1: /opt/secagent/.env
+APP_QUOTA_DAILY_LIMIT=300        # 开发期临时上限，发布前必须改回 50
+APP_QUOTA_EVAL_DAILY_LIMIT=200   # 开发期临时上限，发布前必须改回 60
+APP_QUOTA_PUBLIC_DAILY_LIMIT=300 # 开发期临时上限，发布前必须改回 30
+```
+
+```yaml
+# srv1: /opt/secagent/docker-compose.yml（environment 段，已入库同款）
+APP_QUOTA_DAILY_LIMIT: "${APP_QUOTA_DAILY_LIMIT:-50}"
+APP_QUOTA_EVAL_DAILY_LIMIT: "${APP_QUOTA_EVAL_DAILY_LIMIT:-60}"
+APP_QUOTA_PUBLIC_DAILY_LIMIT: "${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}"
+```
+
+> ⚠️ **为什么 .env 单独改不够**：compose 的 `SPRING_APPLICATION_JSON` 优先级**高于**环境变量绑定，
+> 所以只有把值也写进那段 JSON 的插值里（`public-daily-limit:${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}`），
+> `.env` 才会真正生效。否则表现是"改了 .env、重启了、上限没变"，而且**不报错**。
+
+### 改完怎么验证（不要只看配置文件）
+
+```bash
+docker exec secagent cat data/model-quota.json          # 上限=50 时 used 到 50 就该拒
+docker exec secagent cat data/model-quota-eval.json
+docker exec secagent cat data/model-quota-public.json
+docker exec secagent sh -c 'echo $APP_QUOTA_PUBLIC_DAILY_LIMIT'   # 容器内实际拿到的值
+curl -s http://127.0.0.1:9900/api/public/ask -X POST \
+  -H 'Content-Type: application/json' -d '{"question":"什么是SSH暴力破解"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["quota"])'
+```
+
+### 发布前回收清单（逐条核对，全部打勾才能对外）
+
+```
+[ ] /opt/secagent/.env 里三个 APP_QUOTA_* 改回 50 / 60 / 30，并删掉"开发期临时"注释
+[ ] /opt/secagent/docker-compose.yml 的 environment 三个默认值与 .env 一致（还是 50/60/30）
+[ ] docker exec secagent sh -c 'echo $APP_QUOTA_PUBLIC_DAILY_LIMIT' → 30
+[ ] /api/public/ask 返回的 data.quota.limit == 30（页面上的"剩余次数"也会跟着变）
+[ ] data/model-quota*.json 三个文件都在（配额机制没有被顺手关掉）
+[ ] 公开端点仍然是"匿名 + 每 IP 每月 6 次限流 + 每 IP 并发 1"（改额度不该动限流）
+```
 
 ---
 

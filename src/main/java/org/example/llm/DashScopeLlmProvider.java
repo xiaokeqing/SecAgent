@@ -110,19 +110,27 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
-        // 配额按【调用来源】分派：评测身份走独立计数器，普通身份走用户计数器。
-        // 两者各自的持久化文件不同，因此"用户额度耗尽 → 评测仍可跑"成立，反之亦然。
+        // 配额按【调用来源】分派：评测身份走评测计数器、匿名公开演示走公开计数器、
+        // 其余走用户计数器。三个池子各自的持久化文件不同，因此"用户额度耗尽 → 评测仍可跑"、
+        // "公开端点被刷爆 → 站主自己仍可用"这两件事同时成立。
         // 判定必须在这里（模型出口）而不是控制器入口：只有真正要调模型的这一步才该计数，
-        // 而 /api/chat 一次提问可能触发多次模型调用（Planner 路由 + 结论生成）。
-        boolean evalRequest = org.example.security.EvalIdentity.isEvalRequest();
+        // 而一次提问可能触发多次模型调用（Planner 路由 + 结论生成）。
+        // 分派收口在 ModelQuotaService.tryAcquire(Identity)，不在本类里 if/else ——
+        // 分派写错不会有任何报错，只会把账记到别的池子上。
         if (modelQuotaService != null) {
-            boolean allowed = evalRequest ? modelQuotaService.tryAcquireEval() : modelQuotaService.tryAcquire();
+            org.example.service.ModelQuotaService.Identity identity =
+                    org.example.security.EvalIdentity.isEvalRequest()
+                            ? org.example.service.ModelQuotaService.Identity.EVAL
+                            : (org.example.security.EvalIdentity.isPublicRequest()
+                                    ? org.example.service.ModelQuotaService.Identity.PUBLIC
+                                    : org.example.service.ModelQuotaService.Identity.USER);
+            boolean allowed = modelQuotaService.tryAcquire(identity);
             if (!allowed) {
                 // 配额用尽只影响"这一步"：抛出后由上层降级（Planner 回退规则、研判标未生成），
                 // 不再像以前那样把整条请求（含护栏/处置）一起拒掉。
-                throw new IllegalStateException(evalRequest
-                        ? "评测模型额度已用完（今日）：本次不调用模型，由上层降级处理"
-                        : "模型额度已用完（今日）：本次不调用模型，由上层降级处理");
+                String label = identity == org.example.service.ModelQuotaService.Identity.EVAL ? "评测"
+                        : (identity == org.example.service.ModelQuotaService.Identity.PUBLIC ? "公开演示（匿名）" : "");
+                throw new IllegalStateException(label + "模型额度已用完（今日）：本次不调用模型，由上层降级处理");
             }
         }
         if (System.currentTimeMillis() < cooldownUntil) {
