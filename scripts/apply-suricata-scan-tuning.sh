@@ -119,29 +119,44 @@ threshold gen_id 1, sig_id $SID_FP, type threshold, track by_src, count 3, secon
 EOF
 ok "阈值文件已写入容器 $TH_IN_CT"
 
-echo "==> 4/6 结构化修改 suricata.yaml（python3+yaml，就地覆盖写）"
+echo "==> 4/6 行级修改 suricata.yaml（保留原文与注释，只插两行）"
 python3 - "$YAML_HOST" "$RULE_NAME" "$TH_IN_CT" <<'PY'
-import sys, io, yaml
+# 为什么不用 yaml.safe_dump：
+#   那会把整份配置重新序列化 —— 注释全丢、引号/缩进风格被改写，风险远大于"插两行"的收益。
+#   这里只做两处文本插入，其余一个字符都不动。
+import sys, io, re
 path, rule_name, th_path = sys.argv[1], sys.argv[2], sys.argv[3]
 with io.open(path, 'r', encoding='utf-8') as f:
-    cfg = yaml.safe_load(f)
-if not isinstance(cfg, dict):
-    sys.exit("yaml 根节点不是映射，拒绝改动")
-rf = cfg.get('rule-files')
-if rf is None:
-    rf = []
-if not isinstance(rf, list):
-    sys.exit("rule-files 不是列表，拒绝改动")
-if rule_name not in rf:
-    rf.append(rule_name)
-cfg['rule-files'] = rf
-cfg['threshold-file'] = th_path
+    lines = f.readlines()
+
+out, inserted_rule = [], False
+i = 0
+while i < len(lines):
+    line = lines[i]
+    out.append(line)
+    m = re.match(r'^rule-files:\s*$', line)
+    if m and not inserted_rule:
+        # 探明该块内子项缩进（形如 "  - suricata.rules"）
+        j, indent = i + 1, '  '
+        while j < len(lines) and re.match(r'^\s*-\s+', lines[j]):
+            indent = re.match(r'^(\s*)', lines[j]).group(1)
+            j += 1
+        if not any(rule_name in l for l in lines[i:j]):
+            out.append('%s- %s\n' % (indent, rule_name))
+            inserted_rule = True
+    i += 1
+
+text = ''.join(out)
+inserted_th = False
+if not re.search(r'^threshold-file:', text, re.M):
+    text = 'threshold-file: %s\n' % th_path + text
+    inserted_th = True
+
 with io.open(path, 'w', encoding='utf-8') as f:
-    yaml.safe_dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-print("      rule-files =", rf)
-print("      threshold-file =", cfg['threshold-file'])
+    f.write(text)
+print("      插入 rule-files 项:", inserted_rule, "| 插入 threshold-file:", inserted_th)
 PY
-ok "配置已就地写回"
+ok "配置已就地写回（只插两行）"
 
 echo "==> 5/6 校验（不合格立即回滚）"
 if ! validate_conf; then
