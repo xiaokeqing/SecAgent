@@ -113,6 +113,39 @@ services:
       APP_QUOTA_EVAL_DAILY_LIMIT: "${APP_QUOTA_EVAL_DAILY_LIMIT:-60}"
       APP_QUOTA_PUBLIC_DAILY_LIMIT: "${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}"
 
+      # ===== 公开面 IP 显示口径（2026-10-14 站主拍板：默认显示真实来源 IP）=====
+      # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_RAG_* 同一个教训：
+      #   上面的 SPRING_APPLICATION_JSON 优先级高于环境变量绑定，凡是它覆盖到的属性，
+      #   "在 .env 里加一行"都不生效且不报错。app.public.* 目前不在那段 JSON 里，
+      #   但仍然显式透传 —— 把"这个口径从哪来"钉在部署面上，将来谁往 JSON 里加一笔也不会静默改口径。
+      # false = 显示观测到的真实来源 IP（默认，站主拍板）；true = 掩码（改造前口径）。
+      # 影响所有 /api/public/** 端点；内网/保留地址在任何口径下都写「内网/未知」。
+      APP_PUBLIC_MASK_IPS: "${APP_PUBLIC_MASK_IPS:-false}"
+      APP_PUBLIC_REMOVAL_CONTACT: "${APP_PUBLIC_REMOVAL_CONTACT:-https://xiaokeqing.cn/about/}"
+      APP_PUBLIC_ASSET_BLOCKLIST: "${APP_PUBLIC_ASSET_BLOCKLIST:-web-01,web-02,web-03,db-01,auth.log,/api/order/detail,/upload/files/}"
+
+      # ===== 离线地理富化（DB-IP Lite，CC BY 4.0；RUNBOOK §26）=====
+      # 与额度/检索同一个教训：**必须在 environment 段显式透传**，否则"在 .env 里加一行"不生效且不报错。
+      # 库文件放在 /opt/secagent/geoip（宿主机，600/700，属主 999:999），只读挂载到 /opt/geoip：
+      #   · 库不进镜像、不进仓库（许可要署名，体积 80MB+，且它是"数据"不是"代码"）；
+      #   · 容器里配的是挂载后的路径（/opt/geoip/...），不是宿主机路径。
+      # 库缺失时**不会静默降级成空分布**：/api/public/geo 会如实返回 available=false + GEO_DB_MISSING。
+      APP_GEOIP_ENABLED: "${APP_GEOIP_ENABLED:-true}"
+      APP_GEOIP_CITY_DB: "${APP_GEOIP_CITY_DB:-/opt/geoip/dbip-city-lite.csv.gz}"
+      APP_GEOIP_ASN_DB: "${APP_GEOIP_ASN_DB:-/opt/geoip/dbip-asn-lite.csv.gz}"
+      # 关掉 IPv6 区间可省约 80MB 常驻内存（IPv6 来源会归为"未定位"）；默认 true。
+      APP_GEOIP_IPV6_ENABLED: "${APP_GEOIP_IPV6_ENABLED:-true}"
+      # 我方公网/内网出口 IP（逗号分隔）。不填的后果是具体的：实测 24h 的 data.srcip 第 2 名
+      # 就是 srv2 自己的公网 IP，于是"攻击来源 TOP"里会出现我们自己的服务器。
+      # 服务器真实 IP 不进仓库 —— 由 /opt/secagent/.env 注入。
+      APP_GEOIP_SELF_IPS: "${APP_GEOIP_SELF_IPS:-}"
+      # 来源 IP 的字段名：主机侧/蜜罐写 data.srcip，Suricata 写 data.src_ip（实测两种并存）。
+      APP_GEOIP_SRC_IP_FIELDS: "${APP_GEOIP_SRC_IP_FIELDS:-data.srcip,data.src_ip}"
+      # 入榜门槛：count>=3 且占比>=1%（防"1 次攻击刷榜"与长尾噪声占满榜单）。
+      APP_GEOIP_MIN_COUNT: "${APP_GEOIP_MIN_COUNT:-3}"
+      APP_GEOIP_MIN_SHARE_PERCENT: "${APP_GEOIP_MIN_SHARE_PERCENT:-1.0}"
+      APP_GEOIP_TOP_IPS: "${APP_GEOIP_TOP_IPS:-1000}"
+
       # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
       # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
       # 全部可留空（留空即用代码默认值，与改造前行为兼容）。
@@ -135,11 +168,34 @@ services:
       # 生成：openssl rand -hex 32，写入 /opt/secagent/.env（权限 600），不要进 git。
       APP_EVAL_TOKEN: "${APP_EVAL_TOKEN:-}"
 
+      # ===== 对话模型供应商：DashScope ⇄ DeepSeek（RUNBOOK §28）=====
+      # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_RAG_* 同一个教训：
+      #   上面的 SPRING_APPLICATION_JSON 优先级【高于】环境变量绑定，凡是它覆盖到的属性，
+      #   "在 .env 里加一行"都不生效且不报错。app.llm.* 目前不在那段 JSON 里，
+      #   但仍然显式透传 —— 把"这个开关从哪来"钉在部署面上。
+      # 默认 dashscope = 改造前口径（qwen-plus）；改 deepseek 后按发布链重建容器。
+      # ⚠️ 对话可换、向量不可换：DASHSCOPE_API_KEY 不能撤（DeepSeek 没有 embedding API）。
+      APP_LLM_PROVIDER: "${APP_LLM_PROVIDER:-dashscope}"
+      # 默认空 = 关闭跨供应商回退（主不可用 → 上层如实判未生成）。
+      # 开启后回答里的 generatedBy 会如实改成真正生成的那家，绝不悄悄换一家还署原名。
+      APP_LLM_FALLBACK_PROVIDER: "${APP_LLM_FALLBACK_PROVIDER:-}"
+      # 【不写默认值】Key 只从 .env（600 权限）注入；写成 compose 里的默认值
+      # 等于把凭据放进仓库。空 = 该供应商不可用并在启动自检里显式打印 MISSING。
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      # 可选覆盖（一般不用写）：默认值就是 application.yml 里那些。
+      APP_LLM_DEEPSEEK_MODEL: "${APP_LLM_DEEPSEEK_MODEL:-deepseek-chat}"
+      APP_LLM_DEEPSEEK_BASE_URL: "${APP_LLM_DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+
       TZ: Asia/Shanghai
 
     volumes:
       # 只读挂载封禁密钥 —— 密钥不进镜像（镜像会被 save/scp，甚至可能推到仓库）
       - /opt/secagent/keys:/opt/keys:ro
+      # 离线地理库（DB-IP Lite，CC BY 4.0）：宿主机 /opt/secagent/geoip → 容器 /opt/geoip（只读）。
+      # 为什么用只读挂载而不是打进镜像：80MB+ 的第三方数据（许可要求署名、体积不该进镜像层），
+      # 且月度更新只需换文件 + 重建容器，不用重新构建镜像。
+      # 目录 700 / 文件 600 / 属主 999:999：容器以 uid 999 运行（能读），宿主机其它用户读不到。
+      - /opt/secagent/geoip:/opt/geoip:ro
       # 运行数据持久化：向量库、审计留痕、封禁记录、评测结果
       - ./data:/app/data
       - ./uploads:/app/uploads

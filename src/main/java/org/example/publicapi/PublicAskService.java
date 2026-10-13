@@ -73,6 +73,22 @@ public class PublicAskService {
     private ModelQuotaService modelQuotaService;
 
     /**
+     * IP 显示口径（唯一来源：{@code app.public.mask-ips}）。
+     *
+     * <p>{@code required=false}：单测里直接 {@code new PublicAskService()} 时按掩码兜底，
+     * 与改造前行为一致。真实运行由 Spring 注入。
+     */
+    @Autowired(required = false)
+    private PublicIpPolicy ipPolicy;
+
+    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
+
+    private PublicIpPolicy policy() {
+        PublicIpPolicy p = ipPolicy;
+        return p != null ? p : FAIL_CLOSED_POLICY;
+    }
+
+    /**
      * 回答一次公开提问。
      *
      * @param question 访客问题（未脱敏、未校验）
@@ -224,7 +240,14 @@ public class PublicAskService {
         m.put("publicDemo", true);
         m.put("toolExecutionAllowed", false);
         m.put("noteTemplate", "公开演示：模型不可用时如实说明，不用模板冒充。");
+        // 【既有字段，语义不变】永远是掩码形态 —— 名字里就写着 Masked，
+        // 把真实地址塞进这个字段等于让字段名说谎（契约"只许新增字段"也不允许改名）。
         m.put("clientIpMasked", PublicIpMask.mask(clientIp));
+        // 【新增字段】按统一口径显示的调用方来源地址（真实态 = 观测到的真实地址）。
+        // 老字段保持原样，页面要真实地址就读这个；两个字段同时存在是刻意的。
+        m.put("clientIp", policy().display(clientIp));
+        // 统一口径字段（与所有公开端点同一位置、同一形状）
+        m.put(PublicIpPolicy.DISCLOSURE_FIELD, policy().disclosure());
         return m;
     }
 

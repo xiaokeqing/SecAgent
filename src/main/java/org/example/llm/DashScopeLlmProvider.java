@@ -24,6 +24,26 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     private static final Logger logger = LoggerFactory.getLogger(DashScopeLlmProvider.class);
 
+    /**
+     * 本实现负责的配置值。
+     *
+     * <p>抽成常量而不是散落的字面量：{@link DashScopeLlmProvider} 与
+     * {@code DeepSeekLlmProvider} 的 {@code id()} 必须与 {@code app.llm.provider}
+     * 的取值逐字一致，写错的表现是"两个实现都不可用"（静默的空档），
+     * 所以它同时被 {@link org.example.config.LlmSelfCheck} 用来核对。
+     */
+    public static final String ID = "dashscope";
+
+    /**
+     * 本实现所属的出站依赖描述（<b>仅用于自检打印</b>）。
+     *
+     * <p>DashScope 这条链路的硬超时不在 {@code OutboundGuard} 里，而是本类内部的
+     * 有界等待（{@code app.llm.timeout-ms}）；自检里要能一眼看出"哪条走守卫、哪条走内部限时"，
+     * 所以这里写的是"说明性 key"，不是 OutboundGuard 的冷却 key。
+     * 冷却 key 由 {@code app.outbound.*} 无关：本实现自带 cooldownUntil。
+     */
+    public static final String DEP_CHAT = "dashscope-chat";
+
     /** 当前选中的 provider；不是 dashscope 时本实现标记为不可用（由对应实现接管） */
     @Value("${app.llm.provider:dashscope}")
     private String selectedProvider;
@@ -68,7 +88,7 @@ public class DashScopeLlmProvider implements LlmProvider {
     private ChatService chatService;
 
     /**
-     * 模型配额（可空注入，便于单测）。
+     * 模型配额闸门（可空注入，便于单测）。
      *
      * <p><b>为什么配额要放在这里而不是控制器</b>：实测发现配额检查在 {@code ChatController}
      * 里、编排之前 —— 于是"规则路由 + 代码护栏 + 审计 + 处置"这些**不依赖模型**的能力
@@ -76,18 +96,32 @@ public class DashScopeLlmProvider implements LlmProvider {
      * 对安全运营系统这是反的：外部模型不可用不该让整个响应能力瘫痪。
      * 现在配额只拦"真正要调模型"的这一步，上层按既有降级路径处理：
      * Planner → 回退规则路由；ANALYST/FORENSICS → 如实标"未生成"。
+     *
+     * <p>分派逻辑已于 2026-10 收口到 {@link ModelQuotaGate}（DeepSeek 实现复用同一份，
+     * 避免两份 if/else 慢慢不一致 —— 分派写错不会报错，只会把账记到别的池子上）。
      */
     @Autowired(required = false)
-    private org.example.service.ModelQuotaService modelQuotaService;
+    private org.example.llm.ModelQuotaGate modelQuotaGate;
 
     @Override
     public String id() {
-        return "dashscope";
+        return ID;
     }
 
     @Override
     public String modelName() {
         return DashScopeChatModel.DEFAULT_MODEL_NAME;
+    }
+
+    /**
+     * Key 是否已配置（供启动自检打印）。
+     *
+     * <p>与 {@link #available()} 里那段判定同源：占位串 {@code sk-placeholder}
+     * 算"未配置" —— 它是为了"无 Key 也能启动"而存在的占位，不是真凭据。
+     * 只返回布尔值，<b>绝不</b>返回 Key 本身或它的前缀（日志会被长期采集）。
+     */
+    public boolean keyConfigured() {
+        return apiKey != null && !apiKey.isBlank() && !apiKey.contains("placeholder");
     }
 
     @Override
@@ -97,7 +131,7 @@ public class DashScopeLlmProvider implements LlmProvider {
             logger.debug("选中 provider={}，本实现({})不参与", selectedProvider, id());
             return false;
         }
-        if (apiKey == null || apiKey.isBlank() || apiKey.contains("placeholder")) {
+        if (!keyConfigured()) {
             logger.debug("DashScope Key 未配置或为占位，判定不可用");
             return false;
         }
@@ -115,23 +149,10 @@ public class DashScopeLlmProvider implements LlmProvider {
         // "公开端点被刷爆 → 站主自己仍可用"这两件事同时成立。
         // 判定必须在这里（模型出口）而不是控制器入口：只有真正要调模型的这一步才该计数，
         // 而一次提问可能触发多次模型调用（Planner 路由 + 结论生成）。
-        // 分派收口在 ModelQuotaService.tryAcquire(Identity)，不在本类里 if/else ——
+        // 分派收口在 ModelQuotaGate（两个 provider 共用），不在本类里 if/else ——
         // 分派写错不会有任何报错，只会把账记到别的池子上。
-        if (modelQuotaService != null) {
-            org.example.service.ModelQuotaService.Identity identity =
-                    org.example.security.EvalIdentity.isEvalRequest()
-                            ? org.example.service.ModelQuotaService.Identity.EVAL
-                            : (org.example.security.EvalIdentity.isPublicRequest()
-                                    ? org.example.service.ModelQuotaService.Identity.PUBLIC
-                                    : org.example.service.ModelQuotaService.Identity.USER);
-            boolean allowed = modelQuotaService.tryAcquire(identity);
-            if (!allowed) {
-                // 配额用尽只影响"这一步"：抛出后由上层降级（Planner 回退规则、研判标未生成），
-                // 不再像以前那样把整条请求（含护栏/处置）一起拒掉。
-                String label = identity == org.example.service.ModelQuotaService.Identity.EVAL ? "评测"
-                        : (identity == org.example.service.ModelQuotaService.Identity.PUBLIC ? "公开演示（匿名）" : "");
-                throw new IllegalStateException(label + "模型额度已用完（今日）：本次不调用模型，由上层降级处理");
-            }
+        if (modelQuotaGate != null) {
+            modelQuotaGate.checkAndAcquire();
         }
         if (System.currentTimeMillis() < cooldownUntil) {
             // 冷却期内快速失败：不再让调用方各等一遍 15 秒超时

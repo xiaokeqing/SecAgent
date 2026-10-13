@@ -146,6 +146,29 @@ public class PublicAlertSource {
         return m != null && "true".equalsIgnoreCase(String.valueOf(m));
     }
 
+    /**
+     * 近 24 小时来源 IP 分布（<b>进程内使用</b>：聚合器会把它变成只有国家/省份/ASN 的公开载荷）。
+     *
+     * <p>fail-closed 与其余取数一致：数据源不是 REAL、网关抛异常、网关返回 null，
+     * 一律返回 {@code available=false} + 机读 reason，绝不返回"空分布"冒充满足
+     * （空分布会让页面显示"24 小时风平浪静"，而那可能是链路断了）。
+     */
+    public org.example.geoip.GeoWindow geoWindow24h(int topN) {
+        if (!available()) {
+            return org.example.geoip.GeoWindow.unavailable("DATA_SOURCE_UNAVAILABLE",
+                    "告警数据源不是 REAL（当前 " + mode() + "）");
+        }
+        try {
+            org.example.geoip.GeoWindow w = wazuhGateway.geoWindow24h(topN);
+            return w == null
+                    ? org.example.geoip.GeoWindow.unavailable("DATA_SOURCE_UNAVAILABLE", "网关未返回来源分布")
+                    : w;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取 24h 来源分布失败：{}", e.getMessage());
+            return org.example.geoip.GeoWindow.unavailable("QUERY_FAILED", "来源分布查询异常：" + e.getMessage());
+        }
+    }
+
     /** 聚合去重后的告警列表（与自用界面同一套聚合口径，避免两个页面数字对不上） */
     public List<Map<String, Object>> aggregated() {
         return aggregator.aggregate(readAlerts());

@@ -3,6 +3,7 @@ package org.example.publicapi;
 import org.example.security.SensitiveContentScanner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -21,12 +22,19 @@ import java.util.regex.Pattern;
  * 模型回答里可能带出四类绝对不能公开的东西，而且它们都<b>不是模型恶意</b>，
  * 是它"如实复述"了上下文里本来就有的事实：
  * <ol>
- *   <li><b>内网地址</b>：检索片段、告警摘要里都有；掩码到网段、内网段一律写"内部地址"；</li>
- *   <li><b>凭据</b>：文档里贴过的示例 Key、Bearer Token、私钥块 —— 一旦被复述就是公开泄露；</li>
+ *   <li><b>内网地址</b>：检索片段、告警摘要里都有；掩码到网段、内网段一律写"内部地址"；
+ *       <b>2026-10-14 起</b>还多一条：站主拍板公开面可显示真实来源 IP，
+ *       但内网/保留/链路地址在<b>任何</b>口径下都不作为来源地址公开（真实态写「内网/未知」）——
+ *       这条判断只在 {@link PublicIpPolicy} 里做，本类不自己读开关；</li>
+ *   <li><b>凭据</b>：文档里贴过的示例 Key、Bearer Token、私钥块 —— 一旦被复述就是公开泄露；
+ *       蜜罐抓到的<b>完整口令</b>也归这一类（{@code 口令=xxx} 一律打码，与开关无关）；</li>
  *   <li><b>内部路径</b>：{@code F:/7AAA/...}、{@code /opt/secagent/...} 这类绝对路径，
  *       既泄露目录结构，也泄露"这台机器上跑什么"；</li>
  *   <li><b>内部标识</b>：{@code eval-xxx} 审计 actor、{@code UNTRUSTED_DATA} 包裹标记、
- *       "系统提示词"措辞 —— 公开页面不需要暴露内部治理词汇。</li>
+ *       "系统提示词"措辞 —— 公开页面不需要暴露内部治理词汇；</li>
+ *   <li><b>内部资产名</b>（2026-10-14 补，{@link PublicAssetFilter}）：{@code web-01}、
+ *       {@code auth.log}、{@code /api/order/detail} 这类名字会随知识库引用片段直出正文，
+ *       词表从配置读（{@code app.public.asset-blocklist}）。</li>
  * </ol>
  *
  * <h3>为什么"脱敏"必须在这一层做，而不是靠提示词</h3>
@@ -59,7 +67,13 @@ public class PublicOutputGuard {
             Pattern.compile("(?i)\\bLTAI[0-9A-Za-z]{8,}"),
             Pattern.compile("(?i)\\beyJ[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{5,}"),
             Pattern.compile("-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-            Pattern.compile("(?i)\\b(api[_\\-]?key|apikey|access[_\\-]?key[_\\-]?secret|password|passwd|secret)\\b\\s*[:=]\\s*[\"']?[A-Za-z0-9!@#$%^&*_\\-]{8,}")
+            Pattern.compile("(?i)\\b(api[_\\-]?key|apikey|access[_\\-]?key[_\\-]?secret|password|passwd|secret)\\b\\s*[:=]\\s*[\"']?[A-Za-z0-9!@#$%^&*_\\-]{8,}"),
+            // 【2026-10-14 补】中文口令字段：蜜罐规则描述原文形如「用户=root 口令=123456 来源=…」，
+            // 既有那几条规则全都只认英文关键词 + 8 位以上取值，于是「口令=123456」
+            // 两边都不命中 —— 6 位纯数字既不够长、关键词也不是英文。
+            // 而这段文本正是 /api/public/honeypot 的 timeline.detail 与公开问答可能复述的内容。
+            // 「永不公开完整口令」与开关无关，所以这里必须单独收紧（右侧一律打码，不看长度）。
+            Pattern.compile("(?i)(口令|密码)\\s*[:=：]\\s*\\S+")
     };
 
     /**
@@ -111,6 +125,26 @@ public class PublicOutputGuard {
     static final String MARKER_PLACEHOLDER = "[内部标记已脱敏]";
     static final String UPSTREAM_PLACEHOLDER = "[上游错误详情已脱敏]";
 
+    /** 没有 Spring 注入时的保守兜底（掩码态 —— 缺配置时"少给"而不是"多漏"） */
+    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
+
+    /** 没有 Spring 注入时的默认资产词表（"实测泄露过"的那几个名字） */
+    private static final PublicAssetFilter DEFAULT_ASSET_FILTER = PublicAssetFilter.defaults();
+
+    /**
+     * IP 口径的唯一来源（配置 {@code app.public.mask-ips}）。
+     *
+     * <p>{@code required=false}：单测里 {@code new PublicOutputGuard()} 没有容器，
+     * 此时按 {@link #FAIL_CLOSED_POLICY}（掩码）兜底 —— 与改造前行为一致，
+     * 也正是"掩码回归"测试要钉住的那条路径。
+     */
+    @Autowired(required = false)
+    private PublicIpPolicy ipPolicy;
+
+    /** 内部资产名停用词过滤（配置 {@code app.public.asset-blocklist}） */
+    @Autowired(required = false)
+    private PublicAssetFilter assetFilter;
+
     /**
      * 脱敏结果。
      *
@@ -134,8 +168,10 @@ public class PublicOutputGuard {
      *   <li>先做<b>凭据/私钥</b>替换 —— 私钥块可能跨多行，先于其它单行规则处理，避免被拆散；</li>
      *   <li>再做<b>敏感信息扫描</b>（{@link SensitiveContentScanner}，与知识库入库同一把尺子）；</li>
      *   <li>然后<b>路径</b>；</li>
-     *   <li>最后<b>IP 掩码</b>（{@link PublicIpMask#maskAll} 覆盖自由文本里内嵌的 IP）；</li>
+     *   <li>最后<b>IP 口径</b>（{@link PublicIpPolicy#displayText} —— 掩码态全掩、真实态只隐内网）；</li>
      *   <li>内部标记中性化放最后 —— 前面几步插入的占位符不含这些词，不会被误伤。</li>
+     *   <li><b>资产名过滤再放最后</b>：它替换的是词，不改变句子结构，放最后能保证
+     *       前面几步产生的占位符不会被再次改写。</li>
      * </ol>
      */
     public Sanitized sanitize(String raw) {
@@ -179,9 +215,12 @@ public class PublicOutputGuard {
             }
         }
 
-        String masked = PublicIpMask.maskAll(text);
+        PublicIpPolicy policy = policy();
+        String masked = policy.displayText(text);
         if (!masked.equals(text)) {
-            findings.add("ip-masked");
+            // 命中类别随口径不同：掩码态是"掩过码了"，真实态是"把内网/保留地址隐去了"。
+            // 两者都如实报告，页面/排障时能一眼看出当时用的是哪套口径。
+            findings.add(policy.masked() ? "ip-masked" : "ip-internal-hidden");
             text = masked;
         }
 
@@ -201,7 +240,28 @@ public class PublicOutputGuard {
             }
         }
 
+        // 【放最后】内部资产名停用词过滤（web-01 / auth.log / /api/order/detail …）。
+        // 为什么必须有：F5 方案 B 会把命中的知识库片段【直出到回答正文】，
+        // 实测那些 mock 资产名就是顺着引用出到公网页面的 —— 凭据/路径/IP 三条规则都拦不住它们。
+        String scrubbed = assets().scrub(text);
+        if (!scrubbed.equals(text)) {
+            findings.add("internal-asset");
+            text = scrubbed;
+        }
+
         return new Sanitized(text, new ArrayList<>(findings));
+    }
+
+    /** 当前生效的 IP 口径：注入缺失时按掩码兜底（fail-closed） */
+    private PublicIpPolicy policy() {
+        PublicIpPolicy p = ipPolicy;
+        return p != null ? p : FAIL_CLOSED_POLICY;
+    }
+
+    /** 当前生效的资产词表：注入缺失时用默认词表兜底（不能因为"没注入"就不过滤） */
+    private PublicAssetFilter assets() {
+        PublicAssetFilter f = assetFilter;
+        return f != null ? f : DEFAULT_ASSET_FILTER;
     }
 
     /**

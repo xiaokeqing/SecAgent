@@ -38,7 +38,9 @@ import java.util.function.Supplier;
  * <h3>它和自用界面接口的区别（这是本类的全部意义）</h3>
  * <ol>
  *   <li><b>匿名可访问</b>：不要求 Token。因此它只能返回"公开出去也不心疼"的数据 ——
- *       源 IP 掩码到网段、不含内网目的地址与资产名、不含原始日志与完整 payload。</li>
+ *       来源 IP 按 {@code app.public.mask-ips} 口径显示（默认显示观测到的真实地址，
+ *       内网/保留写「内网/未知」）、不含内网目的地址与资产名、不含原始日志与完整 payload；
+ *       <b>蜜罐口令只给结构</b>（"永不公开"清单，与开关无关）。</li>
  *   <li><b>字段白名单，不是黑名单</b>：出参按固定字段逐个挑出来放行。
  *       黑名单的问题是"新增字段默认就泄露"，而白名单是"新增字段默认不出现"。</li>
  *   <li><b>独立限流</b>（见 {@link PublicRateLimiter}）+ <b>应用内缓存</b>
@@ -82,6 +84,80 @@ public class PublicApiController {
     private final Snapshot honeypotCache = new Snapshot();
     private final Snapshot auditCache = new Snapshot();
     private final Snapshot latestCache = new Snapshot();
+
+    // ==================== 公开面口径：IP 开关 + 内部资产名词表 ====================
+    //
+    // 【为什么集中在这里读】站主 2026-10-14 拍板：公开面显示观测到的真实来源 IP。
+    // 但"要不要掩码"一旦在多个端点里各写一遍，就必然出现第三种口径（一个页面真实、
+    // 一个页面掩码），而且【不会报错】。所以两个口径对象都只在本类注入一次，
+    // 由 ship(...) 统一作用到所有公开响应上 —— 将来新增端点（例如 /api/public/geo）
+    // 只要走 ok(...)，就自动获得同一套口径。
+
+    /** IP 显示口径（配置 app.public.mask-ips；缺注入时按掩码兜底） */
+    @Autowired(required = false)
+    private PublicIpPolicy ipPolicy;
+
+    /** 内部资产名停用词过滤（配置 app.public.asset-blocklist） */
+    @Autowired(required = false)
+    private PublicAssetFilter assetFilter;
+
+    /** 没有 Spring 注入时的保守兜底（掩码态）：单测直接 new 控制器时走这条 */
+    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
+
+    /** 没有 Spring 注入时的默认资产词表（不能因为"没注入"就不过滤） */
+    private static final PublicAssetFilter DEFAULT_ASSET_FILTER = PublicAssetFilter.defaults();
+
+    private PublicIpPolicy policy() {
+        PublicIpPolicy p = ipPolicy;
+        return p != null ? p : FAIL_CLOSED_POLICY;
+    }
+
+    private PublicAssetFilter assets() {
+        PublicAssetFilter f = assetFilter;
+        return f != null ? f : DEFAULT_ASSET_FILTER;
+    }
+
+    /**
+     * <b>公开响应出海的唯一闸门</b>：整棵 data 树过一遍内部资产名词表，
+     * 并补上统一口径字段 {@code ipDisclosure}。
+     *
+     * <h3>为什么做成"过整棵树"而不是逐字段手工过滤</h3>
+     * 逐字段过滤的失败模式是"新加了一个字段、忘了加过滤" —— 而它不会报错，
+     * 只会静静地把资产名发出去。整棵树扫一遍则相反：默认就被过滤，漏不掉。
+     * 代价是每次请求多一层拷贝（十几条记录的规模，可忽略）。
+     *
+     * <p>只过滤<b>值</b>，不动<b>键名</b>：键名是公开契约的字段名（改键名等于改接口），
+     * 而资产名只可能出现在值里。
+     */
+    private Map<String, Object> ship(Map<String, Object> data) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (data != null) {
+            data.forEach((k, v) -> out.put(k, scrubDeep(v)));
+        }
+        if (!out.containsKey(PublicIpPolicy.DISCLOSURE_FIELD)) {
+            out.put(PublicIpPolicy.DISCLOSURE_FIELD, policy().disclosure());
+        }
+        return out;
+    }
+
+    private Object scrubDeep(Object v) {
+        if (v instanceof String s) {
+            return assets().scrub(s);
+        }
+        if (v instanceof Map<?, ?> m) {
+            Map<String, Object> out = new LinkedHashMap<>();
+            m.forEach((k, val) -> out.put(String.valueOf(k), scrubDeep(val)));
+            return out;
+        }
+        if (v instanceof List<?> l) {
+            List<Object> out = new ArrayList<>(l.size());
+            for (Object o : l) {
+                out.add(scrubDeep(o));
+            }
+            return out;
+        }
+        return v;
+    }
 
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
     @Autowired
@@ -174,7 +250,8 @@ public class PublicApiController {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("code", 200);
             out.put("message", "success");
-            out.put("data", data);
+            // POST 不走 ok(...)，但口径必须一样：同一个 ship(...)（资产名过滤 + ipDisclosure）
+            out.put("data", ship(data));
             return ResponseEntity.ok(out);
         } catch (Exception e) {
             logger.warn("公开问答失败（已按 fail-closed 处理）：{}", e.getMessage());
@@ -230,9 +307,14 @@ public class PublicApiController {
             data.put("results", results);
             data.put("hitCount", results.size());
             data.put("available", true);
+            // 口径描述随开关而变：掩码态<b>逐字节保留改造前的说法</b>（掩码回归要求），
+            // 真实态如实说明"显示的是观测到的真实来源地址"，不能嘴上还说"已掩码"。
             data.put("note", results.isEmpty()
                     ? "公开知识库未检索到相关片段（未命中就是未命中，不用别的数据顶替）。"
-                    : "片段已截断并脱敏；IP 已掩码，内部路径与凭据不出现在响应里。");
+                    : (policy().masked()
+                            ? "片段已截断并脱敏；IP 已掩码，内部路径与凭据不出现在响应里。"
+                            : "片段已截断并脱敏；IP 显示观测到的真实来源地址（内网/保留地址一律写作「内网/未知」），"
+                                    + "内部路径、凭据与内部资产名不出现在响应里。"));
         } catch (PublicKbService.PublicKbUnavailableException e) {
             // fail-closed：检索不可用就如实说不可用，不回空列表冒充"没有相关内容"
             data.put("results", List.of());
@@ -326,7 +408,12 @@ public class PublicApiController {
         return ok(data, res);
     }
 
-    /** 蜜罐战报：连接/登录计数、账号口令 Top、来源分布（掩码）、事件时间线。 */
+    /**
+     * 蜜罐战报：连接/登录计数、账号口令 Top（<b>只给结构</b>）、来源分布、事件时间线。
+     *
+     * <p>来源 IP 按 {@code app.public.mask-ips} 口径显示（默认真实地址，内网/保留写「内网/未知」）；
+     * 口令在任何口径下都只给长度/字符类/弱口令标记，永不给出原文。
+     */
     @GetMapping("/honeypot")
     public ResponseEntity<Map<String, Object>> honeypot(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
@@ -335,7 +422,7 @@ public class PublicApiController {
         return ok(honeypotCache.get(cacheSeconds, this::buildHoneypot), res);
     }
 
-    /** 处置审计（只读）：封禁记录 + 审计流水，IP 全部掩码，不含原始 detail。 */
+    /** 处置审计（只读）：封禁记录 + 审计流水，IP 按开关口径显示，不含原始 detail。 */
     @GetMapping("/audit")
     public ResponseEntity<Map<String, Object>> audit(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
@@ -376,6 +463,183 @@ public class PublicApiController {
         return ok(latestCache.get(cacheSeconds, this::buildLatest), res);
     }
 
+    // ==================== 地理分布（离线库；设计见 docs/design-geo-endpoint.md，运维见 RUNBOOK §26） ====================
+
+    /** 地理分布端点自己的快照（与 /alerts 分开：它的取数是一次独立的 indexer 聚合查询） */
+    private final Snapshot geoCache = new Snapshot();
+
+    /**
+     * 离线地理库（<b>可为空</b>：裁剪过的部署 / 单测直接 new 控制器时就是 null）。
+     * 空 → 端点按 {@code GEO_DB_MISSING} 如实降级，绝不假装"没有攻击"。
+     */
+    @Autowired(required = false)
+    private org.example.geoip.GeoIpService geoIpService;
+
+    /** 入榜门槛：少于这么多次的攻击不入榜（防"1 次探测就上公网地图"） */
+    @Value("${app.public-api.geo.min-count:3}")
+    private int geoMinCount;
+
+    /** 占比门槛（%）：与条数门槛<b>同时</b>满足才入榜（防大窗口里的长尾噪声占满榜单） */
+    @Value("${app.public-api.geo.min-share-percent:1.0}")
+    private double geoMinSharePercent;
+
+    /** 每个来源字段取多少个 IP 做聚合（terms size）；超出的长尾由 coverage 如实披露 */
+    @Value("${app.public-api.geo.top-ips:1000}")
+    private int geoTopIps;
+
+    @Value("${app.public-api.geo.top-countries:20}")
+    private int geoTopCountries;
+
+    @Value("${app.public-api.geo.top-provinces:10}")
+    private int geoTopProvinces;
+
+    @Value("${app.public-api.geo.top-asns:10}")
+    private int geoTopAsns;
+
+    /**
+     * 我方自己的公网出口 IP（逗号分隔）。
+     *
+     * <p>为什么必须有：实测 24 小时 {@code data.srcip} 里排第二的是 srv2 自己的公网 IP（180 条）、
+     * 第三名是 srv1（15 条）—— 不排掉，"攻击来源 TOP"里会出现我们自己的服务器。
+     * 默认空：<b>服务器真实 IP 不进仓库</b>，由部署时的 {@code APP_GEOIP_SELF_IPS} 注入。
+     */
+    @Value("${app.geoip.self-ips:}")
+    private String geoSelfIps;
+
+    /**
+     * 攻击来源地理分布（<b>只聚合</b>）：国家 + 省份 + ASN + 时间桶，供博客大屏画"攻击来源分布"。
+     *
+     * <h3>三条红线（都写进了测试）</h3>
+     * <ol>
+     *   <li><b>不含任何 IP</b>：连掩码 IP 都不给。入参里必须有 IP（聚合要用），出参里一个都不许有 ——
+     *       "某个 IP 被打了几次"本身就是情报；能公开的只有"哪个国家/省份被打了几次"。</li>
+     *   <li><b>不含单条告警</b>：没有标题、没有规则名、没有逐条时间线、没有内网资产与目的地址。</li>
+     *   <li><b>库不可用就说不可用</b>：{@code available=false} + 机读 {@code reason}
+     *       （{@code GEO_DB_MISSING} / {@code GEO_DB_UNUSABLE} / {@code GEO_DB_LOADING} /
+     *       {@code GEO_DISABLED}）+ 人读 {@code note}；<b>不返回空分布</b> ——
+     *       "地理库没装好"和"这段时间没有攻击"必须能被区分开。</li>
+     * </ol>
+     *
+     * <p>分母诚实披露（站主 2026-10-13 明确要求）：实测 24 小时有 11 万条告警，
+     * 但只有约 700 条带来源 IP 字段（{@code data.srcip} / {@code data.src_ip} 两种形状都查）。
+     * 所以响应里同时给 {@code totalAlerts / withSourceIp / geocoded / excludedInternal}，
+     * 页面必须写"有来源 IP 的 N 条 / 总 M 条"，<b>不许把 700 条画成全量分布</b>。
+     *
+     * <p>复用既有公开端点外壳（同一个限流器 20 次/分钟、同一个 CORS 白名单、同一个 ETag 过滤器、
+     * 同一个 15 秒 {@link Snapshot}、同一个 {@code ok(...)} 信封，因此也自动获得
+     * {@code ship(...)} 的资产名过滤与 {@code ipDisclosure} 口径），不新增任何公开面机制。
+     *
+     * <p>署名：DB-IP Lite 是 CC BY 4.0，<b>必须在输出上署名</b> ——
+     * 所以 {@code note} 与 {@code geoAttribution} 两处都带
+     * {@link org.example.geoip.GeoIpService#ATTRIBUTION}。
+     */
+    @GetMapping("/geo")
+    public ResponseEntity<Map<String, Object>> geo(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(geoCache.get(cacheSeconds, this::buildGeo), res);
+    }
+
+    private Map<String, Object> buildGeo() {
+        org.example.geoip.GeoIpService svc = geoIpService;
+        if (svc == null) {
+            // 没有地理库 Bean（例如裁剪过的部署）：与"库缺失"同一口径，不假装有数据
+            return buildGeoUnavailable("GEO_DB_MISSING",
+                    "地理富化未装配（没有 GeoIpService）：本端点不返回任何分布，也不以 0 冒充'没有攻击'。",
+                    cacheSeconds, generatedAt());
+        }
+        if (!svc.ready()) {
+            return buildGeoUnavailable(svc.reason(), geoUnavailableNote(svc), cacheSeconds, generatedAt());
+        }
+        return buildGeo(svc, source.geoWindow24h(geoTopIps), geoThresholds(), cacheSeconds,
+                generatedAt(), geoSelfIps);
+    }
+
+    private static String geoUnavailableNote(org.example.geoip.GeoIpService svc) {
+        return switch (svc.state()) {
+            case DISABLED -> "地理富化已在配置中关闭（app.geoip.enabled=false）：不返回分布，也不以内置样本顶替。";
+            case MISSING -> "离线地理库不存在（app.geoip.city-db 指向的文件/目录里没有 dbip-city-lite-*.csv.gz）："
+                    + "请先跑 scripts/srv1-geoip-update.sh 落地 DB-IP Lite 库；本端点不返回任何数字。";
+            case LOADING -> "离线地理库正在后台装载：稍后重试即可（这不是'没有攻击'）。";
+            default -> "离线地理库读取失败（不是 gzip / 被截断 / 坏行超阈值 / 区间乱序）："
+                    + "请按 RUNBOOK §26 回滚到上一份库文件；本次不返回任何分布。";
+        };
+    }
+
+    private org.example.geoip.GeoAggregator.Thresholds geoThresholds() {
+        return new org.example.geoip.GeoAggregator.Thresholds(
+                Math.max(1, geoMinCount), Math.max(0d, geoMinSharePercent),
+                Math.max(1, geoTopCountries), Math.max(1, geoTopProvinces), Math.max(1, geoTopAsns));
+    }
+
+    /** 不可用载荷（纯函数：字段名与可用载荷对齐，前端只判 {@code available} 一个开关） */
+    static Map<String, Object> buildGeoUnavailable(String reason, String note, int cacheSeconds, String now) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", now);
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("available", false);
+        data.put("reason", reason);
+        data.put("geoSource", null);
+        data.put("geoAttribution", org.example.geoip.GeoIpService.ATTRIBUTION);
+        data.put("window", "24h");
+        data.put("coverage", org.example.geoip.GeoAggregator.emptyCoverage());
+        data.put("byCountry", List.of());
+        data.put("byProvinceCN", List.of());
+        data.put("byAsnTop", List.of());
+        data.put("trend", List.of());
+        data.put("note", note + " " + org.example.geoip.GeoIpService.ATTRIBUTION);
+        return data;
+    }
+
+    /**
+     * 可用性判定 + 聚合（<b>纯函数</b>：除入参外不读任何状态）。
+     *
+     * <p>抽成 static 是为了能被单测直接喂各种组合（库不可用 / 数据源不可用 / 窗口为空 / 正常聚合），
+     * 而不用起 Spring 上下文 —— 这些分支在真环境里几乎不可能同时复现。
+     */
+    static Map<String, Object> buildGeo(org.example.geoip.GeoIpService geo,
+                                        org.example.geoip.GeoWindow window,
+                                        org.example.geoip.GeoAggregator.Thresholds thresholds,
+                                        int cacheSeconds, String now, String selfIps) {
+        if (window == null || !window.available()) {
+            String reason = window == null ? "DATA_SOURCE_UNAVAILABLE" : window.reason();
+            String note = "DATA_SOURCE_UNAVAILABLE".equals(reason)
+                    ? "告警数据源不可达（或未拿到真实数据）：本次不展示任何地理分布，也不以内置样本顶替。"
+                    : reason + "；" + (window == null || window.note() == null ? "" : window.note());
+            return buildGeoUnavailable(reason, note, cacheSeconds, now);
+        }
+        Map<String, Object> data = org.example.geoip.GeoAggregator.aggregate(
+                new org.example.geoip.GeoAggregator.Inputs(
+                        window.ipCounts(), window.alertsTotal24h(), window.alertsWithSourceIp24h(),
+                        window.bucketsTruncated(), window.trend(), parseSelfIps(selfIps)),
+                geo, thresholds, now);
+        data.put("cacheSeconds", cacheSeconds);
+        if (window.ipCounts().isEmpty()) {
+            // 数据源可用但窗口内没有任何带来源 IP 的告警：仍然 available=true（不是故障），
+            // 但必须把这句话写进 note —— 否则读者会把"地图上什么都没有"读成"全量分布为空"
+            data.put("reason", "NO_DATA_IN_WINDOW");
+            data.put("note", "数据源可用，但最近 24 小时没有任何带来源 IP 的告警（不是故障）。"
+                    + org.example.geoip.GeoIpService.ATTRIBUTION);
+        }
+        return data;
+    }
+
+    /** 我方公网 IP 配置 → 集合（去空白、丢空项） */
+    static java.util.Set<String> parseSelfIps(String csv) {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        if (csv == null) {
+            return out;
+        }
+        for (String s : csv.split(",")) {
+            String v = s.trim();
+            if (!v.isEmpty()) {
+                out.add(v);
+            }
+        }
+        return out;
+    }
+
     // ==================== 载荷组装 ====================
 
     private Map<String, Object> buildHoneypot() {
@@ -388,7 +652,10 @@ public class PublicApiController {
         data.put("available", available);
         data.put("commandsAvailable", Boolean.TRUE.equals(raw.get("commandsAvailable")));
         data.put("note", available
-                ? "IP 已掩码到网段；命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）"
+                ? (policy().masked()
+                        ? "IP 已掩码到网段；命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）"
+                        : "IP 显示观测到的真实来源地址（内网/保留地址一律写作「内网/未知」）；"
+                                + "口令只给结构，命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）")
                 : "蜜罐数据源不可达，本页不展示任何蜜罐数据");
 
         if (available) {
@@ -397,11 +664,16 @@ public class PublicApiController {
             data.put("logins", raw.get("logins"));
             data.put("loginFails", raw.get("loginFails"));
             data.put("sampled", raw.get("sampled"));
-            // 账号口令 Top 原样保留（那是攻击者试的弱口令，是战报的核心信息）
-            data.put("topCredentials", raw.get("topCredentials"));
-            data.put("topSources", maskKeys(raw.get("topSources")));
+            // 【2026-10-14 修】账号口令 Top 不再原样透出。
+            // 改造前的注释写着"那是攻击者试的弱口令，是战报的核心信息"——来源里确实是这么想的，
+            // 但原样输出的是【完整口令】（键的形状是 "root / 123456"），而站主的硬约束是
+            // 蜜罐抓到的完整口令/凭据永不上公网（与投诉无关，是硬伤害）。
+            // 现在只出结构：用户名 + 长度 + 字符类 + 弱口令标记；key 仍是同一个键，
+            // 值改成结构摘要（"root / 6 位·小写字母+数字·弱口令"），页面无需为"口令列"改结构。
+            data.put("topCredentials", credentialShapes(raw.get("topCredentials")));
+            data.put("topSources", topSourcesForPublic(raw.get("topSources"), policy()));
             data.put("topClients", raw.get("topClients"));
-            data.put("timeline", maskTimeline(raw.get("timeline")));
+            data.put("timeline", timelineForPublic(raw.get("timeline"), policy()));
         }
         return data;
     }
@@ -413,7 +685,7 @@ public class PublicApiController {
         data.put("readOnly", true);
         data.put("summary", auditReader.summary());
         data.put("blocks", auditReader.blocks(20));
-        data.put("actions", maskActionText(auditReader.actions(30)));
+        data.put("actions", actionTextForPublic(auditReader.actions(30), policy()));
         return data;
     }
 
@@ -424,7 +696,8 @@ public class PublicApiController {
         boolean available = source.realData() && !alerts.isEmpty();
 
         List<Map<String, Object>> blocks = auditReader == null ? List.of() : auditReader.blocks(1);
-        return buildLatest(alerts, available, mode, source.windowSize(), cacheSeconds, generatedAt(), blocks);
+        return buildLatest(alerts, available, mode, source.windowSize(), cacheSeconds, generatedAt(),
+                blocks, policy());
     }
 
     private String generatedAt() {
@@ -440,9 +713,10 @@ public class PublicApiController {
      *
      * <h3>字段白名单（不加字段是纪律，不是偷懒）</h3>
      * 出参只有：生成时间、缓存秒数、可用性与原因、窗口大小与条数、等级分布、
-     * 来源分布（已掩码）、最近一条事件的<b>时间/等级/类型/来源网段</b>、最近一次封禁的
-     * <b>时间/网段/动作</b>。刻意<b>不含</b>：标题、规则名、内网目的地址与资产名、
-     * 聚合 id 与成员 id、原始日志、reason 正文（可能含内网信息）。
+     * 来源分布（已按口径处理）、最近一条事件的<b>时间/等级/类型/来源地址</b>、最近一次封禁的
+     * <b>时间/地址/动作</b>，以及统一口径字段 {@code ipDisclosure}。
+     * 刻意<b>不含</b>：标题、规则名、内网目的地址与资产名、聚合 id 与成员 id、原始日志、
+     * reason 正文（可能含内网信息）。
      *
      * @param alerts       已经过 fail-closed 过滤的真实告警（内置样本已在数据源侧剔除）
      * @param available    数据源是否真的拿到了真实数据
@@ -450,11 +724,27 @@ public class PublicApiController {
      * @param windowSize   取数窗口大小（口径说明用）
      * @param cacheSeconds 应用内快照 TTL，同时作为 Cache-Control 的 max-age
      * @param generatedAt  本次载荷生成时间
-     * @param latestBlocks 最近一次封禁记录（已掩码；可为空）
+     * @param latestBlocks 最近一次封禁记录（已按口径处理；可为空）
      */
     static Map<String, Object> buildLatest(List<SecurityAlert> alerts, boolean available, String mode,
                                            int windowSize, int cacheSeconds, String generatedAt,
                                            List<Map<String, Object>> latestBlocks) {
+        // 【保留这个 7 参重载】它等价于"掩码态"，也就是改造前的口径：
+        // 既有的载荷口径测试（PublicApiLatestTest）用的就是它，因此它们
+        // 一字不改仍然是"掩码回归"的证据。生产链路走下面带 policy 的重载。
+        return buildLatest(alerts, available, mode, windowSize, cacheSeconds, generatedAt,
+                latestBlocks, PublicIpPolicy.masking());
+    }
+
+    /**
+     * {@link #buildLatest(List, boolean, String, int, int, String, List)} 的口径显式版本。
+     *
+     * @param policy IP 显示口径（唯一来源：{@code app.public.mask-ips}）
+     */
+    static Map<String, Object> buildLatest(List<SecurityAlert> alerts, boolean available, String mode,
+                                           int windowSize, int cacheSeconds, String generatedAt,
+                                           List<Map<String, Object>> latestBlocks, PublicIpPolicy policy) {
+        PublicIpPolicy p = policy == null ? PublicIpPolicy.masking() : policy;
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("generatedAt", generatedAt);
         data.put("cacheSeconds", cacheSeconds);
@@ -478,7 +768,10 @@ public class PublicApiController {
         }
 
         data.put("reason", "OK");
-        data.put("note", "字段全部来自公开白名单：来源 IP 已掩码到网段，不含标题/内网目的地址/聚合 id");
+        data.put("note", p.masked()
+                ? "字段全部来自公开白名单：来源 IP 已掩码到网段，不含标题/内网目的地址/聚合 id"
+                : "字段全部来自公开白名单：来源 IP 显示观测到的真实地址（内网/保留地址写作「内网/未知」），"
+                        + "不含标题/内网目的地址/聚合 id");
 
         data.put("severityCounts", severityCounts(alerts));
         data.put("sourceCounts", sourceCounts(alerts));
@@ -489,7 +782,7 @@ public class PublicApiController {
         putEnum(ev, "severity", newest == null ? null : newest.getSeverity());
         putEnum(ev, "type", newest == null ? null : newest.getType());
         putEnum(ev, "source", newest == null ? null : newest.getSource());
-        ev.put("srcIp", PublicIpMask.mask(newest == null ? null : newest.getSrcIp()));
+        ev.put("srcIp", p.display(newest == null ? null : newest.getSrcIp()));
         data.put("latestEvent", ev);
         data.put("latestBlock", latestBlocks == null || latestBlocks.isEmpty() ? null : latestBlocks.get(0));
         return data;
@@ -541,25 +834,57 @@ public class PublicApiController {
         return m;
     }
 
-    /** 审计流水的文本字段（reason）也过一遍 IP 掩码 —— 文本里可能内嵌 IP */
-    private static List<Map<String, Object>> maskActionText(List<Map<String, Object>> in) {
+    /** 审计流水的文本字段（reason）也过一遍 IP 口径与口令隐藏 —— 文本里可能内嵌 IP / 口令 */
+    private static List<Map<String, Object>> actionTextForPublic(List<Map<String, Object>> in,
+                                                                 PublicIpPolicy policy) {
         for (Map<String, Object> m : in) {
             Object reason = m.get("reason");
             if (reason != null) {
-                m.put("reason", PublicIpMask.maskAll(String.valueOf(reason)));
+                // 先隐口令（与 IP 口径无关的硬约束），再按开关处理 IP
+                m.put("reason", policy.displayText(CredentialStructure.hidePasswords(String.valueOf(reason))));
             }
         }
         return in;
     }
 
-    /** 把 [{key,count}] 里的 key 当 IP 掩码 */
-    private static List<Map<String, Object>> maskKeys(Object v) {
+    /**
+     * 账号口令 Top → <b>只给结构</b>（"永不公开完整口令"的执行点）。
+     *
+     * <p>输入形状：{@code [{key:"root / 123456", count:3113}]}（{@code key} 里含完整口令）。
+     * 输出形状：{@code [{key:"root / 6 位·小写字母+数字·弱口令", count:3113,
+     * username:"root", passwordLength:6, passwordCharClasses:"小写字母+数字", weakPassword:true}]}。
+     * {@code key} / {@code count} 两个既有字段都保留（契约"只许新增字段"），
+     * 新增的四个字段让页面能自己组装结构说明。口令原文字符<b>一个都不出现</b>。
+     */
+    static List<Map<String, Object>> credentialShapes(Object v) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (v instanceof List<?> l) {
+            for (Object o : l) {
+                if (o instanceof Map<?, ?> m) {
+                    Map<String, Object> x = CredentialStructure.describe(
+                            m.get("key") == null ? null : String.valueOf(m.get("key")));
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("key", x.get("key"));
+                    entry.put("count", m.get("count"));
+                    entry.put("username", x.get("username"));
+                    entry.put("passwordLength", x.get("passwordLength"));
+                    entry.put("passwordCharClasses", x.get("passwordCharClasses"));
+                    entry.put("weakPassword", x.get("weakPassword"));
+                    out.add(entry);
+                }
+            }
+        }
+        return out;
+    }
+
+    /** 把 [{key,count}] 里的 key 当来源 IP 处理（口径由 {@link PublicIpPolicy} 决定） */
+    private static List<Map<String, Object>> topSourcesForPublic(Object v, PublicIpPolicy policy) {
         List<Map<String, Object>> out = new ArrayList<>();
         if (v instanceof List<?> l) {
             for (Object o : l) {
                 if (o instanceof Map<?, ?> m) {
                     Map<String, Object> x = new LinkedHashMap<>();
-                    x.put("key", PublicIpMask.mask(m.get("key") == null ? null : String.valueOf(m.get("key"))));
+                    x.put("key", policy.display(m.get("key") == null ? null : String.valueOf(m.get("key"))));
                     x.put("count", m.get("count"));
                     out.add(x);
                 }
@@ -568,8 +893,15 @@ public class PublicApiController {
         return out;
     }
 
-    /** 时间线里的源 IP 掩码 */
-    private static List<Map<String, Object>> maskTimeline(Object v) {
+    /**
+     * 时间线 → 来源 IP + detail 文本（口径由 {@link PublicIpPolicy} 决定）。
+     *
+     * <p><b>2026-10-14 修</b>：{@code detail} 是蜜罐规则的<b>描述原文</b>，形状是
+     * {@code 蜜罐: 攻击者"登录成功" 用户=root 口令=123456 来源=106.37.205.248}。
+     * 改造前这里只对 IP 做掩码，<b>完整口令就这样随 timeline 出过公网</b>。
+     * 现在先整段隐口令（与开关无关），再按口径处理 IP。
+     */
+    private static List<Map<String, Object>> timelineForPublic(Object v, PublicIpPolicy policy) {
         List<Map<String, Object>> out = new ArrayList<>();
         if (v instanceof List<?> l) {
             for (Object o : l) {
@@ -577,10 +909,11 @@ public class PublicApiController {
                     Map<String, Object> x = new LinkedHashMap<>();
                     x.put("time", m.get("time"));
                     x.put("kind", m.get("kind"));
-                    x.put("srcIp", PublicIpMask.mask(m.get("srcIp") == null ? null : String.valueOf(m.get("srcIp"))));
-                    // detail 是规则描述原文，里面内嵌了完整 IP —— 必须过一遍文本掩码，
-                    // 否则前面结构化字段掩得再干净，这里照样漏（实测漏过一次）
-                    x.put("detail", PublicIpMask.maskAll(m.get("detail") == null ? null : String.valueOf(m.get("detail"))));
+                    x.put("srcIp", policy.display(m.get("srcIp") == null ? null : String.valueOf(m.get("srcIp"))));
+                    // detail 是规则描述原文，里面内嵌了完整 IP 与完整口令 —— 两者都必须处理，
+                    // 否则前面结构化字段处理得再干净，这里照样漏（实测漏过一次）
+                    x.put("detail", policy.displayText(CredentialStructure.hidePasswords(
+                            m.get("detail") == null ? null : String.valueOf(m.get("detail")))));
                     out.add(x);
                 }
             }
@@ -705,8 +1038,13 @@ public class PublicApiController {
         m.put("endTime", src.get("endTime"));
         m.put("title", src.get("title"));
         m.put("ruleName", src.get("ruleName"));
-        m.put("srcIp", PublicIpMask.mask(asString(src.get("srcIp"))));
-        m.put("srcGeo", src.get("srcGeo"));
+        m.put("srcIp", policy().display(asString(src.get("srcIp"))));
+        // 公开面【刻意】恒为 null：srcGeo 的内部形状是「国家|省|城市|ASN|机构」（GeoIpInfo.describe()），
+        // 逐条输出它等于把"某个攻击者属于哪个机构"搬上公网页面；公开面的地理口径只有聚合
+        // （GET /api/public/geo，见 docs/design-geo-endpoint.md）。
+        // 键名保留、值保持空 —— 这正是本轮改造前它对真实告警的取值（内置样本不进公开面），
+        // 所以不是语义变更，而是"不让新富化的数据从这条缝里漏出去"。测试：PublicApiGeoLeakTest。
+        m.put("srcGeo", null);
         m.put("occurredAt", src.get("occurredAt"));
         m.put("status", src.get("status"));
         m.put("hitCount", src.get("hitCount"));
@@ -722,8 +1060,9 @@ public class PublicApiController {
         m.put("id", a.getId());
         m.put("title", a.getTitle());
         m.put("ruleName", a.getRuleName());
-        m.put("srcIp", PublicIpMask.mask(a.getSrcIp()));
-        m.put("srcGeo", a.getSrcGeo());
+        m.put("srcIp", policy().display(a.getSrcIp()));
+        // 同 publicAggregate：srcGeo 只在内网面可见，公开面恒为 null（口径见上）
+        m.put("srcGeo", null);
         m.put("occurredAt", a.getOccurredAt());
         m.put("status", a.getStatus());
         m.put("hitCount", a.getCount());
@@ -870,7 +1209,8 @@ public class PublicApiController {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("code", 200);
         body.put("message", "success");
-        body.put("data", data);
+        // 所有公开 GET 端点的共同出口：资产名过滤 + 统一 ipDisclosure（口径只有一个来源）
+        body.put("data", ship(data));
         return ResponseEntity.ok(body);
     }
 

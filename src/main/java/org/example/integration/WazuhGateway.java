@@ -56,6 +56,24 @@ public interface WazuhGateway {
     Map<String, Object> honeypotSummary(int size);
 
     /**
+     * 近 24 小时<b>来源 IP 分布</b>：{@code IP → 告警条数}（indexer 侧 terms 聚合，非抽样）
+     * + 带来源 IP 的告警按小时分桶 + 窗口总量。
+     *
+     * <h3>为什么不复用 {@link #recentAlerts(int)}</h3>
+     * {@code recentAlerts} 取的是"最近 N 条"，会被低危噪声刷屏，也可能只覆盖几分钟；
+     * 而"攻击来源分布"要的是整 24 小时窗口，且不该把原始日志（含 payload 与内网目的地址）
+     * 搬进应用进程 —— 让 indexer 只回聚合结果，字节数从 MB 级降到 KB 级。
+     * 口径与代价（TOP N 之外的长尾被截断）由 {@link GeoWindow#bucketsTruncated()} 如实暴露。
+     *
+     * <p>默认实现返回"不可用"：这样接口新增方法不会让既有替身/其它实现静默变成"空分布"。
+     *
+     * @param topN 每个来源字段取多少个 IP（上限 5000）
+     */
+    default org.example.geoip.GeoWindow geoWindow24h(int topN) {
+        return org.example.geoip.GeoWindow.unavailable("DATA_SOURCE_UNAVAILABLE");
+    }
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）

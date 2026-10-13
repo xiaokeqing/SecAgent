@@ -61,6 +61,29 @@ secrets/
 # ---------- 内部资料：不公开 ----------
 docs/internal/
 
+# ---------- 离线地理库（DB-IP Lite，CC BY 4.0）：绝不进仓库 ----------
+# 为什么绝不入库：
+#   · 体积：City 库 gz 包 80MB+、解压后 300MB+，进一次仓库就永久留在历史里；
+#   · 许可：CC BY 4.0 允许再分发，但再分发方要负责署名与版本说明 ——
+#     把"数据"当"代码"发出去，等于把署名义务散播到每一个 clone；
+#   · 时效：它是按月更新的数据，仓库里那份三个月后就是错的，而没人会去更新它。
+# 只入库存放/校验/更新脚本（scripts/srv1-geoip-update.sh），库文件落在服务器
+# /opt/secagent/geoip（600/700，属主 999:999），只读挂载给容器。
+# ⚠️ 路径必须【锚定到仓库根】，不能写成裸 `geoip/`：
+#    裸目录名会匹配任意层级的同名目录 —— 包括 src/main/java/org/example/geoip/
+#    （那里是地理富化的源码），于是整个包被静默排除、commit 里什么都没有。
+/geoip/
+/data/geoip/
+/uploads/geoip/
+**/geoip/*.csv
+**/geoip/*.csv.gz
+dbip-*.csv
+dbip-*.csv.gz
+dbip-*.mmdb
+GeoLite2-*.mmdb
+GeoLite2-*.csv
+*.mmdb
+
 # ---------- 临时脚本 ----------
 # 默认忽略随手写的临时脚本，但保留 PoC 与部署脚本
 *.sh

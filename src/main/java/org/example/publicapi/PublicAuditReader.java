@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -26,10 +27,12 @@ import java.util.Map;
  * 审计留痕本身就是两个 JSON 文件（{@code blocked-ips.json} / {@code response-audit.json}），
  * 这里只做<b>读取 + 脱敏 + 隔离</b>，不写、不改、不删：
  * <ul>
- *   <li>IP 一律掩码到网段（{@link PublicIpMask}）；</li>
+ *   <li>IP 一律走 {@link PublicIpPolicy} 口径（{@code app.public.mask-ips}：默认显示观测到的
+ *       真实地址，内网/保留写「内网/未知」；开关为 true 时与改造前的掩码口径逐字节一致）；</li>
  *   <li>只输出白名单字段（操作者、动作、结果、时间、审计 ID），
  *       不返回 detail 里的原始文本（可能含内网信息）；</li>
- *   <li><b>评测流量（actor 以 {@code eval-} 开头）一律丢弃</b> —— 公网端点是"真实使用"的展示面，
+ *   <li>reason 文本里的口令一律隐去（{@link CredentialStructure#hidePasswords}，与开关无关）；
+ *       <b>评测流量（actor 以 {@code eval-} 开头）一律丢弃</b> —— 公网端点是"真实使用"的展示面，
  *       评测记录混进来会让封禁/处置计数凭空上涨（而实际什么都没封）。</li>
  * </ul>
  */
@@ -39,10 +42,25 @@ public class PublicAuditReader {
     private static final Logger logger = LoggerFactory.getLogger(PublicAuditReader.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** 没有 Spring 注入时的保守兜底（掩码态）：与改造前行为一致 */
+    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
+
+    /**
+     * IP 口径（唯一来源）。{@code required=false}：单测里 {@code new PublicAuditReader()}
+     * 没有容器，此时按掩码兜底 —— 也正因如此，"掩码回归"测试不需要任何改动。
+     */
+    @Autowired(required = false)
+    private PublicIpPolicy ipPolicy;
+
     @Value("${app.public-api.data-dir:/app/data}")
     private String dataDir;
 
-    /** 封禁记录（最近若干条，已掩码；评测记录已丢弃） */
+    private PublicIpPolicy policy() {
+        PublicIpPolicy p = ipPolicy;
+        return p != null ? p : FAIL_CLOSED_POLICY;
+    }
+
+    /** 封禁记录（最近若干条，已按口径处理；评测记录已丢弃） */
     public List<Map<String, Object>> blocks(int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (JsonNode n : readArray("blocked-ips.json")) {
@@ -51,7 +69,7 @@ public class PublicAuditReader {
             }
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id", text(n, "id"));
-            m.put("ip", PublicIpMask.mask(text(n, "ip")));
+            m.put("ip", policy().display(text(n, "ip")));
             m.put("durationMinutes", n.path("durationMinutes").asInt(0));
             m.put("source", text(n, "source"));
             m.put("actor", text(n, "actor"));
@@ -68,7 +86,7 @@ public class PublicAuditReader {
         return out.size() > limit ? out.subList(0, Math.max(1, limit)) : out;
     }
 
-    /** 处置审计流水（最近若干条，已掩码；评测记录已丢弃） */
+    /** 处置审计流水（最近若干条，已按口径处理；评测记录已丢弃） */
     public List<Map<String, Object>> actions(int limit) {
         List<Map<String, Object>> out = new ArrayList<>();
         for (JsonNode n : readArray("response-audit.json")) {
@@ -80,8 +98,8 @@ public class PublicAuditReader {
             m.put("time", text(n, "time"));
             m.put("actor", text(n, "actor"));
             m.put("action", text(n, "action"));
-            m.put("target", PublicIpMask.mask(text(n, "target")));
-            m.put("reason", text(n, "reason"));
+            m.put("target", policy().display(text(n, "target")));
+            m.put("reason", CredentialStructure.hidePasswords(text(n, "reason")));
             m.put("riskLevel", text(n, "riskLevel"));
             m.put("mode", text(n, "mode"));
             m.put("success", n.path("success").asBoolean(false));
@@ -117,7 +135,9 @@ public class PublicAuditReader {
         m.put("blockActive", active);
         m.put("blockedByGuard", blockedByGuard);
         m.put("executedActions", executed);
-        m.put("note", "数据来自处置审计留痕文件；IP 已掩码，不含原始 detail");
+        m.put("note", policy().masked()
+                ? "数据来自处置审计留痕文件；IP 已掩码，不含原始 detail"
+                : "数据来自处置审计留痕文件；IP 显示观测到的真实地址（内网/保留写作「内网/未知」），不含原始 detail");
         return m;
     }
 

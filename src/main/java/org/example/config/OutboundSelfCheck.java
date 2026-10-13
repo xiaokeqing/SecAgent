@@ -65,6 +65,26 @@ public class OutboundSelfCheck {
     private final SshBlockExecutor sshExecutor;
     private final WazuhService wazuhService;
 
+    /**
+     * DeepSeek 对话链路的超时配置（可空注入）。
+     *
+     * <p>它参与的是<b>手写 OkHttp</b> 那条出站（{@code POST /v1/chat/completions}），
+     * 与 DashScope 的 SDK 路径是两条独立的依赖、两个独立的冷却键。
+     * 可空注入是为了让"只关心出站超时矩阵"的既有单测不必连它一起构造；
+     * 缺失时自检如实写 MISSING（与通知/webhook 那条同一处理方式）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private DeepSeekConfig deepSeekConfig;
+
+    /**
+     * DeepSeek 对话实现（可空注入）。
+     *
+     * <p>只用来问一句"Key 配了吗、依赖键是哪个"—— 自检打印的值取自真正参与调用的对象，
+     * 而不是再读一遍配置（后者在"配置改了但 Bean 没拿到"时会打印骗人的值）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.example.llm.DeepSeekLlmProvider deepSeekLlmProvider;
+
     @Value("${vector.store:memory}")
     private String vectorStore;
 
@@ -136,6 +156,26 @@ public class OutboundSelfCheck {
                 dashScopeConfig == null ? MISSING : dashScopeConfig.getEffectiveCallTimeoutMs() + "ms",
                 chatCircuit,
                 "spring.ai.dashscope.chat.options.* → DashScopeConfig 的 OkHttp"));
+
+        // ---- 1b) LLM chat（DeepSeek，手写 OkHttp 走 OpenAI 兼容端点）----
+        //
+        // 这一行必须单独存在，哪怕当前没选中 DeepSeek：出站"有几个冷却键"是运维要在
+        // 事后核对的事实（"一个供应商故障会不会误伤另一个"取决于此），
+        // 而且 app.llm.provider 是随时可切的 —— 切过去那一刻才发现自检没覆盖就太晚了。
+        OutboundTimeouts deepSeekTimeouts = (deepSeekConfig != null)
+                ? deepSeekConfig.toOutboundTimeouts() : timeouts;
+        String deepSeekDep = (deepSeekLlmProvider != null)
+                ? deepSeekLlmProvider.depKey() : org.example.llm.DeepSeekLlmProvider.DEP_CHAT;
+        String deepSeekKey = (deepSeekLlmProvider == null)
+                ? MISSING + "(DeepSeek provider 未接入)"
+                : (deepSeekLlmProvider.keyConfigured() ? "SET" : MISSING + "(DEEPSEEK_API_KEY 未配置)");
+        rows.add(new Dependency(deepSeekDep,
+                deepSeekTimeouts.getConnectTimeoutMs() + "ms",
+                deepSeekTimeouts.getReadTimeoutMs() + "ms",
+                deepSeekTimeouts.getCallTimeoutMs() + "ms",
+                guardCircuit(),
+                "DeepSeek（OpenAI 兼容 /v1/chat/completions，零新增依赖的手写 OkHttp）；"
+                        + "冷却键与 dashscope-chat 【分开】，避免一家故障误伤另一家；key=" + deepSeekKey));
 
         // ---- 2) LLM embedding：SDK 自身没有显式 connect/read，只有调用层预算（如实标 MISSING）----
         String embeddingCall = (embeddingService == null)

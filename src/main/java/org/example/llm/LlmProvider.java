@@ -26,6 +26,22 @@ public interface LlmProvider {
     String modelName();
 
     /**
+     * 回答里 {@code generatedBy} 应当写的值 —— <b>必须是"这次究竟是谁生成的"</b>。
+     *
+     * <h3>为什么单独一个方法，而不是让调用点拼 {@code id() + "/" + modelName()}</h3>
+     * 因为"选中的"和"真正生成的"可能不是同一个：启用备用供应商后，主供应商超时会改由
+     * 备用回答。此时如果调用点仍拼 {@code id()}，公开回答会写
+     * {@code generatedBy=dashscope/qwen-plus}，而实际产出它的是 DeepSeek ——
+     * 这是<b>如实标注</b>这件事上最不该出现的一种错：看起来更具体，其实是假的。
+     *
+     * <p>做成 {@code default} 方法：<b>只新增、不改动</b>既有实现与调用契约
+     * （任何现有 {@code LlmProvider} 实现无需改动，行为与改造前逐字一致）。
+     */
+    default String generatedBy() {
+        return id() + " / " + modelName();
+    }
+
+    /**
      * 当前是否可用（已选中的 provider、Key 已配置且非占位）。
      * <b>调用方必须先判断它</b>：不可用时要么显式报不可用，要么走明确标注的确定性路径，
      * 不许把模板输出当成模型输出。

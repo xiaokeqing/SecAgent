@@ -293,11 +293,13 @@ POST /api/public/ask    匿名；每 IP 6 次/分钟 + 每 IP 并发 1 + 每日�
 GET  /api/public/kb?q=  匿名；每 IP 20 次/分钟；只出白名单字段（标题/片段/来源类型/可信度）
 
 四道护栏：① PromptInjectionGuard（命中即拒绝，且问题包 UNTRUSTED_DATA）
-          ② 输出护栏（PublicOutputGuard：凭据/内部路径/内部标记/上游报错残留）
-          ③ 脱敏（IP 掩码到网段；内网段写"内部地址"；自由文本内嵌 IP 也覆盖）
+          ② 输出护栏（PublicOutputGuard：凭据/内部路径/内部标记/上游报错残留/内部资产名）
+          ③ 脱敏（IP 口径见 §27：默认真实来源 IP，内网/保留写"内网/未知"；
+             掩码态见 §27.2 一键回退；自由文本内嵌 IP 同样覆盖）
           ④ 配额与限流（用户/评测/公开三本账，公开池独立计数与文件）
 
-公开路径的硬约束：RESPONDER 只解释、不调任何工具（匿名永远无法触发处置）。
+公开路径的硬约束（2026-10-14 起）：RESPONDER 只解释、不调任何工具（匿名永远无法触发处置）；
+          蜜罐完整口令与内部资产名永不公开（与 IP 开关无关，见 §27.4）。
 行为验证（最强证据，不依赖日志）：
   · 注入尝试 → state=input-insufficient，且编排未被调用；
   · 正常提问但模型不可用 → state=model-failed，回答里明写"未生成"；
@@ -564,6 +566,9 @@ curl -s http://127.0.0.1:9900/api/public/ask -X POST \
   · 命中引用必须直出正文（2026-10-13 F5 方案 B）：标题 + 片段 + 可信度 + "只基于公开知识库"口径，
     未生成结论时同样直出 —— 测试 PublicAskCitationRenderingTest
   · 不泄露：内网地址（→「内部地址」）、审计原文、密钥、系统提示词、上游报错详情（→「[上游错误详情已脱敏]」）
+  · IP 显示口径与"永不公开"两条（2026-10-14 起，**先读 §27**）：来源 IP 按 app.public.mask-ips 显示
+    （默认真实地址；内网/保留→「内网/未知」），每个响应都带 ipDisclosure；蜜罐完整口令与内部资产名
+    在任何口径下都不公开 —— 改公开面之前请先看 §27.6 的"可能漏改的地方"
   · 回答带机读 state 与 stateLabel；模型不可用/额度用尽如实写 failureReason，禁止模板冒充
   · 检索不可用时 available:false + 空结果（不是 500）
 
@@ -2202,3 +2207,347 @@ srv1 的公网入站是 **cloudflared 隧道**，应用只监听 `127.0.0.1:9900
 - srv2 上 `/opt/wazuh/config/wazuh_cluster/rules/srv1_local_rules.xml` 是 bind mount 进容器的，
   改它必须走 `scripts/srv2-install-srv1-rules.sh`（否则语法错会让 analysisd 起不来）。
 - `/opt/secagent/vendor/srv1-client.keys` 是 agent 身份凭证，**不要入库**（`.gitignore` 里应有 vendor/）。
+
+## 26. 离线地理富化与 `/api/public/geo`（DB-IP Lite，2026-10-13 落地）
+
+```
+【一句话】攻击来源分布地图 = 离线库（DB-IP Lite City + ASN，CC BY 4.0）+ 排序区间数组二分查找
+          + indexer 端 terms 聚合；公开面只给【国家/省份/ASN + 计数 + 独立IP数 + 24×1h 时间桶】，
+          响应里没有任何 IP（连掩码 IP 都没有）。设计/前端对接见 docs/design-geo-endpoint.md。
+
+【为什么不用在线地理 API】红线：不调任何第三方地理/情报 API（隐私 + 配额 + 零依赖）。
+          库文件放服务器、不进仓库、不进镜像（80MB+，且许可要求署名）。
+
+—— 26.1 库：名字、版本、许可、署名（照抄，不许改写）——
+  库名/版本：DB-IP Lite City <YYYY-MM>（主）+ DB-IP Lite ASN <YYYY-MM>（可选，用于机构榜）
+  当前落地：2026-10（city 85,827,400 B / asn 7,015,072 B，均为 gz）
+  许可：CC BY 4.0（可再分发、可商用，但【必须署名】）
+  ★ 署名文案（公开页面与 API 的 note 里都要有，代码里是 GeoIpService.ATTRIBUTION，测试逐字断言）：
+      IP 地理位置数据由 DB-IP (https://db-ip.com) 提供，CC BY 4.0
+  备选库（未采用，写清理由）：MaxMind GeoLite2 City（许可更严、要 license key）、
+      iptoasn.com ASN+country TSV（只有国家级，做不到省份）。
+
+—— 26.2 文件怎么落地（srv1）——
+  /opt/secagent/geoip/                         目录 700，属主 999:999（= 容器里的 uid/gid）
+    dbip-city-lite-2026-10.csv.gz              文件 600，属主 999:999
+    dbip-asn-lite-2026-10.csv.gz               文件 600，属主 999:999
+    dbip-city-lite.csv.gz -> 上面那份的符号链接（稳定路径；月度更新只翻链接）
+    dbip-asn-lite.csv.gz  -> 同上
+  docker-compose.yml 里只读挂载：- /opt/secagent/geoip:/opt/geoip:ro
+  容器内路径由 APP_GEOIP_CITY_DB / APP_GEOIP_ASN_DB 指定（默认 /opt/geoip/dbip-city-lite.csv.gz）。
+  ⚠️ 600/700 是"宿主机上别的用户读不到"，不是"root 独占" —— 容器以 uid 999 跑，
+     所以属主必须是 999:999（实测 docker exec secagent id → uid=999(secagent)）。
+     若改成 root:root 700，容器里会 read 失败 → 应用如实报 GEO_DB_UNUSABLE（不会静默变空图）。
+
+  首次落地/月度更新（下载 → 校验 → 原子替换 → 失败保留旧库并告警）：
+    bash /opt/secagent/scripts/srv1-geoip-update.sh              # 当前月；当月未发布自动回退到上月
+    bash scripts/srv1-geoip-update.sh --dry-run                  # 只下载+校验，绝不改动现有库
+    bash scripts/srv1-geoip-update.sh --verify                   # 只校验正在用的库
+    bash scripts/srv1-geoip-update.sh --month 2026-09            # 指定月份（补票/复现）
+    bash scripts/srv1-geoip-update.sh --rollback                 # 把链接指回上一份（保留 current+prev）
+    bash scripts/srv1-geoip-update.sh --self-test                # 不需要网络/root 的纯函数自测
+  脚本校验项（任一不过就【保留旧库】并 notify HIGH）：gzip 完整性、体积区间（city 50–200MB /
+    asn 2–40MB）、首行形状、行数 ≥100 万、必须含 IPv6 段（首行 ::,…）。
+  更新频率：每月一次（DB-IP 在每月 1 日发布上月数据）。cron 建议（srv1，root）：
+    17 4 3 * *  bash /opt/secagent/scripts/srv1-geoip-update.sh >> /opt/secagent/logs/geoip-cron.log 2>&1
+
+  ★★ 实测：srv1 直连 download.db-ip.com 只有 30–200 KB/s（Cloudflare，中国出口），
+     86MB 的 city 库要 20–45 分钟而且会中途掉速 —— 脚本原先只支持"自己下载"，
+     在这种链路上月度更新很可能一直失败。所以把两件事拆开（2026-10-13 落地）：
+       · **下载可以在任何地方做**（本机/CI/别的机器，能拿到文件就行）；
+       · **校验与原子落地必须在 srv1 上做**（同一套判据、同一条替换路径，不许绕过）。
+     推荐链路（本次首次落地就是这么做的，27 秒传完 86MB）：
+       # 在能快速访问 db-ip.com 的机器上
+       curl -fsS -O https://download.db-ip.com/free/dbip-city-lite-2026-10.csv.gz
+       curl -fsS -O https://download.db-ip.com/free/dbip-asn-lite-2026-10.csv.gz
+       scp dbip-*-lite-2026-10.csv.gz srv1:/tmp/geodb/
+       # 在 srv1 上（root）
+       bash /opt/secagent/scripts/srv1-geoip-update.sh --from-dir /tmp/geodb --month 2026-10
+       # 加 --dry-run 可先只校验不落地；sha256sum 应该与本机一致（本次 d0a4d944… / ed175994…）
+     ★ --from-dir 模式下**校验一个都不少**（gzip/体积/首行/行数/v6 段），
+       失败依旧"保留旧库 + notify HIGH"：实测给一个截断的 city 包 → 日志写
+       "校验失败：不是完整的 gzip"，旧库的 链接/inode/mtime/sha256 四项全同（没被碰过）。
+
+  ★ 库是【启动时装载】的：更新后必须重建容器才生效 ——
+    bash /opt/secagent/scripts/srv1-redeploy.sh --force
+    （不要 docker compose up 手工重建：会丢 digest 引用，见 CLAUDE.md 硬规矩 1）
+
+  ★ 首次落地实测（2026-10-13 21:46，srv1，已核对）：
+      /opt/secagent/geoip                      drwx------ root:root 700
+        dbip-city-lite-2026-10.csv.gz          -rw------- 999:999 85,827,400 B  sha256 d0a4d944…
+        dbip-asn-lite-2026-10.csv.gz           -rw------- 999:999  7,015,072 B  sha256 ed175994…
+        dbip-city-lite.csv.gz -> dbip-city-lite-2026-10.csv.gz     （稳定链接）
+        dbip-asn-lite.csv.gz  -> dbip-asn-lite-2026-10.csv.gz
+      校验耗时 9.2 s（含解压 300MB 数行数 7,786,864 —— 与真库行数逐位相同）
+      --verify 复查："当前在用的库校验全部通过"
+      --rollback 在只有一份库时如实报"找不到上一份"（不会假装回滚成功）
+      注意：文件属主显示成 `systemd-coredump:input` —— 那是 srv1 上 uid/gid **999 的名字**，
+            容器里同一个数字就叫 `secagent`。**按数字认，别按名字认**（与 §22.4 同一条纪律）。
+
+—— 26.3 内存与耗时（真库实测；同一份库，两处都测过）——
+  【本机】装载 12,128 ms（7,786,864 行 city + 477,362 行 asn，0 坏行）
+  【srv1 实测，2026-10-13 22:0x，一台临时容器 + 与生产完全相同的 JVM 参数（-Xmx1g -XX:+UseSerialGC）
+    经只读挂载读 /opt/geoip】装载 17,203 ms / GC 后常驻 152 MB（代码内估算 163 MB）
+    关掉 IPv6 的对照：装载 12,239 ms / 常驻 70 MB（省约 82 MB，IPv6 来源归为"未定位"）
+    查询吞吐 200,000 次/76 ms ≈ 2,631 次/ms（含 IP 解析）
+  （实测姿势：把 target/classes 里的 geoip 类 + slf4j-api.jar 传进 /tmp/geobench，
+    用 `docker run --rm --entrypoint java -v /opt/secagent/geoip:/opt/geoip:ro ... GeoIpBenchMain`
+    跑一次 —— 不碰生产容器、不占生产端口。★ 注意必须写 `--entrypoint`，否则镜像 ENTRYPOINT 会
+    再起一份完整应用，见 26.8-5。）
+  索引结构 排序区间数组 + 二分查找
+  区间行数 city v4 3,620,434（完全连续）/ v6 4,166,430；asn v4 402,389 / v6 74,973
+  记录池去重后 194,466 个城市记录 + 82,135 个 ASN 记录
+  ⇒ srv1 现状：容器 mem_limit 1536m、JAVA_OPTS -Xmx1g、当前 RSS 289MB。
+    装载后 RSS 预期 ~450MB（1.5GB 上限内，实测装载期间宿主 used 689MB / 1870MB）；
+    装载在【后台线程】做，不阻塞健康检查（start_period 120s），装载期间端点如实返回 GEO_DB_LOADING。
+  ⇒ 内存吃紧就关 IPv6：APP_GEOIP_IPV6_ENABLED=false 实测省 82MB，
+    代价是 IPv6 来源一律归为"未定位"（不上地图）。
+
+—— 26.4 降级语义（四种，谁都别想冒充谁）——
+  GEO_DB_MISSING    库文件不存在（还没跑更新脚本 / 卷没挂上）→ available=false + note
+  GEO_DB_UNUSABLE   文件在但读不了（不是 gzip / 截断 / 坏行>1% / 区间乱序）
+  GEO_DB_LOADING    正在后台装（真库 12 秒）
+  GEO_DISABLED      app.geoip.enabled=false（站主要关掉）
+  DATA_SOURCE_UNAVAILABLE / QUERY_FAILED   indexer 侧取数失败（与地理库无关）
+  ★ 一律【不返回空分布】—— "没装好"与"这段时间没有攻击"必须是不同的话。
+  ★ 降级实测（改名/破坏库文件即可复现）：
+      mv /opt/secagent/geoip/dbip-city-lite.csv.gz{,.bak}   → GEO_DB_MISSING
+      echo not-gzip > /opt/secagent/geoip/dbip-city-lite.csv.gz → GEO_DB_UNUSABLE
+      两者都要在重建容器后 curl /api/public/geo 看 reason（别只看代码）。
+  ★ 回滚：bash scripts/srv1-geoip-update.sh --rollback（保留 current+prev 两份，更早的自动删）
+
+—— 26.5 口径与红线（改代码前先看这五条）——
+  1. 公开面只给【聚合】：国家/省份/ASN + count + uniqueIps + 时间桶。不含 IP（连掩码都不给）、
+     不含单条告警、不含内网资产与目的地址。测试用正则扫整段响应体断言"无 IP 形态字符串"。
+  2. 排除再聚合：我方公网/内网出口（APP_GEOIP_SELF_IPS，逗号分隔；实测不填的后果是
+     "data.srcip 第 2 名就是 srv2 自己的 IP"，地图上会出现我们自己的服务器）、
+     内网/环回/链路本地/CGNAT、RFC5737 文档网段、组播与保留段 —— 只进 coverage 计数，不上地图。
+  3. 分母诚实披露：coverage.totalAlerts / withSourceIp / geocoded / excludedSelf /
+     excludedInternal / excludedReserved / unlocated / invalid / sourceBuckets / sourceBucketsTruncated。
+     实测 24h 有 11 万条告警，但带来源 IP 的只是其中一部分（两种字段 data.srcip 与 data.src_ip 都查）
+     —— 页面必须写"有来源 IP 的 N 条 / 总 M 条"，不许把几百条画成"全量攻击分布"。
+  4. 入榜门槛：count ≥ APP_GEOIP_MIN_COUNT(3) 且占比 ≥ APP_GEOIP_MIN_SHARE_PERCENT(1%)。
+     只为防两件具体的事："1 次探测就上榜"和"长尾噪声占满榜单"。
+  5. 富化只补 SecurityAlert.srcGeo（内部形状 国家|省|城市|ASN|AS机构，未知段写 -），
+     **公开面不输出逐条 srcGeo**（/alerts、/alerts/{aggId}、/latest 里该字段恒为 null；有测试钉住）。
+
+—— 26.6 怎么临时关掉（按影响面从小到大）——
+  1) 只关地理分布端点（其余公开端点不受影响）：
+       /opt/secagent/.env 加 APP_GEOIP_ENABLED=false → 重建容器 → /api/public/geo 返回 GEO_DISABLED
+  2) 省内存保功能：APP_GEOIP_IPV6_ENABLED=false（省 ~80MB，IPv6 归为"未定位"）
+  3) 彻底关闭并释放内存：把 compose 里的 /opt/secagent/geoip 挂载注释掉 → 重建容器
+     （端点照样在，但如实返回 GEO_DB_MISSING）
+     ⚠️ 不改 compose、只删库文件的话，容器里挂载点仍在、只是文件没了 → 同样是 GEO_DB_MISSING。
+  4) 回滚到"没有地理富化"的代码版本：按发布链部署上一个 tag（scripts/srv1-redeploy.sh 的
+     last-known-good 机制），库文件留着不影响任何既有端点。
+
+—— 26.7 没做到 / 疑虑（如实列，别当成已完成）——
+  · 城市级准确率：Lite 库是"IP 段 → 注册地"，不是"人/设备所在地"。国家级大体可信，
+    省级可用，城市级经常错（移动网络、云机房、VPN 出口全都会偏）；页面文案不要出现城市级断言。
+  · 内网/NAT：内网段按 RFC1918/6598 判为 INTERNAL 并与我方 IP 一起排除；运营商 NAT 之后的
+    真实用户无法区分（一个出口 IP 背后可能是几千人）；`10.0.0.10` 这种"内网源地址"在
+    Suricata 侧大量存在（实测 24h 43,282 条），它们只进 coverage，不上地图。
+  · 体积与更新失败后果：city 库 86MB（gz）/300MB+（解压），只留 current+prev 两份（约 200MB 磁盘）；
+    更新失败只会通知 + 保留旧库，地图继续按旧版本绘制（不会变坏图），但如果连续几个月更新失败，
+    新分配的 IP 段会显示成"未定位" —— 这正是 coverage.unlocated 存在的意义。
+  · 常驻 164MB 对 srv1 的影响：容器上限 1.5GB、堆 1GB、当前 RSS 287MB ⇒ 装载后约 450MB，
+    实测同一台机 1GB 堆可以装载；但 HeapDumpOnOutOfMemoryError 会往 /app/data 写 dump，
+    真出现 OOM 要先看是否是地理库导致的（那时用 APP_GEOIP_IPV6_ENABLED=false 或 enabled=false 兜住）。
+  · TOP N 截断：terms size = APP_GEOIP_TOP_IPS(1000)，超出部分不参与地图；
+    响应里 sourceBucketsTruncated=true 时页面必须标注"仅显示最集中的 N 个来源"。
+  · IPv6：默认加载，但 Wazuh 侧告警的来源字段是否稳定携带 IPv6 尚未在长周期上验证
+    （本轮只验证了库侧与端点侧）。
+
+—— 26.8 落地实测踩到的坑（都是"看起来成了、其实没成"）——
+  1) `set -o pipefail` + "提前退出的管道"会把成功读成失败：
+     `zcat big.gz | grep -q -m1 '^::,'` —— grep 命中即退，zcat 收到 SIGPIPE（141），
+     pipefail 下整条管道判失败 ⇒ 校验把**真库**判成"缺少 IPv6 段"而拒收。
+     修法：把这类判断放进 `( set +o pipefail; ... )` 子壳。同类写法还有 `printf | grep -qE`。
+  2) bash 里 `local m="$1" c="...$m..."` 在 `set -u` 下直接 `m: unbound variable` 退出，
+     而且报错行号指向函数里更靠后的行（看起来完全不像这一行的问题）—— 必须拆成两条 local。
+  3) case 模式里写带引号的逗号（`*","*","*",*)`）在 srv1 的 bash 上报
+     `syntax error near unexpected token`，报错行同样指向**另一句**。用 tr 数逗号替代。
+  4) Windows 上生成 .sh 时注意行尾与编码：CRLF 会让 bash 报奇怪的语法错；
+     传文件用 base64 或 scp（`Get-Content/Set-Content` 会把 UTF-8 读成 ANSI 把中文写坏）。
+  5) ★★ 别用 `docker rm/stop` 配 `--filter ancestor=<secagent镜像>` 做清理：
+     这个选择器**会把生产容器一起选中**（2026-10-13 21:58 我因此把线上容器删掉，
+     服务中断约 30 秒）。按容器名/ID 精确操作。
+     同理，`docker run --rm <secagent镜像> sh -c 'ls ...'` 不会执行你的命令 ——
+     镜像 ENTRYPOINT 会让它**再起一份完整应用**（占内存）。要验证容器视角的文件可读性，
+     用 `docker run --rm --entrypoint sh -u 999:999 -v ...:ro <镜像> -c 'ls -l /opt/geoip'`。
+  6) 误删容器后的正确恢复路径（本次实跑）：`cd /opt/secagent && bash scripts/srv1-redeploy.sh --force`
+     —— 它按发布指针用 **digest** 重建，并跑部署前硬校验 + 健康核对，
+     恢复后的 embeddedGitCommit / artifactMd5 与事故前逐位相同（没有引入新代码）。
+     注意：这种秒级中断**不会**触发 healthwatch（分钟级巡检）—— 别以为"没人报警 = 没发生"。
+  7) **稳定符号链接会把"版本号"吃掉**：部署面用的是
+     `dbip-city-lite.csv.gz → dbip-city-lite-2026-10.csv.gz`，而版本号是从**文件名**解析的。
+     不解析链接的话，线上 `geoSource` 会变成"DB-IP Lite City 未知版本"（实测：srv1 上第一次
+     跑 bench 就是 `city=null`），而单测直接指向带月份的文件，看不见这个问题。
+     现在 `GeoIpDatabase.versionOf()` 与 `GeoIpService.loadBlocking()` 都会解析链接（修完 srv1 复测
+     `city=2026-10 / asn=2026-10`）。**凡是"从文件名取信息"的逻辑，都要想一遍链接形态。**
+  8) 目录权限只 `chmod 700` 不够，必须连**属主一起 chown 到 999:999**：
+     首次落地时目录是 root:root 700，容器（uid 999）连 traverse 都不行，
+     文件 600 设得再对也读不到（实测：`AccessDeniedException: /opt/geoip/dbip-city-lite.csv.gz`）。
+     脚本现在会在落地后 chown 目录并做"按数字核对属主+u+x/u+r"的可读性自检
+     （不用 `runuser -u 999`：util-linux 只认用户名，而 uid 999 的名字每台机器不一样）。
+
+<!-- 【补录 2026-10-14】§27 公开面 IP 显示口径：站主拍板"公开面显示真实来源 IP"，
+     并与"永不公开"两条一起落地。因 §26 已被 GeoIP 端点预留，本节编号用 27。 -->
+
+## 27. 公开面 IP 显示口径：真实 IP + 两条永不公开（2026-10-14 落地）
+
+```
+【站主决定】公开面不再硬掩码 —— 显示【观测到的真实来源 IP】。
+【为什么还要有开关】"要不要掩码"如果散落在多个端点里，必然出现第三种口径
+  （一个页面真实、一个页面掩码），而且不会报错。所以做成【一处控制、一个来源】。
+【唯一开关读取点】org.example.publicapi.PublicIpPolicy（配置 app.public.mask-ips）
+  · 它是所有公开端点读口径的唯一入口（含后加的 /api/public/geo）
+  · 代码层保证：PublicIpSwitchConfigTest 会扫描 publicapi 包，
+    发现第二处 "${app.public.mask-ips" 直接构建失败
+```
+
+### 27.1 开关语义（两态，逐字对比）
+
+```
+app.public.mask-ips = false  ★默认（站主拍板：显示真实 IP）
+  结构化 IP 字段          45.83.91.12                        真实地址（自动剥端口）
+  内网/保留/链路地址      内网/未知                          ← 任何口径下都不作为攻击源
+  认不出的取值            未知                               不猜、不原样透出
+  自由文本里的公网 IP     原样保留
+  自由文本里的内网 IP     内网/未知
+  ipDisclosure.masked     false
+  note 类文案             "…来源 IP 显示观测到的真实地址（内网/保留地址写作「内网/未知」）…"
+
+app.public.mask-ips = true   （改造前口径，一键回退用）
+  结构化 IP 字段          45.83.***.***                      与 2026-10-14 之前【逐字节相同】
+  内网/保留/链路地址      内部地址
+  认不出的取值            ***
+  自由文本里的任何 IP     一律 PublicIpMask.maskAll（公网掩码、内网→内部地址）
+  ipDisclosure.masked     true
+  note 类文案             与改造前【逐字节相同】（原句照旧，不许改字）
+```
+
+**影响面（全部走 PublicIpPolicy，一个都不会漏）**：
+
+| 端点 | 受影响的字段 |
+|---|---|
+| `GET /api/public/overview` | 无来源 IP 字段；仅带 `ipDisclosure`（口径声明） |
+| `GET /api/public/alerts` | `list[].srcIp`（聚合来源）、`stats` 统计文本 |
+| `GET /api/public/alerts/{aggId}` | `members[].srcIp`、`summary.srcIp` |
+| `GET /api/public/honeypot` | `topSources[].key`、`timeline[].srcIp`、`timeline[].detail` 文本内的 IP |
+| `GET /api/public/audit` | `blocks[].ip`、`actions[].target`、`actions[].reason` 文本内的 IP |
+| `GET /api/public/latest` | `latestEvent.srcIp`、`latestBlock.ip` |
+| `GET /api/public/kb` | 片段/标题里内嵌的 IP（经 PublicOutputGuard） |
+| `POST /api/public/ask` | 回答正文与引用片段里的 IP、`clientIp`（新增字段） |
+| `GET /api/public/geo` | 该端点**不给任何 IP**（设计如此）；只继承 `ipDisclosure` 与资产名过滤 |
+
+### 27.2 怎么一键切回掩码（一条配置，不改代码、不重新部署）
+
+```bash
+# srv1: /opt/secagent/.env
+APP_PUBLIC_MASK_IPS=true
+# 然后按发布链重建容器（★不要用 docker compose up 手工重建 —— 会丢 digest 引用）
+# 核对生效：GET https://demo.xiaokeqing.cn/api/public/latest | jq .data.ipDisclosure
+#   期望 {"masked":true,...}，且 .data.latestEvent.srcIp 形如 "45.83.***.***"
+# 再核对：honeypot 的内网来源应显示「内部地址」（不是「内网/未知」）
+```
+
+⚠️ **两个必须同时确认的地方**（本项目在这里踩过坑，见 §6.7 与 `APP_RAG_*` 注释）：
+1. `docker-compose.yml` 的 `environment` 段必须有 `APP_PUBLIC_MASK_IPS` 透传行（已入库）；
+2. 该键**不许留空**：空字符串绑到 boolean 会让应用直接启动失败（不是静默降级）。
+   要掩码就显式写 `true`。
+
+### 27.3 口径字段 `ipDisclosure`（所有公开响应同一位置、同一形状）
+
+```jsonc
+// 每个 /api/public/** 的 data 里都有（统一由 PublicApiController.ok(...) / ship(...) 补上）
+"ipDisclosure": {
+  "masked": false,                                    // 与开关一致：true=展示的是网段掩码
+  "notice": "观测到的来源地址，未经验证，仅供参考",     // 两个口径同一句话（避免口径漂移）
+  "removalContact": "https://xiaokeqing.cn/about/"    // 移除/更正入口（app.public.removal-contact）
+}
+```
+
+- 页面只要读这三个键就能渲染"口径声明 + 移除入口"，**不需要知道开关细节**（博客仓库不需要改）。
+- `removalContact` 默认是博客关于页；站主要换成邮箱就改 `APP_PUBLIC_REMOVAL_CONTACT`。
+- 该字段是**新增字段**，既有字段一个都没改名/删除（硬约束）；ETag / 限流 / CORS / 快照语义不变
+  （`ipDisclosure` 是常量，不影响 ETag 稳定性）。
+
+### 27.4 为什么"口令"与"资产名"永不公开（与开关无关）
+
+这两条**不是**"敏感度取舍"，是站主定的硬约束，代码里独立于开关、永远不会被打开：
+
+1. **蜜罐抓到的完整口令 / 凭据（CredentialStructure）**
+   - 公开一个真实口令 = 替攻击者完成一次撞库验证，对任何复用了该口令的第三方站点都是直接伤害 ——
+     与我们被不被投诉无关。
+   - 现在只出**结构**：`username`（用户名可以给）、`passwordLength`、`passwordCharClasses`、
+     `weakPassword`（粗判：内置常见弱口令表 / ≤8 位且单一字符类 / ≤6 位）。
+   - **同时修掉两个真实泄露点**（改造前就在漏）：
+     · `honeypot.topCredentials[].key` 原本是 `"root / 123456"` —— **完整口令原文直出**；
+       现在 `key` 保持同一个键名，值改成结构摘要 `"root / 6 位·数字·弱口令"`，并新增 4 个结构字段；
+     · `honeypot.timeline[].detail` 是蜜罐规则描述原文（`…用户=root 口令=123456 来源=…`），
+       改造前只掩了 IP —— **完整口令随 timeline 出过公网**。现在整段先过 `口令=[口令已隐藏]`。
+   - 公开问答链路上也加了中文口令规则（`PublicOutputGuard` 的 `口令|密码[:=：]…` 一律打码）。
+   - 测试：`CredentialStructureTest`（每个口令形态都断言原文不出现）、
+     `PublicIpDisclosureE2ETest.credentialsNeverReachThePublicPayload`（**两种口径 × 四个端点**）。
+
+2. **内部资产名（PublicAssetFilter，配置 `app.public.asset-blocklist`）**
+   - 字段白名单挡得住结构化的 `dstAsset`，挡不住自由文本里的 `web-01` ——
+     而 F5 方案 B 会把命中的知识库引用片段**直出到回答正文**，实测这些 mock 名就是这么出去的。
+   - 现在公开响应出海前对**整棵 data 树**过一遍停用词表（`PublicApiController.ship(...)` 的 deep-scrub），
+     命中即替换为 `[内部标识已脱敏]`；`PublicOutputGuard` 里也过一遍（覆盖回答正文与引用）。
+   - 默认词表 = **实测泄露过的名字**：`web-01/web-02/web-03`、`db-01`、`auth.log`、
+     `/api/order/detail`、`/upload/files/`。**刻意不收 `srv1`/`srv2`**（公开端点本就用它说明两台机器在线状态，
+     收掉等于改既有口径）。
+   - 规则正则原文、内网地址同样不在公开面出现（前者从未出参，后者 →「内网/未知」/「内部地址」）。
+
+### 27.5 怎么验证（都可重复跑）
+
+```bash
+# ① 开关与口径（一条命令看两件事）
+curl -s https://demo.xiaokeqing.cn/api/public/latest | jq '{ip: .data.latestEvent.srcIp, disclosure: .data.ipDisclosure}'
+#   默认（真实态）期望： ip 形如 "106.37.205.248"，disclosure.masked=false
+#   切到掩码后期望：      ip 形如 "106.37.***.***"，disclosure.masked=true
+
+# ② 口令永不出现在任何公开响应里（两种口径都跑一遍；这里用 grep 做"整包体检"）
+for u in latest alerts honeypot audit; do
+  curl -s "https://demo.xiaokeqing.cn/api/public/$u" | grep -E '口令=[^[]|密码=[^[]' && echo "★ $u 漏口令"
+done
+
+# ③ 内网地址没有被当成攻击源（应只见「内网/未知」/「内部地址」）
+curl -s https://demo.xiaokeqing.cn/api/public/honeypot | grep -E '172\.18\.|10\.0\.0\.' && echo "★ 漏内网"
+
+# ④ 内部资产名没随引用直出（F5-B 直出的正文也要看）
+curl -s https://demo.xiaokeqing.cn/api/public/alerts | grep -E 'web-0[0-9]|auth\.log|/api/order/detail' && echo "★ 漏资产名"
+
+# ⑤ 本地全绿
+mvn -B test
+```
+
+**测试清单（新增，共 6 个类 / 37 条）**：
+`PublicIpPolicyTest`（两态 / 默认值 / 内网不当攻击源 / 掩码态与 PublicIpMask 逐字节一致 / 口径字段形状）、
+`PublicMaskedRegressionTest`（**三个端点的掩码态黄金串逐字节比对**，冻结串在 `src/test/resources/publicapi/masked-golden-*.json`）、
+`PublicIpDisclosureE2ETest`（两种口径 × 四个端点的端到端契约 + 口令不泄露 + 资产名过滤 + 内网不当攻击源）、
+`CredentialStructureTest`、`PublicAssetFilterTest`、`PublicIpSwitchConfigTest`（默认值 / .env 模板 / compose 透传 / "开关只有一个读取点"）。
+
+### 27.6 没做到 / 疑虑（如实列，别让"CI 全绿"被读成"没风险"）
+
+1. **真实 IP 会被爬走**：这是站主拍板接受的代价。公开面现在给出的是一份**可被第三方直接采集的
+   攻击源清单**（含时间、类型、来源地址）—— 对做威胁情报聚合的人是有价值的输入。
+   本改造的取舍是"公开透明优先"；如果哪天想收回，**一条配置即可**（§27.2），不需要改代码。
+2. **口径漂移只能靠测试发现**：`PublicIpSwitchConfigTest` 只能保证"开关只有一个读取点"，
+   不能保证"每个端点都用它"。真正兜底的是 `PublicIpDisclosureE2ETest`
+   —— 它固定在 4 个端点上；**以后新增公开端点时必须同时加进那个清单**（否则新端点可能是掩码态）。
+3. **可能漏改的地方**（已核查，但结构性风险仍在）：
+   - 公开面之外的地方**不动**（`ResponseGuard`、通知模板、内部界面仍按原口径）；
+   - `publicAggregate`/`publicAlert`/`timelineForPublic`/`topSourcesForPublic`/`actionTextForPublic`
+     是**白名单式**逐个字段处理 —— 将来有人往这些方法里加新字段时，必须显式套 `policy().display(...)`；
+   - 内部资产名词表是**静态词表**，只能挡住"名字已知"的资产；新资产名不会自动进表。
+     它是兜底，不是"资产信息过滤器"（真正的边界仍是公开字段白名单）。
+4. **口令"结构"仍有信息量**：长度 + 字符类 + 弱口令标记对针对性爆破是有用的信息
+   （例如"就是 6 位纯数字"）。站主明确允许给结构，所以这里按"允许"落地；
+   如果哪天要更保守，把 `topCredentials` 换成"只有弱口令计数"是更小的公开面。
+5. **弱口令标记是粗判**：三条判据（内置常见表 / ≤8 位单一字符类 / ≤6 位）都是启发式，
+   不是密码强度评估。页面措辞必须按"粗判"写，别让人读成"我们已经评估过你的密码强度"。
+6. **`/api/public/geo` 与本次改造的交集只有 `ipDisclosure` 与资产名过滤**：
+   该端点本身不给任何 IP（设计如此），它的运维见 §26（由 GeoIP 那一路负责）。

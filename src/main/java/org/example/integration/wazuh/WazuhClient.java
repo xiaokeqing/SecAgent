@@ -475,8 +475,76 @@ public class WazuhClient {
     }
 
     /**
-     * 通用只读 indexer 查询（蜜罐战报等公开只读端点用）。
+     * 近 24 小时的<b>来源 IP 分布</b>：按 IP 做 terms 聚合 + 带来源 IP 的告警按小时分桶。
      *
+     * <h3>为什么是一条独立查询，而不是拿 {@link #fetchAlerts(int)} 回来本地数</h3>
+     * 实测 24 小时有 11 万条告警，其中 99% 集中在两三个 IP 上。取"最近 1000 条"再本地统计，
+     * 既要把几 MB 原始日志（含 payload 与内网目的地址）搬进应用进程，又会得到
+     * "最近几分钟谁在刷"而不是"24 小时全国分布"。这里让 indexer 只回聚合结果：
+     * <b>字节数从 MB 级降到 KB 级，且是整窗口的精确计数</b>。
+     *
+     * <h3>为什么是"两个字段各一条 terms"</h3>
+     * 实测同一索引里两类告警的来源字段名不同：
+     * 主机侧/蜜罐写 {@code data.srcip}，Suricata（经 Wazuh agent 进来）写 {@code data.src_ip}。
+     * 只查一个字段会丢掉一大半来源（实测 host-side 24h 只有约 700 条，
+     * 而 suricata 侧有 10 万+ 条）—— 这种"少了一半还不报错"是最难发现的错。
+     * 字段名由配置给出（{@code app.geoip.src-ip-fields}），不写死在代码里。
+     *
+     * <p>{@code src_present} 这个 filter 聚合负责回答"窗口内有多少条告警真的带来源 IP" ——
+     * 公开端点要用它如实标注"分母是多少"，否则读者会以为地图覆盖了全部 11 万条告警。
+     * 趋势也取自它（而不是取全部告警），这样趋势与地图是同一批数据。
+     *
+     * @param topN     每个字段取多少个 IP（terms 的 size）；超出的长尾由 sum_other_doc_count 如实暴露
+     * @param srcFields 来源 IP 的字段名（至少一个）
+     */
+    public JsonNode fetchGeoAggregates24h(int topN, java.util.List<String> srcFields) throws IOException {
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址（integration.wazuh.indexer-url）");
+        }
+        int size = Math.max(1, Math.min(topN, 5000));
+        // 查询体用 Jackson 构造，不拼字符串：字段名来自配置，拼字符串时一个引号就能把整个查询变成语法错误
+        java.util.List<Object> should = new java.util.ArrayList<>();
+        for (String f : srcFields) {
+            should.add(java.util.Map.of("exists", java.util.Map.of("field", f)));
+        }
+        java.util.Map<String, Object> aggs = new java.util.LinkedHashMap<>();
+        int i = 0;
+        for (String f : srcFields) {
+            aggs.put("by_ip_" + (i++), java.util.Map.of("terms",
+                    java.util.Map.of("field", f, "size", size)));
+        }
+        aggs.put("src_present", java.util.Map.of(
+                "filter", java.util.Map.of("bool", java.util.Map.of("should", should, "minimum_should_match", 1)),
+                "aggs", java.util.Map.of("by_hour", java.util.Map.of("date_histogram", java.util.Map.of(
+                        "field", "@timestamp",
+                        "fixed_interval", "1h",
+                        "min_doc_count", 0,
+                        "extended_bounds", java.util.Map.of("min", "now-24h", "max", "now"))))));
+
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("size", 0);
+        body.put("track_total_hits", true);
+        body.put("query", java.util.Map.of("bool", java.util.Map.of("filter",
+                java.util.List.of(java.util.Map.of("range",
+                        java.util.Map.of("@timestamp", java.util.Map.of("gte", "now-24h")))))));
+        body.put("aggs", aggs);
+
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/wazuh-alerts-*/_search")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .post(RequestBody.create(mapper.writeValueAsString(body), JSON))
+                .build();
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
+            String respBody = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 来源分布查询失败 HTTP " + resp.code() + ": " + snippet(respBody));
+            }
+            return mapper.readTree(respBody);
+        }
+    }
+
+    /**
+     * 通用只读 indexer 查询（蜜罐战报等公开只读端点用）。     *
      * <p>刻意只接受<b>查询体</b>、只走 {@code _search}：不给调用方留写操作的口子，
      * 也避免有人顺手把删改请求传进来。
      *

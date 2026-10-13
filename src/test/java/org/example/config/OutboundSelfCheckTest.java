@@ -32,6 +32,10 @@ class OutboundSelfCheckTest {
     /** 期望被自检覆盖的出站依赖（少一个就失败，防"新加了客户端但忘了登记"） */
     private static final List<String> EXPECTED_DEPENDENCIES = List.of(
             "dashscope-chat",
+            // DeepSeek 对话链路（手写 OkHttp 走 OpenAI 兼容端点）：它必须单独出现在自检里，
+            // 因为"有几个冷却键、会不会互相误伤"取决于它 —— 而且 app.llm.provider 随时可切，
+            // 切过去那一刻才发现自检没覆盖就太晚了。
+            "deepseek-chat",
             "dashscope-embedding",
             "wazuh-api",
             "wazuh-indexer",
@@ -203,6 +207,49 @@ class OutboundSelfCheckTest {
         assertTrue(row.contains("callTimeout=10000ms"),
                 "调用预算要取自真正建 OkHttpClient 的传送器（这里被 app.notify.timeout-ms 收紧了）：" + row);
         assertTrue(row.contains("OutboundGuard"), "webhook 出站必须复用 OutboundGuard：" + row);
+    }
+
+    /**
+     * DeepSeek 对话链路必须被自检覆盖，且如实标明"冷却键与 dashscope 分开"。
+     *
+     * <p>为什么这条重要：{@code app.llm.provider} 随时可以从 dashscope 切成 deepseek。
+     * 如果自检里没有这一行，切换之后就没有任何地方能回答"这条链路的实际超时是几秒、
+     * 它和 DashScope 会不会互相熔断" —— 而那正是本类存在的全部理由。
+     */
+    @Test
+    @DisplayName("DeepSeek 对话链路：统一超时 + 独立冷却键 + Key 状态显式打印")
+    void deepSeekChatDependencyIsCovered() {
+        OutboundSelfCheck check = selfCheck(3000, 12000, 15000);
+        // 注入与生产同形的配置对象（值取自真正参与调用的对象，而不是再读一遍配置）
+        ReflectionTestUtils.setField(check, "deepSeekConfig", new DeepSeekConfig(3000, 12000, 15000));
+
+        String row = rowOf(check.buildLine(), "deepseek-chat");
+        assertTrue(row.contains("connect=3000ms") && row.contains("callTimeout=15000ms"),
+                "DeepSeek 必须与其他出站链路共用同一组生效值：" + row);
+        assertTrue(row.contains("read=12000ms"), row);
+        assertTrue(row.contains("OutboundGuard"), "必须复用 OutboundGuard（有界等待 + 熔断冷却）：" + row);
+        assertTrue(row.contains("分开"),
+                "要写明冷却键与 dashscope-chat 分开，否则'一家故障误伤另一家'这件事没人知道：" + row);
+        assertTrue(row.contains("key=" + OutboundSelfCheck.MISSING),
+                "Key 未接入时如实写 MISSING，不许留空：" + row);
+    }
+
+    /** 配了 DeepSeek provider 时，自检要取自该对象（Key 状态与依赖键） */
+    @Test
+    @DisplayName("已接入 DeepSeek provider 时，自检打印它的依赖键与 Key 状态（不含密钥）")
+    void deepSeekKeyStateComesFromProvider() {
+        OutboundSelfCheck check = selfCheck(3000, 12000, 15000);
+        ReflectionTestUtils.setField(check, "deepSeekConfig", new DeepSeekConfig(1000, 2000, 3000));
+
+        org.example.llm.DeepSeekLlmProvider provider = new org.example.llm.DeepSeekLlmProvider();
+        ReflectionTestUtils.setField(provider, "apiKey", "sk-should-never-be-printed");
+        ReflectionTestUtils.setField(check, "deepSeekLlmProvider", provider);
+
+        String row = rowOf(check.buildLine(), "deepseek-chat");
+        assertTrue(row.contains("key=SET"), row);
+        assertTrue(row.contains("callTimeout=3000ms"),
+                "收紧后的生效值必须打印出来（这里被 app.llm.deepseek.* 扣到 3s）：" + row);
+        assertFalse(row.contains("sk-should-never-be-printed"), "绝不许把密钥写进日志：" + row);
     }
 
     /** 从一行自检里取出某个依赖的片段（到下一个依赖之前） */

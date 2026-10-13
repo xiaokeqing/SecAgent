@@ -94,6 +94,11 @@ class SpringBeanConstructorTest {
                 || c.isAnnotationPresent(Component.class)
                 || c.isAnnotationPresent(Repository.class)
                 || c.isAnnotationPresent(Controller.class)
-                || c.isAnnotationPresent(RestController.class);
+                || c.isAnnotationPresent(RestController.class)
+                // 【2026-10-14 补】原来漏了 @Configuration：于是"@Configuration 类里的 @Bean 产出同类型对象"
+                // 这种**启动即崩**的写法躲过了本门禁（实证：DeepSeekConfig 与它产出的 Bean 同名同类型 →
+                // BeanDefinitionStoreException: @Bean definition illegally overridden）。
+                // @Configuration 的构造器同样必须"能被 Spring 选中"（多构造器要恰好一个 @Autowired），一并纳入。
+                || c.isAnnotationPresent(org.springframework.context.annotation.Configuration.class);
     }
 }

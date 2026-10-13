@@ -503,6 +503,16 @@ public class WazuhService implements WazuhGateway {
 
     // ==================== 告警 ====================
 
+    /**
+     * 离线地理富化（可空：单测里直接 {@code new WazuhService()} 时没有它）。
+     *
+     * <p>刻意用 {@code required=false} 而不是构造器注入：这个服务在很多单测里是
+     * 手写 new 出来的，加一个必填依赖会让它们全部编译/启动失败；
+     * 而"没有富化"是完全可以接受的状态（{@code srcGeo} 保持 null，页面显示"未知"）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.example.geoip.GeoIpService geoIpService;
+
     @Override
     public List<SecurityAlert> recentAlerts(int limit) {
         if (available && client != null) {
@@ -513,6 +523,105 @@ public class WazuhService implements WazuhGateway {
             }
         }
         return builtinAlerts(limit);
+    }
+
+    /** 来源 IP 的字段名：主机侧/蜜罐与 Suricata 用的不是同一个（实测），所以做成配置 */
+    @Value("${app.geoip.src-ip-fields:data.srcip,data.src_ip}")
+    private String srcIpFieldsConfig;
+
+    private List<String> srcIpFields() {
+        List<String> out = new ArrayList<>();
+        if (srcIpFieldsConfig != null) {
+            for (String f : srcIpFieldsConfig.split(",")) {
+                String v = f.trim();
+                if (!v.isEmpty()) {
+                    out.add(v);
+                }
+            }
+        }
+        return out.isEmpty() ? List.of("data.srcip") : out;
+    }
+
+    /**
+     * 24 小时来源 IP 分布（公开地理端点的取数口径）。
+     *
+     * <p>不返回内置样本：数据源不可用时返回 {@code available=false}，
+     * 让公开端点如实显示"地理分布不可用"，<b>而不是拿样本里的文档网段画一张假地图</b>。
+     */
+    @Override
+    public org.example.geoip.GeoWindow geoWindow24h(int topN) {
+        if (client == null) {
+            return org.example.geoip.GeoWindow.unavailable("CLIENT_NOT_READY",
+                    "Wazuh 客户端未初始化（未启用或初始化失败）");
+        }
+        List<String> fields = srcIpFields();
+        try {
+            JsonNode root = client.fetchGeoAggregates24h(topN, fields);
+            return parseGeoWindow(root, fields.size());
+        } catch (Exception e) {
+            logger.warn("来源 IP 分布查询失败（公开地理端点将如实降级）：{}", e.getMessage());
+            return org.example.geoip.GeoWindow.unavailable("QUERY_FAILED",
+                    "来源分布聚合查询失败（" + e.getMessage() + "）；这不是'没有攻击'，前端应显示降级");
+        }
+    }
+
+    /**
+     * 解析 {@link WazuhClient#fetchGeoAggregates24h} 的响应（<b>纯函数，便于单测直接喂 JSON</b>）。
+     *
+     * @param root       OpenSearch 响应
+     * @param fieldCount 查询里用了几个来源字段（聚合名是 {@code by_ip_0..by_ip_{n-1}}）
+     */
+    static org.example.geoip.GeoWindow parseGeoWindow(JsonNode root, int fieldCount) {
+        if (root == null || root.isMissingNode() || root.isNull()) {
+            return org.example.geoip.GeoWindow.unavailable("EMPTY_RESPONSE");
+        }
+        // 没有 aggregations 节点 = 这不是一次正常的聚合响应（被中间件改成错误页、索引名写错等）。
+        // 不能当成"窗口里没有带来源 IP 的告警"——那会把一次查询故障渲染成"天下太平"。
+        if (!root.path("aggregations").isObject()) {
+            return org.example.geoip.GeoWindow.unavailable("EMPTY_RESPONSE",
+                    "聚合响应里没有 aggregations 节点（查询未按预期执行）");
+        }
+        long total = root.path("hits").path("total").path("value").asLong(0);
+        JsonNode aggs = root.path("aggregations");
+        JsonNode present = aggs.path("src_present");
+        long withIp = present.path("doc_count").asLong(0);
+
+        Map<String, Long> byIp = new LinkedHashMap<>();
+        boolean truncated = false;
+        for (int i = 0; i < fieldCount; i++) {
+            JsonNode buckets = aggs.path("by_ip_" + i).path("buckets");
+            if (!buckets.isArray()) {
+                continue;
+            }
+            if (aggs.path("by_ip_" + i).path("sum_other_doc_count").asLong(0) > 0) {
+                truncated = true;
+            }
+            for (JsonNode b : buckets) {
+                String ip = b.path("key").asText("");
+                if (ip.isEmpty()) {
+                    continue;
+                }
+                byIp.merge(ip, b.path("doc_count").asLong(0), Long::sum);
+            }
+        }
+        List<org.example.geoip.GeoAggregator.IpCount> counts = new ArrayList<>();
+        byIp.entrySet().stream()
+                .sorted(java.util.Comparator
+                        .comparingLong((Map.Entry<String, Long> e) -> e.getValue()).reversed()
+                        .thenComparing(Map.Entry::getKey))
+                .forEach(e -> counts.add(new org.example.geoip.GeoAggregator.IpCount(e.getKey(), e.getValue())));
+
+        List<org.example.geoip.GeoAggregator.TrendPoint> trend = new ArrayList<>();
+        for (JsonNode b : present.path("by_hour").path("buckets")) {
+            String local = WazuhTime.toLocal(b.path("key_as_string").asText(""));
+            // date_histogram 的 key 就是整点，取到分钟即可（"2026-10-13 20:00:00" → "2026-10-13T20:00"）
+            String ts = local.length() >= 16 ? local.substring(0, 16).replace(' ', 'T') : local;
+            trend.add(new org.example.geoip.GeoAggregator.TrendPoint(ts, b.path("doc_count").asLong(0)));
+        }
+        if (counts.isEmpty()) {
+            return org.example.geoip.GeoWindow.empty(total);
+        }
+        return new org.example.geoip.GeoWindow(true, "OK", null, total, withIp, truncated, counts, trend);
     }
 
     /**
@@ -574,6 +683,15 @@ public class WazuhService implements WazuhGateway {
                     classifySource(n));
             a.setRuleName(ruleName);
             a.setSrcIp(srcIp);
+            // ===== 离线地理富化（任务 2）：只填 srcGeo 这一个既有字段，不改任何现有字段语义 =====
+            // 形状：国家ISO2|一级行政区|城市|ASN|AS组织（未知段写 "-"）；定位不到时为 null。
+            // 刻意【不】在公开面输出它（PublicApiController 里显式置 null）：
+            // 逐条的地理+ASN 等于把"某个攻击者属于哪个机构"搬到公网页面，
+            // 公开面只允许国家/省份级聚合（见 GeoAggregator）。
+            // 库不可用/未启用时 geoIpService 为 null 或 ready()=false → srcGeo 保持 null，如实"未知"。
+            if (geoIpService != null && geoIpService.ready()) {
+                a.setSrcGeo(geoIpService.describe(srcIp));
+            }
             a.setDstIp(dstIp);
             a.setDstAsset(dstAsset);
             a.setDescription(desc);

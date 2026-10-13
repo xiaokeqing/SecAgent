@@ -57,9 +57,25 @@ public class PublicKbService {
     @Autowired
     private PublicKbVisibility visibility;
 
-    /** 输出脱敏器（IP 掩码 / 凭据 / 内部路径）。可空注入便于单测。 */
+    /** 输出脱敏器（IP 口径 / 凭据 / 内部路径 / 资产名）。可空注入便于单测。 */
     @Autowired(required = false)
     private PublicOutputGuard outputGuard;
+
+    /**
+     * IP 显示口径（唯一来源：{@code app.public.mask-ips}）。
+     *
+     * <p>只在 {@link #outputGuard} 缺失的兜底路径上用得到；正常路径由护栏统一处理，
+     * 但"没有护栏"绝不能变成"自己另判一次掩不掩码"—— 所以这里也读同一个对象。
+     */
+    @Autowired(required = false)
+    private PublicIpPolicy ipPolicy;
+
+    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
+
+    private PublicIpPolicy policy() {
+        PublicIpPolicy p = ipPolicy;
+        return p != null ? p : FAIL_CLOSED_POLICY;
+    }
 
     /**
      * 公开检索。
@@ -256,11 +272,16 @@ public class PublicKbService {
         return v.substring(0, max) + "…";
     }
 
-    /** 出海前统一脱敏：IP 掩码 + 凭据 + 内部路径 + 内部标记 */
+    /** 出海前统一脱敏：IP 口径 + 凭据 + 内部路径 + 内部标记 + 内部资产名 */
     private String sanitize(String s) {
-        if (outputGuard == null || s == null) {
-            // 脱敏器缺失时按最保守处理：宁可少给内容，也不原样透出
-            return org.example.publicapi.PublicIpMask.maskAll(s);
+        if (s == null) {
+            return null;
+        }
+        if (outputGuard == null) {
+            // 脱敏器缺失时按最保守处理：宁可少给内容，也不原样透出。
+            // 注意这里仍然读同一个口径对象，而不是"缺了护栏就默认掩码"——
+            // 那会造出第二个口径来源（真实态下页面看到的东西自相矛盾）。
+            return policy().displayText(s);
         }
         return outputGuard.sanitize(s).text();
     }
