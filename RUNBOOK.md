@@ -565,7 +565,7 @@ curl -s http://127.0.0.1:9900/api/public/ask -X POST \
   因此：不再新增"低速多端口扫描"规则；SSH 层面的扫描是可见可检测的（ET SCAN sid 2001219）。
 
 【已做】误报抑制（运维批量登录不再刷告警）：
-  阈值文件（容器内 /etc/suricata/threshold.conf）：
+  阈值文件（容器内 /etc/suricata/threshold.conf）：  ⚠️〔2026-10-13 核实：该抑制**从未真正生效** —— threshold.conf 未被 compose 挂载且为 0 字节，详见 §17.3 未决项〕
     threshold gen_id 1, sig_id 2001219, type threshold, track by_src, count 3, seconds 10
   应用脚本：scripts/apply-suricata-scan-tuning.sh（在 srv2 上 root 执行）
     --check     只校验当前配置（suricata -T）+ 打印 rule-files
@@ -796,15 +796,34 @@ srv1 侧：数据链路约 1.5 分钟自愈回 REAL，health 全程 200/ok ✓
 
 ### 17.3 加载与运行验证
 ```
-2026-10-13 09:47:26 CST：重启 suricata 容器以加载裁剪后的规则（检测空窗 5–10 秒，维护窗口内已获批准）
+2026-10-13 09:47:26 CST：重启 suricata 容器以加载裁剪后的规则（维护窗口内，已获站主批准）
   · 容器内规则 58,405 行 / alert 42,447 条 ✓
-  · threshold-file 仍在（sid 2001219 的运维误报抑制没丢）✓
   · 解析/配置错误 0 条 ✓
   · **阳性对照**：生产里持续命中的 `ET INFO Python-urllib (sid 2013031)` 重启后照常在报
     （fast.log 01:48:51 / 01:48:56 UTC 两条，节奏与裁剪前一致）→ 裁剪未伤及在用检测 ✓
   · eve.json 持续写入 ✓
+  · 实施方另做 4 次对照演练（本地轮/srv1 轮 × 旧引擎/新引擎）：基线命中集 {2228000, 2260000}
+    在裁剪后**逐条复现、丢失 = 0**；indexer 侧独立复核 2013031×96｜2228000×24｜2260000×12｜2001219×1 吻合；
+    裁剪后 24h 命中集合仍为 58 个且与裁剪前逐项一致。
 
-仍待补（非阻塞）：5 个演练场景的"逐条命中对比表"。等价证据已具备：关键签名全在 + 在用签名照常报 + 0 解析错误。
+【2026-10-13 追加·三条必须记住的事实】
+  ① **真实检测空窗 ≈ 41–42 秒**（`Signal Received` → `Engine started`），不是 5–10 秒。
+     本配置 console 日志关闭，`docker logs` 里看不到 "Engine started"，要以 suricata.log 时间戳为准。
+     → 今后在维护窗口里重启 suricata，按 45 秒空窗规划。
+  ② **不要在 512 MiB cgroup 里执行 `docker exec suricata suricata -T`**：
+     那会在同一 cgroup 内再起一个 450–485 MiB 引擎，与在线引擎叠加有 OOM 风险（2026-10-13 实测侥幸未触发）。
+     → 校验规则请用**一次性独立容器**（挂 rules + yaml 进去跑 `-T`），或先停在线引擎。
+  ③ 09:47:15 那次"非实施方发起的 docker-API 重启"**是我做的**（为加载裁剪后的规则），非 OOM、非异常。
+
+【未决·需站主拍板】`threshold.conf` 实际未生效：
+  compose 只挂载 `etc/suricata.yaml`、`rules`、`logs` —— **threshold.conf 不在挂载之列**，
+  它只是镜像层里一个 **0 字节**文件（`/etc/suricata/threshold.conf`，Oct 12 16:08）。
+  也就是说 §11 记的"sid 2001219 阈值抑制"**从未真正生效**：当初只把 yaml 的 `threshold-file:` 指过去，
+  没把抑制规则写进那个文件，而"文件内容"这一层当时没验（验证不完整的教训）。
+  修法（若启用）：把抑制规则写到**已挂载**的目录（如 `/opt/suricata/rules/threshold.conf`），
+  yaml 的 `threshold-file` 指向 `/var/lib/suricata/rules/threshold.conf`；备份 → 改 → 用**一次性容器**跑 `-T` 校验
+  → 重启（按 41s 空窗）→ 确认日志 `Threshold config parsed: N rule(s) found` 的 N > 0。
+  站主确认前**不动它**（与当前线上保持一致）。
 ```
 
 ### 17.4 代价（写清楚，别只写好的一面）
