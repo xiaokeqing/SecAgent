@@ -2725,6 +2725,9 @@ drift: diff=<n> missing_in_repo=<n> missing_on_server=<n> accepted=<m>  baseline
 
 **实测（2026-10-13 22:45–22:51，srv1 真跑两轮，最终被测脚本 sha256=cb391c57b528…）**：
 
+> 表中的 `files=157` 是当时快照的文件数；§28.6 又补捞 5 个落地物之后是 **161** —— 判据与退出码不变，
+> 最后一轮已在最终提交 `e874a1e`（`files=161`）上复跑，结论逐项一致。
+
 | 场景 | 命令 | 结果 |
 |---|---|---|
 | 基准解析（auto） | `srv1-drift-check.sh --baseline` | `baseline=snapshot@34c2e90c0105 age=0d files=157 kind=snapshot`，退出 **0**；stderr 写明"origin/main 不可用 → 退化到只读快照" |
