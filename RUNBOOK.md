@@ -1256,6 +1256,10 @@ authorized_keys 条目：restrict,command="/opt/secagent/scripts/srv1-heartbeat.
 > 三件加固，都是外部评审指出、站主确认后做的。每条都带运行态证据（命令 + 真实输出）。
 > **动 CI 之前先看 22.7「已知会红的地方」** —— 两个门禁接入时的第一次运行本来就是红的，
 > 那是它们在正确工作，不是谁把东西弄坏了。
+>
+> ⚠️ **2026-10-13 收口更新**：备份链已升级为【加密归档 + 排除 `access.jsonl`】，本节 22.2/22.3/22.4 里写的
+> 明文 `data-<stamp>.tar.gz` 已被 `data-<stamp>.tar.gz.enc` 取代，srv2 侧同步支持 `push <stamp> <sha256> enc`
+> 并在落盘前解密校验。协议与恢复步骤见 **§28.4**；本节保留原样作为当时口径的记录。
 
 ### 22.1 为什么 data/ 必须异地备份（P0）
 
@@ -2551,3 +2555,312 @@ mvn -B test
    不是密码强度评估。页面措辞必须按"粗判"写，别让人读成"我们已经评估过你的密码强度"。
 6. **`/api/public/geo` 与本次改造的交集只有 `ipDisclosure` 与资产名过滤**：
    该端点本身不给任何 IP（设计如此），它的运维见 §26（由 GeoIP 那一路负责）。
+
+---
+
+## 28. 主机侧四项加固：容器守卫 / 反向心跳 / 漂移巡检 / 备份加密（2026-10-13 落地，2026-10-13 收口补录）
+
+> **【补录说明】** 本节内容原先**只存在于 srv1 的 `/opt/secagent`**（服务器侧分支提交 `4f652c3`，从未推送到 GitHub）。
+> 服务器侧那份 RUNBOOK 把它编成"§22"，与仓库里的 §22（状态异地备份）**编号撞车**，两份 RUNBOOK 因此互有缺失
+> （服务器版缺 §13–§20、§22–§27；仓库版缺 §21 与本节）。2026-10-13 收口时把这 12 个落地物连同本节一起捞回权威仓库，
+> 本节在权威 RUNBOOK 里改用 §28；服务器侧那份按"只读消费端"整体对齐（`git reset --hard`，见 28.3 末）。
+> 四个缺口都是真事，逐条给阈值、冷却、怎么临时关掉、密钥在哪、怎么恢复。
+
+| 缺口（都是真事） | 当时的表现 | 本节补的东西 |
+|---|---|---|
+| 误删 srv1 生产容器 → 停机约 **25–30 秒** | **零告警**；`notify.log` 里一个字都没有。既有巡检是 2–3 分钟级、且要连续 3 次才动作（6–9 分钟），短窗口从采样缝里漏掉 | §28.1 容器守卫（**25 秒**级断言） |
+| 只有 srv2 盯 srv1，方向是**单向**的 | srv2 挂了：Wazuh 告警、备份落盘、备份抽测**全部静默停止**，而 srv1 看起来一切正常 | §28.2 srv1→srv2 反向心跳 |
+| `/opt/secagent` 一度不是 git 仓库，落地物只存在于服务器 | RUNBOOK §21 与 20 个落地文件曾差点丢掉，靠手工捞回 | §28.3 漂移巡检（进每日自检） |
+| 备份是**明文** tar.gz 推到 srv2（含封禁表、处置审计、真实 IP），且把可再生的 `data/access.jsonl*` 一起打进包 | srv2 是蜜罐机、暴露面更大：拿到它的盘就等于拿到全部审计内容；包还被日志撑大 | §28.4 备份加密 + 排除 access 日志 |
+
+### 28.1 容器守卫（srv1）
+
+```bash
+# 看状态（探测结果 + 计数 + 故障起点）
+bash /opt/secagent/scripts/srv1-container-guard.sh --status
+# 只判断、不通知（演练）
+bash /opt/secagent/scripts/srv1-container-guard.sh --dry-run
+# 日志
+tail -f /opt/secagent/logs/container-guard.log
+# 定时器
+systemctl list-timers secagent-containerguard.timer
+journalctl -u secagent-containerguard.service -n 50 --no-pager
+```
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 断言 | `docker inspect -f '{{.State.Running}}' secagent` == `true` | 容器不存在（inspect 非 0）或 `Running != true` 都算失败 |
+| 周期 | **25 秒**（`secagent-containerguard.timer`，`AccuracySec=1s`） | `AccuracySec=1s` 是必须的：systemd 默认 `AccuracySec=1min` 会把 25 秒周期并成 ~1 分钟，等于把灵敏度打回原盲区 |
+| 阈值 | 连续 **2** 次失败 | 最坏检出时间 ≈ 2×25s + 脚本耗时 ≈ **≤60 秒** |
+| 冷却 | **600 秒**（同一故障内不重复告警）；恢复通知 `--cooldown 0` | 冷却键带"本次故障起点"，紧邻的第二次故障的恢复通知不会被上一次的冷却吞掉 |
+| 部署窗口抑制 | 默认开（`GUARD_SUPPRESS_DURING_DEPLOY=0` 可关） | `/var/lock/secagent-deploy.lock` 被持有时（发布链正在重建容器）只记录不告警 —— 否则每次正常发布都误报一次。**手工 `docker stop` 不持锁，照样会报**（这正是要抓的场景） |
+| 状态文件 | `/opt/secagent/state/container-guard.state`（`KEY=value`，可 source） | 失败计数 / 故障起点 / 上次告警时间 |
+| 健康维度 | **不**参与判定，只在正文里如实展示 | "容器在跑但应用不健康"是 `secagent-healthwatch`（2 分钟级、连续 3 次回滚）的职责，两者刻意不重叠 |
+
+**实测（2026-10-13 22:10:41，srv1）**：`docker stop secagent` → 第 1 次失败 22:11:06、第 2 次 22:11:32 → **22:11:33 发出告警，用时 52 秒**（≤60 秒）；
+`docker start secagent` → 22:11:57 判定恢复 → **22:11:58 发出「已恢复」**；收尾核对 `health=healthy`，`Config.Image` 与 `ImageID` 与测试前**完全一致**。
+
+**只按容器名操作**：`docker inspect secagent` / `docker stop secagent` / `docker start secagent`。
+**绝不**用 `--filter ancestor=` / `--filter name=` 这类选择器 —— 上一个实施方就是用 `ancestor` 选择器误伤了别的生产容器。
+
+**临时关闭**：`systemctl disable --now secagent-containerguard.timer`（脚本本身仍可手工跑）。
+
+### 28.2 反向心跳：srv1 盯 srv2（dead man switch）
+
+与 srv2 上的 `secagent-srv1deadman` **完全对称**，方向相反。
+
+```bash
+bash /opt/secagent/scripts/srv1-watch-srv2.sh --status      # 三个面 + 状态文件
+bash /opt/secagent/scripts/srv1-watch-srv2.sh --self-test   # 只查依赖/配置，不发通知
+bash /opt/secagent/scripts/srv1-watch-srv2.sh --reset-state
+tail -f /opt/secagent/logs/srv2-watch.log
+systemctl list-timers secagent-srv2deadman.timer
+```
+
+三个探测面（全部信息来自 srv2 侧的**心跳 JSON**，来源见下）：
+
+| 面 | 判据 |
+|---|---|
+| ① SSH + 心跳 | 用**只能读心跳**的强制命令钥匙连 srv2，拿回带 `secagent-srv2-heartbeat/1` 标记的 JSON。等价于"sshd 活着 + 强制命令没被改 + 应答脚本能跑" |
+| ② 关键容器（含 Suricata） | `wazuh.indexer` / `wazuh.manager` / `wazuh.dashboard` / `cowrie` / `suricata` 是否都 `running`（按**容器名**精确 inspect） |
+| ③ 备份与密钥 | 最新备份的年龄 ≤ `SRV2_BACKUP_MAX_AGE`（默认 **36h**，备份每天 03:30 一次）且 `key_present=true` —— 备份链断掉是 srv2 最容易被忽略的失效方式 |
+
+| 项 | 值 |
+|---|---|
+| 周期 | **3 分钟**（`secagent-srv2deadman.timer`，与对面同节奏） |
+| 阈值 | 连续 **3** 次失败（≈9 分钟）→ `notify.sh HIGH` |
+| 重提醒 | 仍未恢复每 **6 小时**（`REALERT_SECONDS=21600`）一次 |
+| 标题 | 按失败面区分，**不把"一个容器挂了"说成"整机不可用"**：① 失败 →「srv2 疑似整机不可用」；只有 ② →「srv2 关键容器异常」；只有 ③ →「srv2 备份/密钥状态异常」 |
+| 恢复通知 | INFO「srv2 已恢复（不可用时长达 …）」，冷却键带"本次故障起点" |
+| 状态文件 | `/opt/secagent/state/srv2-watch-state.json` |
+| 配置文件 | `/opt/secagent/srv2watch.env`（可选；环境变量优先于文件） |
+
+**密钥与信任边界（关键）**：
+
+| 文件 | 位置 | 说明 |
+|---|---|---|
+| srv1→srv2 探活私钥 | srv1:`/etc/secagent/heartbeat/srv2_ed25519`（600） | 由 `scripts/srv1-gen-srv2-heartbeat-key.sh` 生成 |
+| 对应公钥的授权条目 | srv2:`/root/.ssh/authorized_keys` | `restrict,command="/opt/secagent/scripts/srv2-heartbeat.sh" …`，由 `scripts/srv2-authorize-srv1-heartbeat-key.sh` 写入（脚本会先备份、写后读回校验、`sshd -t` 失败自动回滚） |
+| srv2 侧应答脚本 | srv2:`/opt/secagent/scripts/srv2-heartbeat.sh`（755） | 只读，输出单行 JSON |
+
+放 `/etc` 而不是 `/root/.ssh` 是刻意的：systemd 服务用 `ProtectHome=yes` 跑，私钥必须在 `/etc` 才读得到。
+`restrict` 关掉一切（pty / agent 转发 / X11 / 端口转发），`command=` 把钥匙能力钉死在"读一份只读 JSON"。
+**实测反向验证**：用这把钥匙请求 `id` 时，拿到的**也是心跳 JSON 而不是 uid** —— 证明强制命令生效。
+
+**实测（2026-10-13 22:24，srv1）**：`SRV2_SSH_PORT=9` 连跑 3 次 → 第 3 次（22:24:27）发 HIGH → 中继 `seq=62 feishu=sent`；再跑一次真实探测 → 退出码 3、发出 INFO「srv2 已恢复」（22:24:29，中继 `seq=63`）。
+面的标题映射另用 stub 通知脚本验过（**不发真告警**）：只让容器面失败 → 标题「srv2 关键容器异常」；只让备份面失败 → 标题「srv2 备份/密钥状态异常」。
+
+**临时关闭**：`systemctl disable --now secagent-srv2deadman.timer`。
+
+### 28.3 漂移巡检：权威仓库 ↔ 服务器（防"落地物只存在服务器"）
+
+已接进**每日自检**（`scripts/srv1-daily-check.sh` 第 5 项）：`rc != 0` 即把当天自检判为失败并走 `notify.sh` 通路。
+
+```bash
+bash /opt/secagent/scripts/srv1-drift-check.sh              # 只打汇总行
+bash /opt/secagent/scripts/srv1-drift-check.sh --status     # 打完整报告
+bash /opt/secagent/scripts/srv1-drift-check.sh --baseline    # 只打印"这次拿什么当权威"
+bash /opt/secagent/scripts/srv1-drift-check.sh --accept      # 把当前状态登记为"已接受"（改登记表，带备份）
+cat /opt/secagent/logs/drift-report.txt                      # 明细
+```
+
+**基准（2026-10-13 修正，这一条最关键）** —— 权威侧**不再**是服务器自己的 `HEAD`：
+
+| 顺序 | 权威来源 | 怎么取 |
+|---|---|---|
+| ① 首选 | GitHub `main` | `timeout 25 git fetch origin main` → `git show origin/main:<path>` |
+| ② 退化 | 只读快照 `/opt/secagent/.repo-snapshot/` | 发布侧 `scripts/publish-drift-snapshot.ps1` 生成并推过来；含 `SNAPSHOT-INFO` + `MANIFEST.sha256` + `tree/` |
+
+**为什么必须改（实测）**：srv1 根本连不上 GitHub —— `github.com:443` 超时、`ssh.github.com:443` 能建 TCP 但
+`Permission denied (publickey)`，`/root/.ssh` 下没有任何 GitHub 凭据（`git fetch origin main` → 退出码 **128**）。
+而它自己的 `.git` HEAD 当时停在 `2999371`，GitHub main 已前进 8 个提交。旧版拿 `HEAD` 当基准 =
+**拿服务器那份旧仓库给服务器自己作证**，真实漂移会被静默吞掉。
+
+**fail-closed（不许静默用旧快照）**：
+
+- `DRIFT_SOURCE=origin`（只认 ①）时 fetch 失败 → **退出 2**；
+- 快照缺失 / 缺 `MANIFEST.sha256` / 缺 `tree/` / 任一文件哈希对不上 / `SNAP_HASHMODE` 不是
+  `sha256-cr-stripped` → **退出 2**；
+- 快照年龄 > `DRIFT_SNAPSHOT_MAX_AGE_DAYS`（默认 **7** 天）→ **退出 2**（阈值可配；边界实测：快照 30 天时阈值 29 天失败、40 天通过）；
+- 权威侧文件列表两次都为空 → **退出 2**（旧版就有这条：不能把"看不见仓库"当成"仓库是空的"）。
+
+**哈希口径**：两边都先 `tr -d '\r'` 再算 sha256。为什么：`.gitattributes` 里 `*.ps1 text eol=crlf`，
+Linux 检出后工作树是 LF，按原始字节比会**恒定误报 9 个 `.ps1`**（收口前登记表 12 条"内容不同"里有 9 条就是它）。
+CRLF↔LF 不是漂移。
+
+**快照怎么更新**（在权威仓库那台机器上）：
+
+```powershell
+pwsh -File scripts/publish-drift-snapshot.ps1          # PowerShell 5.1 也行：.\scripts\publish-drift-snapshot.ps1
+```
+
+它按 `HEAD` 逐 blob 导出 `scripts/` + `deploy/`，写 `MANIFEST.sha256`（同一 CR 口径）+ `SNAPSHOT-INFO`，
+推到 srv1 后由 `scripts/srv1-repo-snapshot.sh --install` 校验、原子替换、`chmod -R a-w` 置只读（旧快照留成 `.old-<时间戳>`）。
+srv1 侧还有 `--from-git [ref]`（哪天能连 GitHub 了就直接从 git 对象生成）与 `--status` / `--verify`。
+**快照过期 = 巡检失败**，所以"忘了更新快照"这件事本身会被每日自检报出来，不会静默降级。
+
+**计数**（汇总行最后一行是机读的）：
+
+```
+drift: diff=<n> missing_in_repo=<n> missing_on_server=<n> accepted=<m>  baseline=<origin/main@sha|snapshot@sha age=..d>  …
+```
+
+| 计数 | 含义 |
+|---|---|
+| `diff` | 两边都有、内容不一致 |
+| `missing_in_repo` | **服务器有、权威来源里没有** ← "落地物只存在服务器"，丢了就没了 |
+| `missing_on_server` | 权威来源里有、服务器上没有 |
+| `accepted` | 登记表里已接受的技术债（**不计入失败**，但仍原样打印在报告里） |
+
+**登记表**：`deploy/srv1-drift-accepted.txt`（已入库）。每行 `<sha256>  <path>  # 原因`。
+为什么必须有它：仓库与服务器本来就不会字节级同步（临时探针、现场新增的探测脚本），不加区分这个检查从第一天起就永远红 ——
+**一个永远红的检查等于没有检查**。登记是**内容哈希级**的：登记过的文件只要再改一个字节，立刻重新变成 `diff` 并告警。
+登记表自己会被排除（否则它会把自己报成 `missing_in_repo=1`，永远消不掉）。
+**登记表应当越缩越短**：每一项的正解都是"把文件提交进仓库"，`--accept` 只是把已知的债写在书面上。
+**2026-10-13 收口结果：51 项 → 1 项**（详见 28.5 第 3 条）。
+
+**被拦下的"假失败"（实测）**：`git status --porcelain -- scripts deploy` 会报 **112** 条，其中 62 条只是
+`100644→100755` 的权限位变化、其余是 `__pycache__/*.pyc`、`*.bak-<时间戳>`、`*~`、`*.orig` 这类缓存与编辑器残留。
+按内容哈希比对时这些**一条都不报**。
+
+**实测（2026-10-13 22:45–22:51，srv1 真跑两轮，最终被测脚本 sha256=cb391c57b528…）**：
+
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 基准解析（auto） | `srv1-drift-check.sh --baseline` | `baseline=snapshot@34c2e90c0105 age=0d files=157 kind=snapshot`，退出 **0**；stderr 写明"origin/main 不可用 → 退化到只读快照" |
+| 只认 GitHub | `DRIFT_SOURCE=origin … --baseline` | 退出 **2**：`drift: [X] DRIFT_SOURCE=origin 但 fetch/解析 origin/main 失败（网络/凭据/host key？）` |
+| **①真失败** | 新建 `scripts/zzz-drift-probe-server-only.sh` 后跑巡检 | 退出 **1**：`diff=0 missing_in_repo=1 missing_on_server=0 accepted=1`，报告点名 `[missing_in_repo] scripts/zzz-drift-probe-server-only.sh` |
+| **②恢复绿** | 删掉探针后再跑 | 退出 **0**：`missing_in_repo=0`；连跑 3 次全 0 |
+| **③快照过期** | 把一份快照的 `SNAP_TIME_EPOCH` 改到 30 天前 | 退出 **2**：`drift: [X] 只读快照已过期：30 天 > 阈值 7 天（SNAPSHOT-INFO 时间 …）` |
+| 阈值边界 | 同一份 30 天快照，阈值 29 / 40 天 | 退出 **2** / 退出 **0** |
+| 快照缺失 | `DRIFT_SNAPSHOT=/tmp/does-not-exist` | 退出 **2** |
+| 快照被篡改 | 往 `tree/scripts/srv1-drift-check.sh` 追加一行 | 退出 **2**：`1/157 个文件与 MANIFEST.sha256 不一致` |
+| 快照少文件 | 删掉 `tree/scripts/srv1-drift-check.sh` | 退出 **2**：`快照缺文件` |
+| 口径不认 | `SNAP_HASHMODE=sha256-raw` | 退出 **2**：`哈希口径不认` |
+| 收口后正常态 | `srv1-drift-check.sh` | 退出 **0**：`diff=0 missing_in_repo=0 missing_on_server=0 accepted=1`（唯一登记项是临时探针 `scripts/al.sh`） |
+
+**fail-closed 细节（旧版就有，保留）**：如果 `git ls-tree` 偶然返回空（git 偶发失败），脚本**拒绝出结论**（退出码 2）
+而不是把"看不见仓库"当成"仓库是空的"——否则登记表会把真实漂移全部"接受"掉、静默掩盖。
+这一条是实测踩出来的（曾出现一次 `config-snapshot.sh` 的假 `missing_in_repo`）。
+
+**srv1 没有仓库时**：所有服务器文件都会被记为 `missing_in_repo`（任务约定的退化行为），此时只看登记表。
+**临时关闭**：`DRIFT_CHECK_DISABLED=1`（或把每日自检第 5 项注释掉）。
+
+**收口动作（2026-10-13，服务器侧从此是"只读消费端"）**：
+srv1 连不上 GitHub，所以"对齐权威"不是 `git fetch origin`，而是把权威仓库整份打成 bundle 传过去：
+
+```bash
+# 权威侧（Windows）
+git bundle create <路径>\authoritative-main.bundle main      # 4.1MB，含完整历史
+scp <路径>\authoritative-main.bundle secagent-srv1:/root/
+# srv1
+cd /opt/secagent
+git bundle verify /root/authoritative-main.bundle
+git fetch /root/authoritative-main.bundle main
+git reset --hard FETCH_HEAD
+```
+
+实测：`reset --hard` 前先备份（`/root/opt-secagent-backup-<时间戳>.tgz`，272MB / 1070 条目，含 `.git` 与 `data/`），
+并逐条确认"会被删除的（D）= 0"、"`data/` 下会被改动的 = 0"（两个 tracked 的活数据
+`data/vector-store.json`、`data/security-events.json` 与目标提交逐字节相同）。
+服务器侧那 19 条"已 `git add` 未 `commit`"的遗留，逐条比对确认与权威提交内容**完全相同**（19/19），
+因此 `reset --hard` 丢掉索引不会丢任何内容。
+
+### 28.4 备份加密 + 排除 access 日志
+
+```bash
+bash /opt/secagent/scripts/srv1-data-backup.sh --dry-run   # 只快照+加密，不联系 srv2
+bash /opt/secagent/scripts/srv1-data-backup.sh             # 备份+加密+推送+触发 srv2 抽测
+bash /opt/secagent/scripts/srv1-data-backup.sh --status    # 本地归档 + srv2 清单 + 密钥状态
+bash /opt/secagent/scripts/srv1-data-backup.sh --drill     # 让 srv2 对最新一份再抽测一次
+```
+
+| 项 | 值 |
+|---|---|
+| 排除 | `data/access.jsonl*`（bash 通配，按文件名匹配）。它是**可再生的观测数据**，每天最多 64MB×7；排除了哪些、多大，会如实写进日志、`meta.txt` 的 `excluded=`，并回显在抽测输出里 —— **排除必须是可见的，不能静默少文件** |
+| 加密 | `openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt`（系统自带，零新增依赖） |
+| 归档名 | `data-<stamp>.tar.gz.enc`（**密文落盘**；明文只在加密期间短暂存在，随即删除，服务器上不留明文副本） |
+| 密钥 | **srv1 与 srv2 各一份：`/opt/secagent-backup.key`（600，root，内容相同，不进仓库）** |
+| 推送协议 | `push <stamp> <sha256> enc`（第三个参数是格式；旧脚本不带第三参 = `plain`，向后兼容） |
+| srv2 落盘 | 仍存**密文**；解密只发生在抽测的临时目录里；明文残留在 `.incoming` 会被清理 |
+| 恢复抽测 | srv2 收下后**立刻**跑 `secagent-backup-drill.sh`：① 外层 sha256 ② **解密** ③ 数量 ④ 路径集合 ⑤ 逐文件 `sha256sum -c manifest.sha256`；任一不过 → **删掉这份备份**（fail-closed，宁可不留也不留一份救不回来的） |
+| 保留 | srv2 留最近 **14** 份；srv1 本地留最近 **3** 份 |
+
+**srv2 侧接收脚本（2026-10-13 收口时一并入库）**：仓库里原先那份 `scripts/srv2-backup-receive.sh` 只认明文协议，
+而 srv2 上实际在跑的 `/usr/local/sbin/secagent-backup-receive`（11300B，2026-10-13 22:20）已经支持
+`push <stamp> <sha256> [enc|plain]`：`enc` 时用同一把 `/opt/secagent-backup.key` 解密到临时目录、按明文做归档结构校验、
+落盘仍存密文，明文删干净。**这又是一处"落地物只存在服务器"**（只在 srv2 上，仓库里从没有过），本次捞回仓库。
+只捞 srv1 侧不捞它的话，srv1 加密推、srv2 按明文收 = 一对不一致的实现。
+
+**实测（2026-10-13 22:21）**：
+
+- srv1 `--dry-run`：`access.jsonl:130724B` 被排除；11 个文件 / 明文 1756616 字节 → 密文 1756640 字节；密文头 2 字节 `5361`（gzip 魔数是 `1f8b`，不同即证明真的加密了）
+- 本地自证：`file` 认成 `openssl enc'd data with salted password`；`gzip -t` 报 `not in gzip format`；用密钥解开后头 2 字节回到 `1f8b`
+- srv2 收到后自动抽测：`恢复抽测 20261013-222113：11/11 一致（文件数 11 个，内容与归档时逐字节相同）`
+- **独立复核**（不只看抽测自己的结论）：在 srv2 上单独解密解包，与 srv1 线上 `data/` 逐文件算 sha256 对比 → **11/11 逐字节相同**
+- **负向测试**：用一把错的密钥去解同一份备份 → `抽测失败：解密失败`、退出码 1。**密钥不对会失败，不会静默通过**
+
+**密钥丢了会怎样（务必知道）**：所有 `*.tar.gz.enc` 都**解不开**，等于**没有备份**。密钥不在仓库、不在备份包里 ——
+它是这套备份链唯一"必须另外保管"的东西。所以：
+
+- 至少再存一份到运维自己的密码库/离线介质；
+- srv1 与 srv2 上的两份互为备份，但**不要**只有这两份（同一场事故可能同时毁掉它们）；
+- 轮换密钥 = 旧备份永久失效，必须**先**解密重打包**再**换，不能直接覆盖密钥文件。
+
+**从加密备份恢复（在 srv2 上取包 → 在 srv1 上还原）**：
+
+```bash
+# ① 在 srv2 上先自证能解开（不通过就别往下走）
+sudo /usr/local/sbin/secagent-backup-drill.sh /opt/secagent-backup/<stamp>
+# ② 取回本机（由运维自己的 SSH 通道；备份通道是单向只写的）
+scp root@43.143.114.79:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc .
+# ③ 在 srv1 上：先验外层没坏
+sha256sum -c <(scp root@43.143.114.79:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc.sha256 - | sed "s|data-<stamp>|$PWD/data-<stamp>|")   # 或手工比对哈希
+# ④ 解密 + 解包（cwd 必须是 data 的父目录：manifest 里是 data/xxx 相对路径）
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in data-<stamp>.tar.gz.enc \
+  -pass file:/opt/secagent-backup.key | tar -xzf - -C /opt/secagent
+# ⑤ 逐文件校验
+cd /opt/secagent && sha256sum -c manifest.sha256
+# ⑥ 属主/权限必须与原状一致（否则容器写不进去）：目录 750、文件 644、owner 999:999
+#    ⚠️ 999 在 srv1 上叫 systemd-coredump:input、在 srv2 上叫 lxd:input —— 名字不同、数字相同，
+#       所以只用数字（或直接 tar 解压），不要按名字 chown
+```
+
+**临时关闭加密**：没有开关，`/opt/secagent-backup.key` 不在时备份会**直接失败**并保留旧归档 ——
+这是刻意的 fail-closed（绝不静默退回明文）。
+**临时关闭整个备份**：`systemctl disable --now srv1-data-backup.timer`。
+
+### 28.5 已知局限与疑虑（如实列，别当成已解决）
+
+1. **25 秒级检测有误报风险**。容器在"重建"的一瞬间（`docker compose up -d --no-build` 会先移除再创建）本来就不存在，2 次×25 秒的窗口有可能连击到它。缓解手段是**部署窗口抑制**（发布链持 `/var/lock/secagent-deploy.lock` 时不告警），但任何**不走那把锁**的重建（手工 `docker rm` + `run`、`systemctl restart docker` 等）仍会被判成故障。这是刻意的取舍：宁可偶尔多报一次，也不回到"删了 30 秒没人知道"。真嫌吵就把 `FAIL_THRESHOLD` 调 3（≈75 秒）。
+2. **夜间静默会把 HIGH 压成 MEDIUM**。`/opt/secagent/.env` 里 `NOTIFY_NIGHT_QUIET=22:00-07:00` + 默认 `downgrade` 模式。
+   本次两处告警实测都在 22:11/22:24 发出，`notify.log` 明确写着「夜间静默：级别 HIGH → MEDIUM（消息仍会发出，只是降级）」，中继侧记为 `high=False`（**只发飞书、跳过邮件**）。
+   也就是说：**夜里真正的容器停机，邮件通道不会响**。要么接受（飞书会响、正文里有降级标注），要么把容器守卫/反向心跳改成 `--force` 发送，要么把 `NOTIFY_NIGHT_QUIET_MODE` 改成 `high-only`。
+3. **漂移巡检的"登记表"仍是债，但已经从 51 项缩到 1 项**（2026-10-13 收口）。
+   收口前那 51 项里绝大多数是**假债**：9 项只是 `*.ps1` 的 CRLF↔LF；31 项是"服务器工作树比它自己的旧 HEAD 新"
+   （srv1 的 HEAD 停在 `2999371`，GitHub main 已前进 8 个提交）造成的 `missing_in_repo`。
+   真正只存在于服务器、且属于我们自己运维资产的 12 个文件已逐个入库（§28 开头那张表）。
+   剩下这 1 项是临时探针 `scripts/al.sh`：**"服务器上的唯一文件不许删"是本次硬约束**，所以登记而不是删除，处置权在站主。
+4. **两份 RUNBOOK 已经合并**：本节已作为 §28 补录进【权威仓库的 RUNBOOK】，服务器侧 `/opt/secagent` 也按
+   `git reset --hard` 对齐到同一个提交，所以两份 RUNBOOK 从此同源。原服务器版的 §22 段落里的 §22.3（旧基准）
+   已被本节取代 —— 看漂移巡检一律以 **28.3** 为准。
+5. **反向心跳的覆盖面**：srv2 的 `wazuh.indexer/manager/dashboard`、`cowrie`、`suricata` 是按**容器名**精确检查的；
+   如果这些容器将来改名，检查会报 `missing`（会告警，不会漏报），需要同步改 `SRV2_REQUIRED_CONTAINERS`。
+   另外 srv1→srv2 的探活钥匙新增了一条 `authorized_keys` 条目（`restrict` + 强制命令），
+   撤销办法：在 srv2 上跑 `bash /opt/secagent/scripts/srv2-authorize-srv1-heartbeat-key.sh --rollback`。
+6. **加密用的是 `openssl enc`（口令派生，不是有认证的 AEAD）**。`-pbkdf2 -iter 200000` 对抗口令爆破是够的，
+   但 CBC 没有完整性认证：密文被篡改时**可能**解出垃圾而不是报错。之所以不影响结论，是因为
+   外层还有 sha256、内层还有逐文件 `sha256sum -c manifest.sha256` —— 篡改一定会被后面的校验抓到。
+   要更强的方案就换 `gpg --symmetric --cipher-algo AES256`（本次刻意不引依赖，且要先确认机器上有 gpg）。
+7. **漂移巡检的性能**：origin 模式每个文件一次 `git show`（157 个文件、一轮约 2–3 秒）；
+   snapshot 模式只在装载快照时逐文件算一次 sha256 做完整性校验，之后逐文件比对用的是清单里的哈希。
+   文件数量级再涨一个量级就要改成 `git cat-file --batch` 批量取。
+8. **漂移巡检的覆盖面是有限的（别读成"服务器上什么都盯着"）**：它只比 `/opt/secagent/{scripts,deploy}`
+   （`DRIFT_DIRS` 可改），**不覆盖**：`/etc/systemd/system/` 下安装的 unit 副本（装了但仓库里没有、或改了没同步，
+   巡检看不见）、srv2 上的 `/usr/local/sbin/*`（本次就是靠人工比对才发现 `secagent-backup-receive` 比仓库新）、
+   `/etc/fail2ban/` 与 `/etc/wazuh*` 等"安装后才有"的落点、以及 `docker-compose.yml` 之外被发布链生成的
+   `.ci-override.yml`。把覆盖面扩到"安装落点"是**下一步**的事，本轮没做。
+9. **srv1 的 `origin/main` 引用是过期的，别看它判断一致性**：srv1 连不上 GitHub，`origin/main` 永远停在 `2999371`，
+   所以 `git status` 会显示 "ahead of 'origin/main' by 35 commits"。判断 srv1 是否与权威一致，
+   要比对权威 bundle / 快照里的 commit（`git rev-list --left-right --count <权威提交>...HEAD` 应为 `0  0`），
+   不要读 `origin/main`。
