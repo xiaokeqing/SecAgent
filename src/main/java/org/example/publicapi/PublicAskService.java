@@ -360,7 +360,11 @@ public class PublicAskService {
         m.put("blocked", true);
         m.put("hitCount", hits.size());
         m.put("guard", "PromptInjectionGuard");
-        m.put("handling", "命中即拒绝生成；未命中时也会把问题包裹为 UNTRUSTED_DATA 再送模型");
+        // 【2026-10-13 实测补充】这里原来写着包裹标记的字面名（UNTRUSTED_DATA）。
+        // F3 已经把「拒绝文案里的字面内部标记」去掉，但这个元数据字段漏了 ——
+        // 公开响应里一个字面内部治理词汇都不该有（它与 answer 一样会被页面显示）。
+        // 所以改成描述性说法：说清做法，不给出内部记号本身。
+        m.put("handling", "命中即拒绝生成；未命中时也会把问题按「不可信数据」包裹后再送模型");
         return m;
     }
 
