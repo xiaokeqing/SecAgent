@@ -146,6 +146,19 @@ services:
       APP_GEOIP_MIN_SHARE_PERCENT: "${APP_GEOIP_MIN_SHARE_PERCENT:-1.0}"
       APP_GEOIP_TOP_IPS: "${APP_GEOIP_TOP_IPS:-1000}"
 
+      # ===== 攻击故事线 /api/public/stories + /api/public/story（RUNBOOK §32）=====
+      # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_WEBSTATS_* 同一个教训：
+      #   不在这里透传时，"在 .env 里加一行 APP_PUBLIC_STORY_*"会【不生效且不报错】。
+      # 【是什么】把同一个来源的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」串成时间线。
+      #   前三段来自 Wazuh indexer；处置审计来自应用侧留痕文件（不在 indexer 里）。
+      # 【不许编】某段取不到就进 gaps[]，并在 coverage.stageStatus 里区分
+      #   OK / NOT_WIRED / UNKNOWN —— "没接入"与"没发生"必须能分开读。
+      # 【蜜罐命令】数据源里没有命令执行规则 → commandsAvailable=false（不编命令序列）。
+      # 【候选池】内网/保留地址与我方 APP_GEOIP_SELF_IPS 不进榜；排除数由 coverage 如实给出。
+      APP_PUBLIC_STORY_TOP_SOURCES: "${APP_PUBLIC_STORY_TOP_SOURCES:-50}"
+      APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE: "${APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE:-40}"
+      APP_PUBLIC_STORY_MAX_LIMIT: "${APP_PUBLIC_STORY_MAX_LIMIT:-20}"
+
       # ===== 公开聚合端点 /api/public/webstats（访问日志的只读聚合，RUNBOOK §29）=====
       # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_PUBLIC_*/APP_GEOIP_* 同一个教训：
       #   env_file 只是"运行时兜底"，而 SPRING_APPLICATION_JSON 的优先级更高 ——

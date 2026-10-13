@@ -760,6 +760,155 @@ public class PublicApiController {
         return out;
     }
 
+    // ==================== 攻击故事线（/stories + /story；设计见 docs/design-attack-story-endpoint.md，运维见 RUNBOOK §32） ====================
+
+    /**
+     * 攻击故事线服务（<b>可为空</b>：单测直接 new 控制器、或裁剪过的部署里就是 null）。
+     *
+     * <p>空 → 两个端点如实返回 {@code available=false + STORY_DISABLED}，
+     * 绝不用"空事件流"冒充"这个来源什么都没做"。
+     */
+    @Autowired(required = false)
+    private AttackStoryService attackStoryService;
+
+    /**
+     * <b>值得看的来源</b>：把同一个来源的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」四段
+     * 各自的条数与首末时间列出来，并给出 <b>{@code gaps[]}</b>（哪几段确实没有数据）。
+     *
+     * <h3>它和 {@code /alerts} 的区别</h3>
+     * {@code /alerts} 回答"现在有什么告警"（一条一条），本端点回答"哪些来源的故事是完整的"
+     * （一个来源一行）。后者是博客"看一次攻击全过程"页面的入口列表。
+     *
+     * <h3>口径（三条都写进了测试）</h3>
+     * <ol>
+     *   <li><b>不许编</b>：某一段没有数据就写进 {@code gaps[]}；那一段本身"接没接上"
+     *       由 {@code coverage.stageStatus} 单独回答（{@code OK} / {@code NOT_WIRED} / {@code UNKNOWN}）——
+     *       "没接入"与"没发生"必须能分开读；</li>
+     *   <li><b>内网/保留地址与我方 IP 不进榜</b>：它们在公开口径里都写成「内网/未知」，
+     *       几个不同的内网地址会被合并成同一个显示值（实测 24h 里某个内网地址有 4 万+ 条），
+     *       画出来就是"内网/未知 打了我们 4 万次"；排除数在 {@code coverage} 里如实给出；</li>
+     *   <li><b>IP 按既有口径显示</b>（{@link PublicIpPolicy}，默认真实地址；掩码态逐字节回归）。</li>
+     * </ol>
+     *
+     * <p>复用既有外壳：同一个限流器（20 次/分钟）、同一个 CORS 白名单、同一个 ETag 过滤器、
+     * 同一个 15 秒 {@link Snapshot}（按 window 分开存）、同一个 {@code ok(...)}
+     * （因此自动带 {@code ipDisclosure} 与内部资产名过滤），不新增任何公开面机制。
+     */
+    @GetMapping("/stories")
+    public ResponseEntity<Map<String, Object>> stories(
+            @RequestParam(value = "window", required = false) String window,
+            @RequestParam(value = "limit", required = false) String limit,
+            HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        Integer hours = AttackStoryService.parseWindowHours(window);
+        if (hours == null) {
+            return badRequest(res, "WINDOW_NOT_SUPPORTED",
+                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
+                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
+                            + "；其它窗口没有数据源验证，不猜）");
+        }
+        if (attackStoryService == null) {
+            return ok(storyDisabled(hours, null), res);
+        }
+        // 缓存与 limit 归一都在 AttackStoryService 里（它按 window / src 分开存，
+        // 单个 Snapshot 只存一份值，用在这里会把不同窗口的结果互相顶掉）
+        return ok(attackStoryService.stories(hours, attackStoryService.parseLimit(limit)), res);
+    }
+
+    /**
+     * <b>一个来源的事件流</b>：{@code ts / stage / kind / summary / severity 或 outcome}，
+     * 按时间升序合并四段；外加每段的 {@code coverage}（查到多少条、哪些段读不到/未接入 + 原因）。
+     *
+     * <h3>为什么只服务"候选池里的来源"</h3>
+     * 候选池 = 同一窗口内 {@code /stories} 用的那份聚合结果（最多 {@code top-sources} 个）。
+     * 若允许任意 {@code src}，这个端点就变成"随便给个 IP 就能问'他有没有打过我们'"的查询器 ——
+     * 那本身就是情报泄露，而且与"给榜上的攻击源画时间线"是两件事。
+     * 不在池里一律 <b>404</b>（与 {@code /alerts/{aggId}} 的 404 同一形状）。
+     *
+     * <h3>只给摘要与结论</h3>
+     * 规则描述文本固定顺序处理：<b>先隐口令</b>（与开关无关）→ <b>再按 IP 口径</b> → 截断；
+     * 索引查询本身就是字段白名单（{@code data.password} / {@code data.message} / {@code full_log}
+     * 根本不进入进程）。蜜罐命令时间线没有数据源 → {@code commandsAvailable=false}（不编）。
+     */
+    @GetMapping("/story")
+    public ResponseEntity<Map<String, Object>> story(
+            @RequestParam(value = "src", required = false) String src,
+            @RequestParam(value = "window", required = false) String window,
+            HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        Integer hours = AttackStoryService.parseWindowHours(window);
+        if (hours == null) {
+            return badRequest(res, "WINDOW_NOT_SUPPORTED",
+                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
+                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
+                            + "）");
+        }
+        String ip = src == null ? "" : src.trim();
+        if (ip.isEmpty()) {
+            return badRequest(res, "MISSING_SRC", "缺少 src 参数（要查哪一个来源）");
+        }
+        if (attackStoryService == null) {
+            return ok(storyDisabled(hours, ip), res);
+        }
+        // 只接受"公网字面量"这一种形状：形状不对直接 400，不拿它去查任何东西
+        if (!AttackStoryService.isPublicIp(ip)) {
+            return badRequest(res, "INVALID_SRC",
+                    "src 必须是观测到的公网来源地址（IPv4/IPv6 字面量）；内网/保留地址不进入故事线");
+        }
+        Map<String, Object> data = attackStoryService.story(ip, hours);
+        if (data == null) {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("code", 404);
+            body.put("message", "该来源不在当前窗口的候选池里（可能是窗口外、我方 IP、内网地址，"
+                    + "或这一段没有它的记录）；请先看 /api/public/stories");
+            body.put("reason", "SOURCE_NOT_IN_WINDOW");
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
+        }
+        return ok(data, res);
+    }
+
+    /**
+     * 故事线服务未装配时的降级载荷（与可用载荷同名同形，前端只判 available）。
+     *
+     * <p>两个端点的形状不同，所以按调用方补对应的空集合键：
+     * {@code srcIp == null}（来自 {@code /stories}）补 {@code sources: []}，
+     * 否则（来自 {@code /story}）补 {@code events: []}。混着返回会让页面
+     * 把"候选列表"当"事件流"渲染。
+     */
+    private Map<String, Object> storyDisabled(int windowHours, String srcIp) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", LocalDateTime.now().format(FMT));
+        data.put("cacheSeconds", Math.max(0, cacheSeconds));
+        data.put("window", AttackStoryService.windowLabel(windowHours));
+        data.put("windowHours", windowHours);
+        data.put("available", false);
+        data.put("reason", "STORY_DISABLED");
+        data.put("note", "攻击故事线未装配（裁剪过的部署，或单测直接 new 控制器）："
+                + "不返回任何来源/事件，也不用内部样本顶替");
+        if (srcIp == null) {
+            data.put("sources", List.of());
+        } else {
+            data.put("srcIp", policy().display(srcIp));
+            data.put("events", List.of());
+            data.put("eventCount", 0);
+        }
+        return data;
+    }
+
+    /** 400：参数不合法（只回机读 reason + 人话，不回任何内部细节） */
+    private ResponseEntity<Map<String, Object>> badRequest(HttpServletResponse res, String reason, String message) {
+        res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", 400);
+        body.put("message", message);
+        body.put("reason", reason);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    }
+
     // ==================== 访问日志聚合（/api/public/webstats；设计见 docs/design-webstats-public-endpoint.md） ====================
 
     /** 聚合端点自己的快照（与 /geo 分开：它读的是内存聚合器，不碰 indexer） */

@@ -322,6 +322,24 @@ app:
       top-countries: 20                                    # 国家榜上限
       top-provinces: 10                                    # 每个国家内部的省份榜上限
       top-asns: 10                                         # ASN 榜上限
+    # ===== 攻击故事线 /api/public/stories + /api/public/story（RUNBOOK §32）=====
+    # 【它是什么】把同一个来源的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」串成一条时间线，
+    #   让博客能开一个"看一次攻击全过程"的页面。stories = 有哪些来源值得看；story = 某来源的事件流。
+    # 【四段的数据源（不一样，别想当然）】
+    #   · alerts / decoyPorts / honeypotLogins 来自 Wazuh indexer（rule.groups 分别是不含
+    #     cowrie/dionaea、dionaea、cowrie 登录规则 100101/100102）；
+    #   · auditActions 来自应用侧处置留痕 data/response-audit.json —— 【不在 indexer 里】，单独拼装。
+    #   某一段取不到就写进 gaps[]，并在 coverage.stageStatus 里区分"OK / NOT_WIRED / UNKNOWN"：
+    #   "没接入"与"这个来源没做这一步"必须能分开读（否则会把没接入误读成没发生）。
+    # 【蜜罐命令时间线】数据源里没有命令执行规则 → commandsAvailable=false，不编造命令序列。
+    # 【不许编】宁可少一段，也不许编一段：取不到就如实写"读不到/未接入 + 原因"。
+    # 【我方 IP / 内网地址】不进候选池（内网地址在公开口径里都写成「内网/未知」，
+    #   合并后会出现"内网/未知 打了我们 4 万次"这种误导读数）；排除数在 coverage 里如实给出。
+    # ⚠️ 与 APP_QUOTA_*/APP_WEBSTATS_* 同一个坑：docker-compose.yml 的 environment 段必须显式透传。
+    story:
+      top-sources: ${APP_PUBLIC_STORY_TOP_SOURCES:50}                    # 候选来源上限（indexer terms size）
+      max-events-per-stage: ${APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE:40}  # 单来源单阶段最多取回多少条事件
+      max-limit: ${APP_PUBLIC_STORY_MAX_LIMIT:20}                        # /stories 的 limit 上限
   # ===== 离线地理富化（DB-IP Lite City + ASN，CC BY 4.0；RUNBOOK §26）=====
   # 零联网：只读本地库文件，绝不在请求路径上调任何在线地理/情报 API。
   # 署名要求（CC BY 4.0）：公开页面与 /api/public/geo 的 note 里必须带

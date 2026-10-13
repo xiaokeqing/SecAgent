@@ -169,6 +169,62 @@ public class PublicAlertSource {
         }
     }
 
+    /**
+     * <b>攻击故事线</b>：窗口内按来源 IP 汇总的候选来源（只读聚合）。
+     *
+     * <p>fail-closed 与其余取数一致：数据源不是 REAL、网关抛异常、网关返回 null，
+     * 一律返回 {@code available=false} + 机读 reason，绝不用空列表冒充"这段时间没有攻击"。
+     */
+    public Map<String, Object> storySources(int windowHours, int topSources) {
+        if (!available()) {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("available", false);
+            m.put("reason", "DATA_SOURCE_UNAVAILABLE");
+            m.put("note", "告警数据源不是 REAL（当前 " + mode() + "）：故事线不返回任何数据，"
+                    + "也不以内置样本顶替");
+            return m;
+        }
+        try {
+            Map<String, Object> m = wazuhGateway.storySources(windowHours, topSources);
+            return m == null ? unavailable("DATA_SOURCE_UNAVAILABLE", "网关未返回故事线候选聚合") : m;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取故事线候选聚合失败：{}", e.getMessage());
+            return unavailable("QUERY_FAILED", "故事线候选聚合查询异常：" + e.getMessage());
+        }
+    }
+
+    /**
+     * <b>攻击故事线</b>：单个来源在窗口内按阶段分组的明细事件。
+     *
+     * <p>fail-closed 同上：非 REAL 时返回"不可用"，绝不返回空事件列表冒充
+     * "这个来源什么都没做"（那是完全相反的两个结论）。
+     */
+    public Map<String, Object> storyEvents(String srcIp, int windowHours, int maxPerStage) {
+        if (!available()) {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("available", false);
+            m.put("reason", "DATA_SOURCE_UNAVAILABLE");
+            m.put("note", "告警数据源不是 REAL（当前 " + mode() + "）：不返回任何事件，"
+                    + "也不以内置样本顶替");
+            return m;
+        }
+        try {
+            Map<String, Object> m = wazuhGateway.storyEvents(srcIp, windowHours, maxPerStage);
+            return m == null ? unavailable("DATA_SOURCE_UNAVAILABLE", "网关未返回故事线明细") : m;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取故事线明细失败：{}", e.getMessage());
+            return unavailable("QUERY_FAILED", "故事线明细查询异常：" + e.getMessage());
+        }
+    }
+
+    private static Map<String, Object> unavailable(String reason, String note) {
+        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("available", false);
+        m.put("reason", reason);
+        m.put("note", note);
+        return m;
+    }
+
     /** 聚合去重后的告警列表（与自用界面同一套聚合口径，避免两个页面数字对不上） */
     public List<Map<String, Object>> aggregated() {
         return aggregator.aggregate(readAlerts());

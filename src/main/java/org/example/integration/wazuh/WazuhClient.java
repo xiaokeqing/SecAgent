@@ -544,6 +544,100 @@ public class WazuhClient {
     }
 
     /**
+     * 攻击故事线的<b>候选来源聚合</b>：窗口内按来源 IP 分别统计各阶段条数 + 首末时间 + 最高等级。
+     *
+     * <h3>为什么是"一条查询、多个 filter 聚合"</h3>
+     * 故事线要把同一个来源在 <b>告警 / 诱饵端口 / 蜜罐登录</b> 三段的记录关联起来。
+     * 如果按 IP 逐个查，就是 N+1 次往返；而"先取 TOP N 个来源、再各自下钻"又会让
+     * 候选集合本身依赖每个阶段的数据（排不出来）。这里让 indexer 一次把
+     * "每个阶段的 TOP N 来源"都算出来，Java 侧按 IP 合并 —— 一次往返、字节数 KB 级。
+     *
+     * <h3>为什么每个阶段都要查两个来源字段</h3>
+     * 实测同一索引里两类告警的来源字段名不同：主机侧/蜜罐写 {@code data.srcip}，
+     * Suricata（经 Wazuh agent 进来）写 {@code data.src_ip}。
+     * 只查一个字段会丢掉一大半来源 —— 而这种"少了一半还不报错"是最难发现的错。
+     * 字段名由配置给出（{@code app.geoip.src-ip-fields}），不写死在代码里。
+     *
+     * <p>{@code src_present} 这个 filter 聚合回答"窗口内有多少条告警真的带来源 IP"：
+     * 公开端点要用它如实标注分母，否则读者会以为候选来源覆盖了全部告警。
+     *
+     * @param windowHours 时间窗口（小时，1–168）
+     * @param topSources  每个阶段每个字段取多少个来源（terms size，1–500）
+     * @param srcFields   来源 IP 的字段名（至少一个）
+     */
+    public JsonNode fetchStorySources(int windowHours, int topSources,
+                                      java.util.List<String> srcFields) throws IOException {
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址（integration.wazuh.indexer-url）");
+        }
+        int hours = Math.max(1, Math.min(windowHours, 168));
+        int size = Math.max(1, Math.min(topSources, 500));
+
+        java.util.Map<String, Object> aggs = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < srcFields.size(); i++) {
+            String f = srcFields.get(i);
+            aggs.put("alerts_" + i, stageAgg(f, size,
+                    java.util.Map.of("bool", java.util.Map.of("must_not",
+                            java.util.List.of(java.util.Map.of("terms",
+                                    java.util.Map.of("rule.groups", java.util.List.of("cowrie", "dionaea"))))))));
+            aggs.put("decoy_" + i, stageAgg(f, size,
+                    java.util.Map.of("term", java.util.Map.of("rule.groups", "dionaea"))));
+            aggs.put("honeypot_" + i, stageAgg(f, size,
+                    java.util.Map.of("term", java.util.Map.of("rule.groups", "cowrie"))));
+            aggs.put("logins_" + i, stageAgg(f, size,
+                    java.util.Map.of("terms", java.util.Map.of("rule.id", java.util.List.of("100101", "100102")))));
+        }
+        java.util.List<Object> should = new java.util.ArrayList<>();
+        for (String f : srcFields) {
+            should.add(java.util.Map.of("exists", java.util.Map.of("field", f)));
+        }
+        aggs.put("src_present", java.util.Map.of("filter",
+                java.util.Map.of("bool", java.util.Map.of("should", should, "minimum_should_match", 1))));
+
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("size", 0);
+        body.put("track_total_hits", true);
+        body.put("query", java.util.Map.of("bool", java.util.Map.of("filter",
+                java.util.List.of(java.util.Map.of("range",
+                        java.util.Map.of("@timestamp", java.util.Map.of("gte", "now-" + hours + "h")))))));
+        body.put("aggs", aggs);
+
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/wazuh-alerts-*/_search")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .post(RequestBody.create(mapper.writeValueAsString(body), JSON))
+                .build();
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
+            String respBody = resp.body() != null ? resp.body().string() : "";
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 故事线聚合查询失败 HTTP " + resp.code() + ": " + snippet(respBody));
+            }
+            return mapper.readTree(respBody);
+        }
+    }
+
+    /** 一个阶段的聚合：可选 preFilter + 按来源字段分桶 + 桶内首末时间/最高等级 */
+    private static java.util.Map<String, Object> stageAgg(String field, int size,
+                                                          java.util.Map<String, Object> preFilter) {
+        java.util.Map<String, Object> sub = new java.util.LinkedHashMap<>();
+        sub.put("min_ts", java.util.Map.of("min", java.util.Map.of("field", "@timestamp")));
+        sub.put("max_ts", java.util.Map.of("max", java.util.Map.of("field", "@timestamp")));
+        sub.put("max_level", java.util.Map.of("max", java.util.Map.of("field", "rule.level")));
+        java.util.Map<String, Object> terms = new java.util.LinkedHashMap<>();
+        terms.put("field", field);
+        terms.put("size", size);
+        java.util.Map<String, Object> ips = new java.util.LinkedHashMap<>();
+        ips.put("terms", terms);
+        ips.put("aggs", sub);
+
+        java.util.Map<String, Object> stage = new java.util.LinkedHashMap<>();
+        // filter 聚合必须带 filter 子句：没有前置条件时用 match_all（缺了它会直接 400）
+        stage.put("filter", preFilter != null ? preFilter : java.util.Map.of("match_all", java.util.Map.of()));
+        stage.put("aggs", java.util.Map.of("ips", ips));
+        return stage;
+    }
+
+    /**
      * 通用只读 indexer 查询（蜜罐战报等公开只读端点用）。     *
      * <p>刻意只接受<b>查询体</b>、只走 {@code _search}：不给调用方留写操作的口子，
      * 也避免有人顺手把删改请求传进来。

@@ -3515,11 +3515,29 @@ sudo bash /usr/local/sbin/srv2-dionaea-check.sh              # 自检（顺序�
 sudo bash /usr/local/sbin/srv2-honeypot-egress-probe.sh      # 隔离实测探针（数 SYN）
 sudo bash /usr/local/sbin/srv2-dionaea-cleanup.sh [--apply]  # 磁盘上限维护
 sudo tail -f /opt/dionaea/var/log/dionaea/dionaea.json       # 结构化事件（Wazuh 吃的就是它）
+sudo tail -20 /opt/secagent/logs/honeypot-egress-check.log   # 每天 09:40 的隔离实测结果
 ```
+
+**隔离是每日自动检查的一等项**（`/etc/cron.d/secagent-honeypot-egress`，每天 09:40）：
+跑一次 egress-probe，结果（**含 rc=0 的正常态**）追加到
+`/opt/secagent/logs/honeypot-egress-check.log`；**只要退出码非 0 就 `notify.sh HIGH`**。
+探针的退出码是有语义的、fail-closed 的：
+
+| rc | 含义 | 为什么这样设计 |
+|---|---|---|
+| 0 | 隔离有效**且测量被证明有效** | 只有"对照组确实在 eth0 抓到 SYN"才允许 0 |
+| 1 | 有洞（有端口真的把 SYN 发出去了） | — |
+| 2 | **测量无效**（对照组没抓到 SYN / 探测容器没产出） | **不许把"没抓到"当"隔离住了"** —— rc=2 也会报警 |
+| 3 | 前置不满足（非 root / 没 tcpdump / 拿不到网段） | 拒绝在测不了的情况下给通过 |
+
+实测（2026-10-14）：正常态 rc=0；人为在链首插一条 `-s 172.19.0.0/16 -j ACCEPT` 造洞 → rc=1
+且经 `notify.sh` 真发到本地 sink（HTTP 200）；对照组指向回环 → rc=2；
+镜像不存在导致探测容器起不来 → rc=2；撤规则后 `iptables -S DOCKER-USER` 与测试前逐字一致。
+另：探针只在 stdout 是终端时上色（否则通知正文会带 ANSI 乱码）。
 
 仓库落点（`deploy/srv2-dionaea/`、`scripts/srv2-dionaea-*.sh`、`scripts/srv2-honeypot-*-probe.sh`）
 与服务器副本 **sha256 一致**，并已进落点基线
-（`srv1-installed-manifest.sh --capture`，34 个落点，`--check` 为 0 missing / 0 changed / 0 added）。
+（`srv1-installed-manifest.sh --capture`，35 个落点，`--check` 为 0 missing / 0 changed / 0 added）。
 
 ### 31.10 没做到 / 可疑的（如实列）
 
@@ -3559,3 +3577,274 @@ sudo tail -f /opt/dionaea/var/log/dionaea/dionaea.json       # 结构化事件�
    以及 `docker exec` 少了 `-i` 时 `wazuh-logtest` 拿不到 stdin，
    自测会输出两行横幅、看起来像"规则没命中"，实际是"根本没喂进去"。
 
+
+## 32. 公开端点 `GET /api/public/stories` + `GET /api/public/story`（攻击故事线，2026-10-14 落地）
+
+```
+【它是什么】把【同一个来源】的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」串成一条时间线，
+  让博客能开一个"看一次攻击全过程"的页面：
+    · GET /api/public/stories?limit=10&window=24h —— 哪些来源值得看（按剧本完整度/严重度排序），
+      每条给 stages 四段计数、首末时间、severityMax，以及 gaps[]（哪几段【没有数据】）；
+    · GET /api/public/story?src=<IP>&window=24h —— 该来源的事件流
+      （ts/stage/kind/summary/severity 或 outcome）+ 每段的 coverage（查到多少条、
+      哪些段读不到/未接入 + 原因）。
+  前端画法与字段读法见 docs/design-attack-story-endpoint.md（给博客对接方的版本）。
+
+【⚠️ 编号说明】任务书里这一节写的是 §31，但并行的另一位实施方先提交了
+  「§31 = Dionaea 上线」（commit c07fd27）。为了不覆盖别人的章节，本节落在 §32；
+  代码/配置/测试里的引用已同步为 §32。
+
+【四段的数据源（不一样，别想当然）】
+  · alerts          —— Wazuh indexer wazuh-alerts-*，rule.groups 不含 cowrie/dionaea 的告警；
+  · decoyPorts      —— 同上，rule.groups=dionaea（规则 100300/100301/100302/100310，§31 上线）；
+  · honeypotLogins  —— 同上，Cowrie 登录规则 100101/100102；
+  · auditActions    —— 【不在 indexer 里】：服务机上的处置留痕 data/response-audit.json。
+  前三段是"被攻击的痕迹"，第四段是"我们的动作"，它们唯一能关联的键是【来源 IP】。
+  测试两个来源字段（app.geoip.src-ip-fields = data.srcip,data.src_ip）分别聚合后按 IP 合并 ——
+  只查一个字段会安静地丢掉一大半来源（Suricata 侧写 data.src_ip、主机侧/蜜罐写 data.srcip）。
+
+【口径：宁可少一段，也不许编一段（本项验收的关键）】
+  · 某段取不到 → 进 gaps[]；那一段【本身】接没接上由 coverage.stageStatus 单独回答
+    （OK / NOT_WIRED / UNKNOWN）。"没接入"与"这个来源没做这一步"必须能分开读。
+  · 蜜罐命令时间线【没有数据源】（Wazuh 侧没有命令执行规则）→ commandsAvailable=false，
+    页面不许用推测把命令序列画出来。
+  · 取不到就写"读不到/未接入 + 原因"，绝不用别的数据顶替、也不用 0 冒充"他没干过"。
+
+【为什么"原始 IP"只在服务端流转】掩码态下 45.205.***.*** 匹配不到任何记录，所以四段关联
+  必须用索引/留痕里的原始地址做 key。原始值只存在于攻击故事线服务内部（Map 的 key），
+  公开载荷一律过 PublicIpPolicy.display(...) —— 内部结构与公开载荷是【两个对象】。
+
+【复用既有的公开面外壳，一个新机制都不加】同一个限流器（20 次/分钟，304 也计入）、
+  同一个 CORS 白名单、同一个 ETag 过滤器、同一个 15 秒快照（按 window/src 分开存）、
+  同一个 ok(...)（因此自动带 ipDisclosure 与 PublicAssetFilter 资产名过滤）。
+```
+
+### 32.1 字段白名单（公开契约：只许新增，不许改名/删除）
+
+```
+GET /api/public/stories
+  generatedAt / cacheSeconds / window / windowHours / available / reason
+  limit / candidates / sourceCount
+  stageLabels{alerts,decoyPorts,honeypotLogins,auditActions}
+  sources[]{srcIp, stages{四段计数}, stagesWithData, stageCount,
+            firstSeen, lastSeen, severityMax, severityMaxLabel,
+            gaps[], gapLabels[], honeypotEvents}
+  coverage{windowHours, indexerTotalAlerts, withSourceIp, topSources,
+           stageStatus{四段: OK|NOT_WIRED|UNKNOWN}, stageNotes{}, 
+           excludedSelf, excludedInternal, audit{...}}
+  limits{defaultLimit, maxLimit, topSources, maxEventsPerStage, supportedWindows}
+  note / ipDisclosure{...}
+
+GET /api/public/story
+  generatedAt / cacheSeconds / window / windowHours / available / reason / srcIp
+  firstSeen / lastSeen / severityMax / severityMaxLabel / gaps[]
+  stages{四段计数}
+  events[]{ts, stage, stageLabel, kind, summary, severity, severityLabel, outcome}
+  eventCount / truncated
+  coverage{ 每段{status, reason, note, queried, returned, truncated, source[, actionRecords…]} 
+            + windowHours + maxEventsPerStage }
+  commandsAvailable / commandsNote
+  limits{...} / note / ipDisclosure{...}
+```
+
+**排序（页面可直接依赖，测试钉住）**：① `stagesWithData` 多者在前 → ② `severityMax` 高者在前 →
+③ 三段事件条数多者在前 → ④ `lastSeen` 新者在前 → ⑤ `srcIp` 升序（同输入同输出 = ETag/304 的前提）。
+
+### 32.2 reason / status 码表（fail-closed，**绝不用 0 冒充"他没干过"**）
+
+| 位置 | 值 | 含义 | 页面怎么显示 |
+|---|---|---|---|
+| `data.reason` | `OK` | 数据可用 | 正常画图 |
+| `data.reason` | `NO_DATA_IN_WINDOW` | 数据源可用，但窗口内没有候选来源 | "这段时间没有来源"（不是故障） |
+| `data.reason` | `DATA_SOURCE_UNAVAILABLE` | 数据源不是 REAL（MOCK/OFF）或网关不可达 | "数据源不可用"（**不显示任何来源**） |
+| `data.reason` | `QUERY_FAILED` | 上游可达但这次查询失败 | "查询失败，稍后重试" |
+| `data.reason` | `STORY_DISABLED` | 故事线服务未装配（裁剪部署/单测） | "故事线未启用" |
+| `data.reason` | `INTERNAL_ERROR` | 组装异常（有旧快照就用旧的） | "暂时不可用" |
+| `coverage.stageStatus[x]` | `OK` | 这一段已接入 | 该段"没有数据"时写"这个来源没做这一步" |
+| `coverage.stageStatus[x]` | `NOT_WIRED` | 这一段**根本没接入**（索引里没有这类规则/日志，或留痕读不到） | 必须写"未接入" |
+| `coverage.stageStatus[x]` | `UNKNOWN` | 接入判定查询失败 | 写"未知"，**不猜** |
+| HTTP 400 | `MISSING_SRC` / `INVALID_SRC` / `WINDOW_NOT_SUPPORTED` | 参数不对 | 提示修正参数 |
+| HTTP 404 | `SOURCE_NOT_IN_WINDOW` | 该来源不在候选池（窗口外/我方 IP/内网地址/没记录） | "这条故事已超出窗口" |
+
+### 32.3 参数与上限（都是常量/配置，攻击者刷不出增长）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `window` | `1h` / `6h` / `24h` / `72h`（默认 24h） | 只实现这四种；别的值 400，**不悄悄按 24h 处理** |
+| `limit` | 默认 10，上限 `APP_PUBLIC_STORY_MAX_LIMIT`（20） | 越界夹回 [1,20]；`candidates` 始终是窗口内候选总数 |
+| 候选来源上限 | `APP_PUBLIC_STORY_TOP_SOURCES`（50） | 同时是 `/story` 的**可查询来源池**大小：池外一律 404（否则这个端点会变成"随便给个 IP 就能问'他有没有打过我们'"的查询器） |
+| 单来源单阶段事件上限 | `APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE`（40） | **每段独立限量**：某段刷屏不会挤掉另外两段；`coverage.queried` 始终是"查到了多少条" |
+| summary 截断 | 200 字符 | 只给摘要与结论 |
+| 单次请求的上游查询数 | 1（候选聚合）+ 0~2（空阶段的接入判定）+ 1~3（明细三段） | 全部只读 `_search`；15 秒快照兜住重复请求 |
+
+### 32.4 怎么临时关 / 降级
+
+```bash
+# srv1: /opt/secagent/.env
+APP_PUBLIC_STORY_TOP_SOURCES=10                 # 候选池收小（同时收窄 /story 可查来源）
+APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE=10        # 明细更小
+APP_PUBLIC_STORY_MAX_LIMIT=5                    # /stories 最多 5 条
+APP_GEOIP_SELF_IPS=43.143.114.79,47.96.106.187  # ★ 不配就会把自己服务器排上"值得看的攻击来源"
+# 改完按发布链重建容器（★不要用 docker compose up 手工重建，会丢 digest 引用）
+# 核对（两个端点都要看）：
+curl -s "https://demo.xiaokeqing.cn/api/public/stories?limit=3&window=24h" | jq '.data.available,.data.reason,.data.candidates'
+curl -s "https://demo.xiaokeqing.cn/api/public/story?src=<候选里的一个>&window=24h" | jq '.data.available,.data.coverage.stageStatus,.data.commandsAvailable'
+```
+⚠️ 与 `APP_QUOTA_*`/`APP_WEBSTATS_*` 同一个坑：`docker-compose.yml` 的 `environment` 段
+**已显式透传** `APP_PUBLIC_STORY_*`（3 个键，见 `AttackStoryConfigTest`）。只在 `.env` 里加一行
+而 compose 里没有透传行，会**不生效且不报错**。
+⚠️ 这三个键**不要留空**：空字符串绑到 int 会让应用直接启动失败。
+
+### 32.5 实测（真实 srv1 索引器**只读**，2026-10-14 01:34；不是推测）
+
+做法：本机起一条只读隧道（`ssh -L 19200:172.20.0.2:9200 secagent-srv1`），
+把 `AttackStoryRealDataProbe`（不以 Test 结尾，**不进 CI**）指向它，
+留痕文件用 `scp` 拷一份 srv1 的真实副本，`APP_GEOIP_SELF_IPS` 配上 srv1/srv2 的公网 IP。
+两个端点的真实响应（原文，只删了缩进外的空白）：
+
+```jsonc
+// GET /api/public/stories?limit=5&window=24h
+{ "code": 200, "message": "success",
+  "data": { "generatedAt": "2026-10-14 01:34:20", "cacheSeconds": 15, "window": "24h",
+    "windowHours": 24, "available": true, "reason": "OK", "limit": 5,
+    "candidates": 131, "sourceCount": 5,
+    "stageLabels": { "alerts": "告警", "decoyPorts": "诱饵端口",
+                     "honeypotLogins": "蜜罐登录", "auditActions": "处置审计" },
+    "sources": [
+      { "srcIp": "77.90.185.30", "stages": { "alerts": 21, "decoyPorts": 54,
+          "honeypotLogins": 0, "auditActions": 0 }, "stagesWithData": 2, "stageCount": 4,
+        "firstSeen": "2026-10-13 18:29:25", "lastSeen": "2026-10-14 01:08:25",
+        "severityMax": "CRITICAL", "severityMaxLabel": "严重",
+        "gaps": ["honeypotLogins", "auditActions"], "gapLabels": ["蜜罐登录", "处置审计"],
+        "honeypotEvents": 0 },
+      { "srcIp": "77.90.185.21", "stages": { "alerts": 7, "decoyPorts": 58,
+          "honeypotLogins": 0, "auditActions": 0 }, "stagesWithData": 2,
+        "firstSeen": "2026-10-14 01:05:25", "lastSeen": "2026-10-14 01:06:25",
+        "severityMax": "CRITICAL", "severityMaxLabel": "严重",
+        "gaps": ["honeypotLogins", "auditActions"], "honeypotEvents": 0 },
+      { "srcIp": "58.19.99.193", "stages": { "alerts": 1195, "decoyPorts": 0,
+          "honeypotLogins": 24, "auditActions": 0 }, "stagesWithData": 2,
+        "firstSeen": "2026-10-13 09:16:03", "lastSeen": "2026-10-14 01:34:09",
+        "severityMax": "HIGH", "severityMaxLabel": "高危",
+        "gaps": ["decoyPorts", "auditActions"], "honeypotEvents": 172 },
+      { "srcIp": "195.178.110.218", "stages": { "alerts": 271, "decoyPorts": 0,
+          "honeypotLogins": 475, "auditActions": 0 }, "stagesWithData": 2,
+        "severityMax": "HIGH", "gaps": ["decoyPorts", "auditActions"], "honeypotEvents": 1428 },
+      { "srcIp": "8.215.69.55", "stages": { "alerts": 8, "decoyPorts": 0,
+          "honeypotLogins": 453, "auditActions": 0 }, "stagesWithData": 2,
+        "severityMax": "HIGH", "gaps": ["decoyPorts", "auditActions"], "honeypotEvents": 1359 } ],
+    "coverage": { "windowHours": 24, "indexerTotalAlerts": 112956, "withSourceIp": 106980,
+      "topSources": 50,
+      "stageStatus": { "alerts": "OK", "decoyPorts": "OK",
+                       "honeypotLogins": "OK", "auditActions": "OK" },
+      "excludedSelf": 2, "excludedInternal": 3,
+      "audit": { "actionsReadable": true, "blocksReadable": true, "actionRecords": 46,
+                 "blockRecords": 10, "evalFiltered": 0, "actionsWithoutTime": 0 } },
+    "limits": { "defaultLimit": 10, "maxLimit": 20, "topSources": 50, "maxEventsPerStage": 40,
+                "supportedWindows": ["1h","6h","24h","72h"] },
+    "note": "按剧本完整度排序…gaps[] 是【这个来源确实没有数据】的阶段…内网/保留地址与我方 IP 已排除。 limit=5：只展示前 5 条（候选 131 条，截断由 sourceCount 与 candidates 如实披露）。",
+    "ipDisclosure": { "masked": false, "notice": "观测到的来源地址，未经验证，仅供参考",
+                      "removalContact": "https://xiaokeqing.cn/about/" } } }
+
+// GET /api/public/story?src=77.90.185.30&window=24h（事件被截断到前 20+20 条，这里只摘首尾）
+{ "code": 200, "message": "success",
+  "data": { "generatedAt": "2026-10-14 01:34:21", "window": "24h", "available": true,
+    "reason": "OK", "srcIp": "77.90.185.30",
+    "firstSeen": "2026-10-13 18:29:25", "lastSeen": "2026-10-14 01:08:25",
+    "severityMax": "CRITICAL", "severityMaxLabel": "严重",
+    "gaps": ["honeypotLogins", "auditActions"],
+    "stages": { "alerts": 21, "decoyPorts": 54, "honeypotLogins": 0, "auditActions": 0 },
+    "events": [
+      { "ts": "2026-10-13 18:29:25", "stage": "alerts", "stageLabel": "告警", "kind": "SQL注入",
+        "summary": "Suricata: Alert - ET SCAN Suspicious inbound to mySQL port 3306",
+        "severity": "LOW", "severityLabel": "低危", "outcome": null },
+      { "ts": "2026-10-14 01:07:29", "stage": "alerts", "stageLabel": "告警", "kind": "暴力破解",
+        "summary": "Suricata: Alert - ET SCAN MYSQL 4.1 brute force root login attempt",
+        "severity": "LOW", "severityLabel": "低危", "outcome": null },
+      { "ts": "2026-10-14 01:08:05", "stage": "decoyPorts", "stageLabel": "诱饵端口",
+        "kind": "诱饵端口 MySQL（3306/tcp）",
+        "summary": "蜜罐(Dionaea): MySQL 连接尝试 来源=77.90.185.30:42100",
+        "severity": "MEDIUM", "severityLabel": "中危", "outcome": "ACCEPT" },
+      { "ts": "2026-10-14 01:08:05", "stage": "decoyPorts", "stageLabel": "诱饵端口",
+        "kind": "诱饵端口 MySQL（3306/tcp）",
+        "summary": "蜜罐(Dionaea): 同一来源 60 秒内多次协议连接（扫描/爆破）来源=77.90.185.30",
+        "severity": "CRITICAL", "severityLabel": "严重", "outcome": "ACCEPT" } ],
+    "eventCount": 40, "truncated": true,
+    "coverage": {
+      "alerts":      { "status": "OK", "queried": 21, "returned": 20, "truncated": true,
+                       "source": "Wazuh indexer（wazuh-alerts-*）" },
+      "decoyPorts":  { "status": "OK", "queried": 54, "returned": 20, "truncated": true,
+                       "source": "Wazuh indexer（wazuh-alerts-*）" },
+      "honeypotLogins": { "status": "OK", "queried": 0, "returned": 0, "truncated": false,
+                       "note": "蜜罐登录这一段窗口内该来源没有记录（数据源可用）" },
+      "auditActions": { "status": "OK", "queried": 0, "returned": 0,
+                       "note": "留痕文件可读，但窗口内该来源没有任何处置记录（不是故障，也不是被隐藏）",
+                       "source": "应用侧处置留痕 data/response-audit.json",
+                       "actionRecords": 46, "blockRecords": 10, "actionsWithoutTime": 0 },
+      "windowHours": 24, "maxEventsPerStage": 20 },
+    "commandsAvailable": false,
+    "commandsNote": "蜜罐命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则），所以 commandsAvailable=false —— 不编造命令序列。",
+    "note": "事件按时间升序合并；每段各自限量（超过则 truncated=true，coverage 里给的是【查到了多少条】而不是取回了多少条）。只给摘要与结论：规则描述里的口令一律隐去，内部资产名与内网地址不出现在响应里。",
+    "ipDisclosure": { "masked": false, "…": "…" } } }
+```
+
+读法（都是真实数据，不是造的）：
+- **真的连起来了**：`77.90.185.30` 从 18:29 起被 Suricata 报 "ET SCAN … mySQL port 3306"，
+  到 01:08 该来源开始连 3306 诱饵端口，Dionaea 连续 accept 并在 60 秒内触发
+  "同一来源 60 秒内多次协议连接（扫描/爆破）"（level 12 → 严重）—— 这是"看一次攻击全过程"要的东西；
+- **分母诚实披露**：窗口内 11.30 万条告警里只有 10.70 万条带来源 IP；候选池上限 50（本次 131 个候选被截断）；
+- **排除项**：`excludedSelf=2`（srv1/srv2 自己的公网出口）、`excludedInternal=3`（内网/隧道地址）。
+  不排掉的话，"值得看的攻击来源"第一名会是我们自己的服务器；
+- 上面那次的 `ipDisclosure.masked=false` 是真实口径（站主 2026-10-14 拍板显示观测到的真实来源地址）。
+  掩码态（`APP_PUBLIC_MASK_IPS=true`）的载荷有**冻结串**回归：
+  `src/test/resources/publicapi/masked-golden-{stories,story}.json`。
+
+**同一份真实数据的四段状态**（这是本项的验收关键）：
+
+| 阶段 | 接得上了吗 | 今天窗口内有数据吗 |
+|---|---|---|
+| `alerts` | ✅ | ✅ 有（约 10.70 万条带来源 IP） |
+| `decoyPorts` | ✅ 接上了（Dionaea 规则 §31 上线） | ✅ 有（实测 159 条，来源 77.90.185.21/.30、3.131.220.121 等**真实**扫描器） |
+| `honeypotLogins` | ✅ | ✅ 有（实测 24h 约 2 万条登录事件） |
+| `auditActions` | ✅ 读取链路接上了（`actionsReadable=true`，留痕里 46 条） | ❌ **窗口内没有记录**：srv1 上 `response-audit.json` 最新一条是 `2026-10-12 15:18`（约 34 小时前） |
+
+⇒ **今天没有任何来源能凑齐 4/4 段**，而**每一个来源的 `gaps[]` 里都有 `auditActions`**。
+这不是端点的缺陷，是如实的现状；页面必须靠 `coverage.stageStatus.auditActions == "OK"`
+把它读成"没有处置记录"，而不是"没接入"。
+
+### 32.6 要让故事线完整还缺什么（如实列）
+
+| 缺的东西 | 要做什么 | 归属 |
+|---|---|---|
+| 窗口内要有处置记录 | 让处置动作真的在窗口内发生一次（人工封一次 / 策略自动封）。**不许**为了页面好看往 `response-audit.json` 里塞测试记录（那是生产留痕；评测记录有 `evalRunId`/`eval-` 隔离） | 站主 |
+| 蜜罐命令时间线 | Cowrie 的 `cowrie.command.input` 目前**没有对应 Wazuh 规则**；要在 srv2 侧加一条可识别的规则并接进索引 | 下一步（srv2） |
+| 诱饵端口的"下载样本"事件 | Dionaea 的 `download.*` 只写文本日志 `dionaea.log`，JSON 里**没有 handler** → 现在**看不到**（不许画成"下载了样本"） | 下一步（srv2） |
+| 换 IP 的同一攻击者 | Cowrie(2222) 与 Dionaea(445/1433/3306) 是两个传感器，只能靠来源 IP 关联；换 IP 就断链 | 口径上接受（不是 bug） |
+
+### 32.7 已知局限（如实列，别把"CI 全绿"读成"四段都完整"）
+
+1. **候选池是 TOP N（默认 50）**：长尾来源不在榜上，`/story` 也查不到（404）。截断由
+   `candidates` / `limits.topSources` 自证。
+2. **两个来源字段分别聚合后相加**：同一条文档若两个字段都有且值相同会被计两次（实测未见）。
+   响应里同时给 `withSourceIp`，可以核对"各来源之和 vs 带来源 IP 的文档数"。
+3. **`kind` 是粗分类**：`alerts` 段标签来自项目既有的 `AlertType.guess(规则描述)` 关键字匹配
+   （实测把 MySQL 端口的 Suricata 签名归到"SQL注入"）。与自用界面**同一套**口径，本次没新增分类器。
+4. **时间来自两种源**：indexer 的 UTC → 本地时区换算；留痕本来就是本地时间（无时区）。
+   服务器时区变更时跨源排序会短暂不一致（与 §29 的同类局限一致）。
+5. **审计段没有 `riskLevel` 的记录不参与 `severityMax`**（不把"没有等级"猜成"中危"）。
+6. **`/story` 只服务候选池内的来源**：池外的公网 IP 一律 404 —— 这是**刻意**的
+   （否则它就是一个"某 IP 有没有打过我们"的查询器），不是"没实现"。
+7. **不是实时**：15 秒快照；一次请求最多触发 5 条只读查询（候选聚合 1 + 空阶段判定 0~2 + 明细 1~3）。
+8. **窗口滚动即遗忘**：历史不上卷，同一个来源的故事在窗口滑出后会变短。前端/对外文档不要
+   把"故事没了"解释成"攻击者收手了"。
+9. **`honeypotEvents`（全量 Cowrie 事件）只是旁证**：它回答"连上过蜜罐但没登录"，
+   **不进** `stages` 计数（否则"连上过"会被当成"登录过"）。
+
+### 32.8 博客侧联动（必须做，否则新端点会被构建检查判为"未授权端点"）
+
+```
+【提醒站主】加了这两个端点之后，博客仓库 scripts/assert-build.sh 的 ALLOWED 白名单需要加：
+    stories
+    story
+（本站代码只负责把端点做好；白名单在博客侧，由站主统一处理。）
+```

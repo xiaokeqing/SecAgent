@@ -41,6 +41,10 @@ public class WazuhService implements WazuhGateway {
     private static final Logger logger = LoggerFactory.getLogger(WazuhService.class);
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
+    /** 故事线查询体用 Jackson 构造（不拼字符串：字段名/取值里一个引号就能把查询变成语法错误） */
+    private static final com.fasterxml.jackson.databind.ObjectMapper MAPPER =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
     @Value("${integration.wazuh.enabled:true}")
     private boolean enabled;
     @Value("${integration.wazuh.base-url:https://localhost:55000}")
@@ -457,6 +461,379 @@ public class WazuhService implements WazuhGateway {
                     list.add(m);
                 });
         return list;
+    }
+
+    /**
+     * <b>攻击故事线</b>（候选来源聚合）—— 见 {@link WazuhGateway#storySources(int, int)}。
+     *
+     * <h3>为什么不看缓存的 {@code available} 就直接查</h3>
+     * 与 {@link #summary24h()} 同一条教训：{@code available} 由每 60 秒一次的重探刷新，
+     * 而 {@code docker compose up -d} 会同时重启隧道与应用 —— 启动那次探测必然失败。
+     * 若把缓存的 {@code available} 当查询前提，冷启动后最多 60 秒内的每个请求都会
+     * 直接返回"数据源不可用"，而 indexer 其实已经就绪。所以这里直接查，异常才降级。
+     */
+    @Override
+    public Map<String, Object> storySources(int windowHours, int topSources) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        if (client == null) {
+            out.put("reason", "CLIENT_NOT_READY");
+            out.put("note", "Wazuh 客户端未初始化（未启用或初始化失败），故事线候选聚合无法查询");
+            return out;
+        }
+        List<String> fields = srcIpFields();
+        try {
+            JsonNode root = client.fetchStorySources(windowHours, topSources, fields);
+            Map<String, Object> parsed = parseStorySources(root, fields.size(),
+                    Math.max(1, Math.min(windowHours, 168)));
+            if (Boolean.TRUE.equals(parsed.get("available"))) {
+                // "接没接上"的判定：窗口内某阶段一条都没有时，再确认一次索引里到底有没有这类数据。
+                // 没有这一步，"诱饵端口还没接入"与"这个窗口没人打诱饵端口"在响应里长得一模一样。
+                Map<String, Object> wiring = new LinkedHashMap<>();
+                wiring.put("alerts", indexerTotal(parsed) > 0 ? "OK" : "NOT_WIRED");
+                wiring.put("decoyPorts", decoyWiring(parsed));
+                wiring.put("honeypotLogins", honeypotWiring(parsed));
+                parsed.put("stageWiring", wiring);
+            }
+            return parsed;
+        } catch (Exception e) {
+            logger.warn("故事线候选聚合查询失败（公开端点会如实降级）：{}", e.getMessage());
+            out.put("reason", "QUERY_FAILED");
+            out.put("note", "故事线候选聚合查询失败（" + e.getMessage() + "）；"
+                    + "这不是'这段时间没有攻击'，页面应显示为降级并重试");
+            return out;
+        }
+    }
+
+    private static long indexerTotal(Map<String, Object> parsed) {
+        Object v = parsed.get("indexerTotal");
+        return v instanceof Number n ? n.longValue() : 0L;
+    }
+
+    /** 窗口内诱饵端口为 0 时，确认索引里究竟有没有 Dionaea 数据（区分"未接入"与"窗口内没有"） */
+    private String decoyWiring(Map<String, Object> parsed) {
+        Object v = parsed.get("decoyTotal");
+        if (v instanceof Number n && n.longValue() > 0) {
+            return "OK";
+        }
+        return indexerHasAny("{\"size\":0,\"track_total_hits\":true,"
+                + "\"query\":{\"term\":{\"rule.groups\":\"dionaea\"}}}");
+    }
+
+    /** 窗口内蜜罐登录为 0 时，确认索引里有没有 100101/100102 这两条登录规则 */
+    private String honeypotWiring(Map<String, Object> parsed) {
+        Object v = parsed.get("honeypotLoginTotal");
+        if (v instanceof Number n && n.longValue() > 0) {
+            return "OK";
+        }
+        return indexerHasAny("{\"size\":0,\"track_total_hits\":true,"
+                + "\"query\":{\"terms\":{\"rule.id\":[\"100101\",\"100102\"]}}}");
+    }
+
+    /** 索引（不限时间窗口）里有没有这类文档。查询失败返回 {@code UNKNOWN}（不猜"未接入"） */
+    private String indexerHasAny(String bodyJson) {
+        try {
+            JsonNode r = client.search("wazuh-alerts-*", bodyJson);
+            long total = r.path("hits").path("total").path("value").asLong(0);
+            return total > 0 ? "OK" : "NOT_WIRED";
+        } catch (Exception e) {
+            logger.warn("阶段接入判定查询失败（按 UNKNOWN 上报，不猜'未接入'）：{}", e.getMessage());
+            return "UNKNOWN";
+        }
+    }
+
+    /**
+     * 解析 {@link WazuhClient#fetchStorySources} 的响应（<b>纯函数，便于单测直接喂 JSON</b>）。
+     *
+     * <p>把多个 filter 聚合按来源 IP 合并成"每个来源各阶段多少条、首末时间、最高等级"。
+     * 两个来源字段（{@code data.srcip} / {@code data.src_ip}）分别聚合后<b>相加</b>：
+     * 同一条文档若两个字段都有且相同会被计两次 —— 实测未见，但响应里同时给出
+     * {@code withSourceIp}（带任一来源字段的文档数）供读者核对，不假装它一定等于各来源之和。
+     *
+     * @param root        OpenSearch 响应
+     * @param fieldCount  查询里用了几个来源字段（聚合名是 {@code *_0..*_{n-1}}）
+     * @param windowHours 窗口小时数（如实回显，便于前端画时间轴刻度）
+     */
+    static Map<String, Object> parseStorySources(JsonNode root, int fieldCount, int windowHours) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("windowHours", windowHours);
+        if (root == null || root.isMissingNode() || root.isNull()
+                || !root.path("aggregations").isObject()) {
+            out.put("available", false);
+            out.put("reason", "EMPTY_RESPONSE");
+            out.put("note", "聚合响应里没有 aggregations 节点（查询未按预期执行）");
+            return out;
+        }
+
+        Map<String, StorySource> byIp = new LinkedHashMap<>();
+        for (int i = 0; i < fieldCount; i++) {
+            collectStage(byIp, root, "alerts_" + i, "alerts");
+            collectStage(byIp, root, "decoy_" + i, "decoy");
+            collectStage(byIp, root, "honeypot_" + i, "honeypot");
+            collectStage(byIp, root, "logins_" + i, "logins");
+        }
+
+        long withIp = root.path("aggregations").path("src_present").path("doc_count").asLong(0);
+        long total = root.path("hits").path("total").path("value").asLong(0);
+        long decoyTotal = 0;
+        long loginTotal = 0;
+
+        List<Map<String, Object>> sources = new ArrayList<>();
+        for (StorySource s : byIp.values()) {
+            decoyTotal += s.decoy;
+            loginTotal += s.honeypotLogins;
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("srcIp", s.ip);
+            m.put("alerts", s.alerts);
+            m.put("decoyPorts", s.decoy);
+            m.put("honeypotLogins", s.honeypotLogins);
+            // 全量 Cowrie 事件（含新连接/客户端指纹）：只用来解释"为什么登录数是 0"，
+            // 不进 stages（否则"连上过"会被当成"登录过"）
+            m.put("honeypotEvents", s.honeypotEvents);
+            m.put("total", s.alerts + s.decoy + s.honeypotLogins);
+            m.put("firstSeen", s.firstSeen);
+            m.put("lastSeen", s.lastSeen);
+            m.put("maxLevel", s.maxLevel);
+            sources.add(m);
+        }
+        // 排序确定（同输入 → 同输出，ETag/304 的前提）：条数多的在前，再按 IP 升序
+        sources.sort((a, b) -> {
+            int c = Long.compare(num(b.get("total")), num(a.get("total")));
+            return c != 0 ? c : String.valueOf(a.get("srcIp")).compareTo(String.valueOf(b.get("srcIp")));
+        });
+
+        out.put("available", true);
+        out.put("reason", sources.isEmpty() ? "NO_DATA_IN_WINDOW" : "OK");
+        out.put("indexerTotal", total);
+        out.put("withSourceIp", withIp);
+        out.put("decoyTotal", decoyTotal);
+        out.put("honeypotLoginTotal", loginTotal);
+        out.put("sourceCount", sources.size());
+        out.put("sources", sources);
+        out.put("note", sources.isEmpty()
+                ? "查询成功：该窗口内没有任何带来源 IP 的告警（这是真实结果，不是数据源故障）"
+                : "按来源聚合完成：两个来源字段（data.srcip / data.src_ip）分别聚合后按 IP 合并");
+        return out;
+    }
+
+    private static long num(Object v) {
+        return v instanceof Number n ? n.longValue() : 0L;
+    }
+
+    /** 把一个阶段（某个来源字段）的分桶合并进 {@code byIp} */
+    private static void collectStage(Map<String, StorySource> byIp, JsonNode root,
+                                     String aggName, String stage) {
+        JsonNode buckets = root.path("aggregations").path(aggName).path("ips").path("buckets");
+        if (!buckets.isArray()) {
+            return;
+        }
+        for (JsonNode b : buckets) {
+            String ip = b.path("key").asText("");
+            if (ip.isEmpty()) {
+                continue;
+            }
+            long count = b.path("doc_count").asLong(0);
+            if (count <= 0) {
+                continue;
+            }
+            StorySource s = byIp.computeIfAbsent(ip, StorySource::new);
+            switch (stage) {
+                case "alerts" -> s.alerts += count;
+                case "decoy" -> s.decoy += count;
+                // 全量 Cowrie 事件只作"连上过蜜罐但没登录"的旁证，不进 stages 计数（只有登录算登录阶段）
+                case "honeypot" -> s.honeypotEvents += count;
+                default -> s.honeypotLogins += count;
+            }
+            s.observe(b.path("min_ts").path("value_as_string").asText(""),
+                    b.path("max_ts").path("value_as_string").asText(""),
+                    b.path("max_level").path("value").asInt(0));
+        }
+    }
+
+    /** 故事线的单来源累加器（只在本类内使用；IP 是索引里的原值，脱敏在公开侧做） */
+    private static final class StorySource {
+        private final String ip;
+        private long alerts;
+        private long decoy;
+        private long honeypotLogins;
+        private long honeypotEvents;
+        private String firstSeen;
+        private String lastSeen;
+        private int maxLevel;
+
+        private StorySource(String ip) {
+            this.ip = ip;
+        }
+
+        private void observe(String minIso, String maxIso, int level) {
+            if (minIso != null && !minIso.isBlank()) {
+                String t = normalizeTime(minIso);
+                if (firstSeen == null || t.compareTo(firstSeen) < 0) {
+                    firstSeen = t;
+                }
+            }
+            if (maxIso != null && !maxIso.isBlank()) {
+                String t = normalizeTime(maxIso);
+                if (lastSeen == null || t.compareTo(lastSeen) > 0) {
+                    lastSeen = t;
+                }
+            }
+            if (level > maxLevel) {
+                maxLevel = level;
+            }
+        }
+    }
+
+    /**
+     * <b>攻击故事线</b>（单来源明细）—— 见 {@link WazuhGateway#storyEvents(String, int, int)}。
+     *
+     * <p>三个阶段各自一条查询、各自一个上限（不共用 size）：某个阶段刷屏时，
+     * 另外两段不会从时间轴上消失。
+     *
+     * <p>{@code _source} 是<b>字段白名单</b>（{@link #STORY_EVENT_FIELDS}）：
+     * 蜜罐文档里有 {@code data.password} / {@code data.message}（明文口令）、
+     * {@code full_log} / {@code previous_output}（原始日志）。用 _source 过滤后，
+     * 这些字段<b>根本不进入本进程</b> —— 比"取回来再记得别输出"可靠得多。
+     */
+    @Override
+    public Map<String, Object> storyEvents(String srcIp, int windowHours, int maxPerStage) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        if (client == null) {
+            out.put("reason", "CLIENT_NOT_READY");
+            out.put("note", "Wazuh 客户端未初始化（未启用或初始化失败）");
+            return out;
+        }
+        String ip = srcIp == null ? "" : srcIp.trim();
+        if (ip.isEmpty()) {
+            out.put("reason", "INVALID_SRC");
+            out.put("note", "来源地址为空，未执行任何查询（不拿空条件去查全库）");
+            return out;
+        }
+        int cap = Math.max(1, Math.min(maxPerStage, 200));
+        int hours = Math.max(1, Math.min(windowHours, 168));
+        try {
+            Map<String, Object> stages = new LinkedHashMap<>();
+            stages.put("alerts", oneStage(ip, hours, cap,
+                    Map.of("bool", Map.of("must_not", List.of(
+                            Map.of("terms", Map.of("rule.groups", List.of("cowrie", "dionaea")))))),
+                    "alerts"));
+            stages.put("decoyPorts", oneStage(ip, hours, cap,
+                    Map.of("term", Map.of("rule.groups", "dionaea")), "decoy"));
+            stages.put("honeypotLogins", oneStage(ip, hours, cap,
+                    Map.of("terms", Map.of("rule.id", List.of("100101", "100102"))), "honeypot"));
+            out.put("available", true);
+            out.put("reason", "OK");
+            out.put("stages", stages);
+            out.put("note", "每段各一条查询、各自限量；truncated=true 表示这一段还有更早的事件没取回");
+            return out;
+        } catch (Exception e) {
+            logger.warn("故事线明细查询失败（公开端点会如实降级）：{}", e.getMessage());
+            out.put("reason", "QUERY_FAILED");
+            out.put("note", "故事线明细查询失败（" + e.getMessage() + "）；这不是'这个来源没有行为'");
+            return out;
+        }
+    }
+
+    /** 单个来源、单个阶段的事件列表（总量 + 已取回条数 + 是否被截断） */
+    private Map<String, Object> oneStage(String srcIp, int windowHours, int cap,
+                                         Map<String, Object> stageFilter, String stage) throws java.io.IOException {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("size", cap);
+        body.put("track_total_hits", true);
+        body.put("sort", List.of(Map.of("@timestamp", "desc")));
+        body.put("_source", STORY_EVENT_FIELDS);
+        body.put("query", Map.of("bool", Map.of("filter", List.of(
+                Map.of("range", Map.of("@timestamp", Map.of("gte", "now-" + windowHours + "h"))),
+                Map.of("bool", Map.of("should", List.of(
+                                Map.of("term", Map.of("data.srcip", srcIp)),
+                                Map.of("term", Map.of("data.src_ip", srcIp))),
+                        "minimum_should_match", 1)),
+                stageFilter))));
+
+        JsonNode root = client.search("wazuh-alerts-*", MAPPER.writeValueAsString(body));
+        long total = root.path("hits").path("total").path("value").asLong(0);
+        List<Map<String, Object>> events = new ArrayList<>();
+        for (JsonNode h : root.path("hits").path("hits")) {
+            Map<String, Object> e = toEvent(h.path("_source"), stage);
+            if (e != null) {
+                events.add(e);
+            }
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("total", total);
+        m.put("returned", events.size());
+        m.put("truncated", total > events.size());
+        m.put("events", events);
+        return m;
+    }
+
+    /**
+     * 故事线事件要用的字段（<b>白名单</b>）。
+     *
+     * <p>刻意不含：{@code data.password} / {@code data.message}（明文口令）、
+     * {@code full_log} / {@code previous_output}（原始日志，含内网目的地址与完整 payload）、
+     * {@code agent.*} / {@code manager.*}（内部资产名）。少取一个字段就少一条泄露路径。
+     */
+    static final List<String> STORY_EVENT_FIELDS = List.of(
+            "@timestamp", "rule.id", "rule.level", "rule.description", "rule.groups",
+            "data.srcip", "data.src_ip", "data.src_port", "data.dst_port", "data.eventid",
+            "data.connection.protocol", "data.username");
+
+    /**
+     * 一条索引文档 → 一条故事线事件（<b>未脱敏</b>：IP 与口令的处理在 publicapi 侧）。
+     *
+     * <p>{@code summary} 用 {@code rule.description}：它与公开端点 {@code /alerts} 已经在
+     * 输出的 {@code title}/{@code ruleName} 是同一类信息（不是内部规则正则原文）。
+     * {@code data.message}（含明文口令，形如 {@code login attempt [root/Abcd@123] succeeded}）
+     * 一律不用。
+     */
+    static Map<String, Object> toEvent(JsonNode s, String stage) {
+        if (s == null || s.isMissingNode()) {
+            return null;
+        }
+        String ts = normalizeTime(s.path("@timestamp").asText(""));
+        String desc = s.path("rule").path("description").asText("");
+        int level = s.path("rule").path("level").asInt(0);
+        String ruleId = s.path("rule").path("id").asText("");
+        String eventId = s.path("data").path("eventid").asText("");
+
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("ts", ts);
+        e.put("summary", desc);
+        e.put("level", level);
+        e.put("outcome", null);
+        switch (stage) {
+            case "decoy" -> {
+                String proto = s.path("data").path("connection").path("protocol").asText("");
+                String port = s.path("data").path("dst_port").asText("");
+                e.put("kind", "诱饵端口 " + decoyProtocolLabel(proto) + (port.isEmpty() ? "" : "（" + port + "/tcp）"));
+                e.put("outcome", "ACCEPT");
+            }
+            case "honeypot" -> {
+                boolean success = "100102".equals(ruleId) || eventId.endsWith("login.success");
+                e.put("kind", success ? "蜜罐 SSH 登录成功" : "蜜罐 SSH 登录失败");
+                e.put("outcome", success ? "SUCCESS" : "FAILED");
+            }
+            default -> e.put("kind", AlertType.guess(desc).getLabel());
+        }
+        return e;
+    }
+
+    /** 诱饵端口协议 → 人读标签（认不出就给原值，不猜） */
+    private static String decoyProtocolLabel(String protocol) {
+        if (protocol == null || protocol.isBlank()) {
+            return "连接";
+        }
+        return switch (protocol.toLowerCase()) {
+            case "smbd" -> "SMB";
+            case "mysqld" -> "MySQL";
+            case "mssqld" -> "MSSQL";
+            case "httpd" -> "HTTP";
+            case "ftpd" -> "FTP";
+            case "ftpdatalisten" -> "FTP-DATA";
+            default -> protocol;
+        };
     }
 
     /**

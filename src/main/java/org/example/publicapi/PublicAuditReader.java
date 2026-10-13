@@ -42,6 +42,10 @@ public class PublicAuditReader {
     private static final Logger logger = LoggerFactory.getLogger(PublicAuditReader.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** 留痕里的时间形状（本地时间，无时区）：{@code 2026-10-11 14:24:01} */
+    private static final java.time.format.DateTimeFormatter FMT =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
     /** 没有 Spring 注入时的保守兜底（掩码态）：与改造前行为一致 */
     private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
 
@@ -108,6 +112,120 @@ public class PublicAuditReader {
         }
         out.sort((a, b) -> String.valueOf(b.get("time")).compareTo(String.valueOf(a.get("time"))));
         return out.size() > limit ? out.subList(0, Math.max(1, limit)) : out;
+    }
+
+    /**
+     * <b>攻击故事线</b>用的处置事件流：窗口内的处置审计记录，<b>按原始目标 IP 分组</b>。
+     *
+     * <h3>为什么 key 是原始 IP，而值里一个 IP 都没有</h3>
+     * 故事线要把"同一个来源"在四个阶段的记录关联起来，所以服务端必须拿原始地址做匹配
+     * （掩码态下 {@code 45.205.***.***} 匹配不到任何东西）。
+     * 于是这里把原始地址放在 <b>Map 的 key</b> 上，值里只放已脱敏的结构化字段 ——
+     * 只要调用方不把这个 Map 直接塞进响应，原始地址就不会出海。
+     * <b>禁止</b>把本方法的返回值直接作为响应体的一部分输出。
+     *
+     * <p>与 {@link #actions(int)} 同一套过滤：评测记录丢弃、口令隐去、字段白名单。
+     * 时间解析不出来的记录<b>不进时间轴</b>（放不上去），数量由 {@link #status()} 如实披露。
+     *
+     * @param since 窗口起点（本地时间；记录里的 {@code time} 也是本地时间）
+     * @return 原始目标 IP → 该 IP 的处置事件（{@code ts/actor/action/outcome/riskLevel/mode/success}）
+     */
+    public Map<String, List<Map<String, Object>>> eventsByTargetSince(java.time.LocalDateTime since) {
+        Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+        for (JsonNode n : readArray("response-audit.json")) {
+            if (isEvalRecord(n)) {
+                continue;
+            }
+            String target = text(n, "target");
+            String time = text(n, "time");
+            if (target == null || target.isBlank() || time == null || time.isBlank()) {
+                continue;
+            }
+            java.time.LocalDateTime ts = parseLocal(time);
+            if (ts == null || since == null || ts.isBefore(since)) {
+                continue;
+            }
+            boolean success = n.path("success").asBoolean(false);
+            String mode = text(n, "mode");
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", text(n, "id"));
+            m.put("ts", ts.format(FMT));
+            m.put("actor", text(n, "actor"));
+            m.put("action", text(n, "action"));
+            m.put("outcome", outcomeOf(success, mode));
+            m.put("riskLevel", text(n, "riskLevel"));
+            m.put("mode", mode);
+            m.put("success", success);
+            // 刻意不输出 detail（原始文本，可能带内网信息）与 reason 正文（/audit 已有，故事线只给结论）
+            out.computeIfAbsent(target.trim(), k -> new ArrayList<>()).add(m);
+        }
+        // 同一来源内按时间升序（时间轴绘制顺序；相等时按 id 保证确定性）
+        for (List<Map<String, Object>> list : out.values()) {
+            list.sort((a, b) -> {
+                int c = String.valueOf(a.get("ts")).compareTo(String.valueOf(b.get("ts")));
+                return c != 0 ? c : String.valueOf(a.get("id")).compareTo(String.valueOf(b.get("id")));
+            });
+        }
+        return out;
+    }
+
+    /**
+     * 审计留痕的<b>可读性状态</b>（把"文件读不到 / 没接入"与"窗口内没有处置"彻底分开）。
+     *
+     * <p>故事线的审计阶段最容易被误读：一段灰色的时间轴既可能是"这段时间没有处置"，
+     * 也可能是"留痕文件根本没读上"。所以状态必须能机读回答：
+     * 文件在不在、读不读得出来、里头有多少条、多少条因为时间缺失进不了时间轴。
+     */
+    public Map<String, Object> status() {
+        List<JsonNode> actions = readArray("response-audit.json");
+        List<JsonNode> blocks = readArray("blocked-ips.json");
+        int evalFiltered = 0;
+        int actionsWithoutTime = 0;
+        int realActions = 0;
+        for (JsonNode n : actions) {
+            if (isEvalRecord(n)) {
+                evalFiltered++;
+                continue;
+            }
+            realActions++;
+            String time = text(n, "time");
+            if (time == null || time.isBlank() || parseLocal(time) == null) {
+                actionsWithoutTime++;
+            }
+        }
+        int realBlocks = 0;
+        for (JsonNode n : blocks) {
+            if (isEvalRecord(n)) {
+                evalFiltered++;
+            } else {
+                realBlocks++;
+            }
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("actionsReadable", Files.isReadable(Path.of(dataDir, "response-audit.json")));
+        m.put("blocksReadable", Files.isReadable(Path.of(dataDir, "blocked-ips.json")));
+        m.put("actionRecords", realActions);
+        m.put("blockRecords", realBlocks);
+        m.put("evalFiltered", evalFiltered);
+        m.put("actionsWithoutTime", actionsWithoutTime);
+        return m;
+    }
+
+    /** 处置结果码（只给结论，不给原始 detail） */
+    private static String outcomeOf(boolean success, String mode) {
+        if ("BLOCKED".equalsIgnoreCase(String.valueOf(mode))) {
+            return "BLOCKED_BY_GUARD";
+        }
+        return success ? "SUCCESS" : "FAILED";
+    }
+
+    /** 解析留痕里的本地时间（{@code yyyy-MM-dd HH:mm:ss}）；解析不出来返回 {@code null}（不猜） */
+    private static java.time.LocalDateTime parseLocal(String s) {
+        try {
+            return java.time.LocalDateTime.parse(s.trim(), FMT);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** 统计：总封禁数 / 已解封数 / 被护栏拦截数 */

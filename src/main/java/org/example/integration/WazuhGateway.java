@@ -74,6 +74,49 @@ public interface WazuhGateway {
     }
 
     /**
+     * <b>攻击故事线</b>：窗口内按来源 IP 汇总的各阶段计数（只读聚合，供公开故事线端点用）。
+     *
+     * <p>阶段口径（公开契约，见 RUNBOOK §32）：
+     * <ul>
+     *   <li>{@code alerts} —— 告警（排除蜜罐两类规则，避免与下面两段重复计数）；</li>
+     *   <li>{@code decoyPorts} —— 诱饵端口（Dionaea，{@code rule.groups=dionaea}）；</li>
+     *   <li>{@code honeypotLogins} —— 蜜罐登录事件（Cowrie 规则 100101/100102）。</li>
+     * </ul>
+     * 处置审计不在 indexer 里（是应用侧的留痕文件），由公开侧另外拼装。
+     *
+     * <p>返回形状（<b>未脱敏</b>，掩码与字段白名单必须在 publicapi 包做）：
+     * <pre>
+     * {available, reason, note, windowHours, indexerTotal, withSourceIp,
+     *  sources:[{srcIp, alerts, decoyPorts, honeypotLogins, firstSeen, lastSeen, maxLevel, total}]}
+     * </pre>
+     * 默认实现返回"不可用"：接口新增方法不会让既有替身静默变成"空数据"。
+     */
+    default Map<String, Object> storySources(int windowHours, int topSources) {
+        return Map.of("available", false, "reason", "DATA_SOURCE_UNAVAILABLE",
+                "note", "网关未实现 storySources");
+    }
+
+    /**
+     * <b>攻击故事线</b>：单个来源在窗口内按阶段分组的明细事件（每阶段独立限量）。
+     *
+     * <p>为什么不做"一条查询取全部、再在 Java 里分段"：某个阶段一旦刷屏
+     * （实测单个 IP 24h 有 5.6 万条 Cowrie 事件），单条查询的 size 上限会被它吃光，
+     * 另外两个阶段直接消失 —— 而页面上看不出"这一段是被挤掉的"。
+     * 所以每段各自一条查询、各自一个上限，并在 {@code coverage} 里如实给出"查到了多少条"。
+     *
+     * <p>返回形状（<b>未脱敏</b>）：
+     * <pre>
+     * {available, reason, note, stages:{alerts|decoyPorts|honeypotLogins:
+     *     {status, total, returned, truncated, events:[{ts, kind, summary, level, outcome}]}}}
+     * </pre>
+     * 默认实现返回"不可用"。
+     */
+    default Map<String, Object> storyEvents(String srcIp, int windowHours, int maxPerStage) {
+        return Map.of("available", false, "reason", "DATA_SOURCE_UNAVAILABLE",
+                "note", "网关未实现 storyEvents");
+    }
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）

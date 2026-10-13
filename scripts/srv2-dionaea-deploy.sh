@@ -166,6 +166,9 @@ install_artifacts() {
   ok "logrotate -> /etc/logrotate.d/secagent-dionaea"
   install -m 0644 -o root -g root "$SRC_DEPLOY/cron.d/secagent-dionaea-cleanup" /etc/cron.d/secagent-dionaea-cleanup
   ok "cron -> /etc/cron.d/secagent-dionaea-cleanup"
+  # 蜜罐网段隔离的每日实测（一等检查项；非 0 就 notify HIGH；探针 fail-closed）
+  install -m 0644 -o root -g root "$SRC_DEPLOY/cron.d/secagent-honeypot-egress" /etc/cron.d/secagent-honeypot-egress
+  ok "cron -> /etc/cron.d/secagent-honeypot-egress（每日 09:40 实测隔离，非 0 报警）"
   install -m 0644 -o root -g root "$SRC_DEPLOY/srv2-dionaea.service" /etc/systemd/system/srv2-dionaea.service
   ok "unit -> /etc/systemd/system/srv2-dionaea.service"
   for s in srv2-dionaea-deploy.sh srv2-dionaea-check.sh srv2-dionaea-killswitch.sh \
