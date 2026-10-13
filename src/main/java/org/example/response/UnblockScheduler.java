@@ -41,12 +41,20 @@ public class UnblockScheduler {
     @Value("${response.unblock.enabled:true}")
     private boolean enabled;
 
+    /** 便捷构造器：**仅供单测**直接 new 使用（通知为空）。Spring 不要用它。 */
     public UnblockScheduler(BlockRecordStore blockRecordStore,
                             AuditService auditService,
                             ObjectProvider<WazuhGateway> wazuhGatewayProvider) {
         this(blockRecordStore, auditService, wazuhGatewayProvider, null);
     }
 
+    /**
+     * 生产用构造器（Spring 用这一个）。
+     *
+     * <p>【2026-10-13 生产事故】与 {@code ResponseActionService} 同一类问题：多构造器 + 都没标注
+     * → 启动 {@code No default constructor found}。由 {@code SpringBeanConstructorTest} 门禁揪出。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
     public UnblockScheduler(BlockRecordStore blockRecordStore,
                             AuditService auditService,
                             ObjectProvider<WazuhGateway> wazuhGatewayProvider,

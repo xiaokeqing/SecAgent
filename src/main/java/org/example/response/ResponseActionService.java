@@ -54,6 +54,7 @@ public class ResponseActionService {
      */
     private final ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider;
 
+    /** 便捷构造器：**仅供单测**直接 new 使用（通知为空）。Spring 不要用它。 */
     public ResponseActionService(ResponseGuard responseGuard,
                                  AuditService auditService,
                                  BlockRecordStore blockRecordStore,
@@ -62,6 +63,17 @@ public class ResponseActionService {
         this(responseGuard, auditService, blockRecordStore, wazuhGatewayProvider, sshBlockProvider, null);
     }
 
+    /**
+     * 生产用构造器（Spring 用这一个）。
+     *
+     * <p>【2026-10-13 生产事故教训】这个类当时有<b>两个</b>构造器、且都没标注：
+     * Spring 4.3+ 只在"类里唯一构造器"时才自动注入，多构造器必须显式指定，
+     * 否则启动即 {@code No default constructor found} 崩溃（线上 11:35 起崩溃循环）。
+     * 而当时 CI 是绿的 —— 单测直接 new 对象、从不加载 Spring 上下文。
+     * 因此：① 这里显式 {@code @Autowired}；② 另加 {@code SpringBeanConstructorTest} 作为门禁，
+     * 反射扫描所有 Spring 组件，凡是"多构造器但没有恰好一个 @Autowired"就直接测试失败。
+     */
+    @org.springframework.beans.factory.annotation.Autowired
     public ResponseActionService(ResponseGuard responseGuard,
                                  AuditService auditService,
                                  BlockRecordStore blockRecordStore,

@@ -530,6 +530,26 @@ curl -s http://127.0.0.1:9900/api/public/ask -X POST \
 端点（匿名可访问，走 https://demo.xiaokeqing.cn，CORS 白名单含 https://xiaokeqing.cn 与 localhost:1313）：
   POST /api/public/ask   {"question":"..."}   question ≤600 字符、body ≤4000；一次性返回（非 SSE），服务端预算 20s
   GET  /api/public/kb?q=…                     q ≤200 字符
+  GET  /api/public/overview | /api/public/alerts | /api/public/alerts/{aggId} | /api/public/honeypot | /api/public/audit
+  GET  /api/public/latest                     最近一次同步/最近一条事件的聚合摘要（2026-10-13 收口，见下）
+
+  ★ /api/public/latest 的收口（2026-10-13）：该端点此前【从未实现】，前端探测它拿到 404，
+    于是页面上出现"latest 未就绪 HTTP 500 / 用 audit 替代"这类技术免责文字（那一行已从前端移走，
+    但端点仍然悬空 —— 谁都可以再探一次，再造一次同样的含糊提示）。
+    两条路二选一，这里选【实现】而不是删除，理由：
+      · 数据全部来自既有公开白名单口径（PublicAlertSource 的掩码字段 + PublicAuditReader 的掩码记录），
+        **没有新增任何内部数据面**；若将来要"最近一条的标题"，那属于扩大公开面，必须先评审再加；
+      · 它省掉了以后每一次"前端想要个摘要"时的重复讨论，而删除方案要长期维护一条"不得调用"的纪律。
+    出参（白名单）：generatedAt / cacheSeconds / available / reason / wazuhMode / windowSize /
+      windowAlertCount / severityCounts[] / sourceCounts[] /
+      latestEvent{occurredAt,severity(|Label),type(|Label),source(|Label),srcIp(掩码)} /
+      latestBlock（复用 /audit 的掩码记录，只取最近 1 条）
+    **刻意不含**：标题、规则名、内网目的地址与资产名、聚合 id 与成员 id、原始日志、reason 正文。
+    无数据时如实 available=false + reason（machine-readable）+ note（人读）：
+      · DATA_SOURCE_UNAVAILABLE —— 数据源不可达或没拿到真实数据（故障）
+      · NO_DATA_IN_WINDOW      —— 数据源可用但窗口内确实没有告警（不是故障；两者混在一起会被渲染成"一切太平"）
+    限流 / CORS / 掩码 / ETag / Cache-Control 与其余公开端点走同一条通路（同一个 Snapshot 缓存 + ok(...)）。
+    测试：PublicApiLatestTest（字段口径 / 泄露检查 / 无数据原因）、PublicApiLatestEndpointTest（路由存在 + 信封 + 响应头）。
 
 限额（三件事互相独立，别混为一谈）：
   · 每 IP 每分钟：ask 6 次 / kb 20 次      → 超限 429 + Retry-After: 60
@@ -867,4 +887,122 @@ srv1 拉取凭据（两个 ACR 域名 + 服务专用凭据目录 /etc/secagent/d
 scripts/srv1-switch-acr-credential.sh：原来只在"拉取失败"时回滚；现在"推送竟然成功"也会
 把服务凭据自动回滚（避免把读写凭据留在服务目录里）。教训：负向测试必须用**同名 tag**做
 tag+push，否则 push 一个本地不存在的 tag 会因"tag 不存在"失败 —— 那是假失败，不是权限判定。
+```
+
+---
+
+## 19. 通知中枢（2026-10-13 新增）
+
+```
+【它解决什么】"检测到了"和"人知道了"是两件事。告警大屏、处置护栏、看门狗自动回滚都已存在，
+但人不在电脑前时这些能力等于不存在 —— 而真实攻击多数发生在没人看屏的时候。
+本节的通道把四类事件推到手机，并做分级与降噪。
+
+【触发事件（四类）】
+  ① 高危告警        severity >= HIGH（CRITICAL 也走这条），由定时巡检拉取，不依赖任何页面访问
+  ② 自动封禁        成功 / 失败都通知（**失败等级更高**：成功只是系统按预期工作，
+                    失败意味着"该拦的没拦住"）；到期自动解封也会通知（LOW，夜间会被静默）
+  ③ 系统降级        WAZUH_MODE 由 REAL 变为非 REAL（以及恢复），成对通知
+  ④ 看门狗回滚      srv1-health-watchdog.sh 经本机端点触发（见下）
+
+【通道】通用 Webhook —— Telegram / 飞书 / 钉钉 / 企业微信 / Bark / n8n 的共同点只有
+  "HTTP POST 一个 JSON"，差异全在载荷形状，所以只配"地址 + 模板"，不写死某一家。
+
+【配置（全部走 .env，见 .env.example）】
+  NOTIFY_WEBHOOK_URL=            空 = 关闭。支持分流：默认=https://a|WATCHDOG_ROLLBACK=https://b
+  NOTIFY_WEBHOOK_TEMPLATE=       留空 = 通用 {"text":"{{title}}\n{{body}}"}
+  NOTIFY_MIN_SEVERITY=HIGH       只认英文枚举名；写错按 HIGH 处理（宁可少发，也不放宽）
+  NOTIFY_COOLDOWN_SECONDS=300    同类事件冷却（按去重键，不是按标题）
+  NOTIFY_NIGHT_QUIET=22:00-07:00 夜间静默，**只压 INFO/MEDIUM；HIGH/CRITICAL 照发**
+  NOTIFY_SAME_IP_MERGE=600       同 IP 合并窗口；0 = 关闭合并（改由冷却去重）
+  模板可用变量：{{title}} {{body}} {{severity}} {{severityLabel}} {{type}} {{typeLabel}}
+                {{ip}} {{actor}} {{time}} {{count}}
+
+【降噪规则（顺序即优先级）】
+  1) 等级门槛    低于 NOTIFY_MIN_SEVERITY 的直接不发
+  2) 夜间静默    窗口内只压 INFO/MEDIUM；呼救与时间无关
+  3) 冷却        同一去重键 cooldown 秒内只发一次
+  4) 同 IP 合并  窗口内同一来源的多类事件合成一条「聚合 N 次」；
+                 **一个窗口只发一条**（否则"聚合 3 次→聚合 8 次→聚合 15 次"仍是刷屏）
+  注意：带 IP 的事件先走合并（合理：同一攻击源在几分钟内刷扫描+爆破+Web 探测，对手机是"一件事"），
+        不带 IP 的事件（系统降级等）才由冷却去重 —— 这也是 §19 验证里分两组演示的原因。
+
+【未配置时的降级行为（如实，不假装）】
+  · NOTIFY_WEBHOOK_URL 为空 = 功能关闭：事件<b>不出网</b>，但会
+      a) 打 WARN 日志（"通知未配置…未推送"）；
+      b) 往 data/notify-audit.jsonl 写一行 outcome=NOT_CONFIGURED（含事件类型/等级/掩码 IP）；
+      c) 启动自检日志 OUTBOUND-TIMEOUTS-SELFCHECK 里显式打印
+         notify-webhook{connect=DISABLED(通知未配置:NOTIFY_WEBHOOK_URL 为空),...}
+  · 因此"手机没响"永远能在日志/审计里查到原因：未配置 / 被等级拦 / 被夜间静默 / 冷却 / 重试用尽失败。
+  · 发送失败有重试（默认 3 次，指数退避），依旧失败则
+      a) 审计 outcome=FAILED + attempts（谁在什么时候想通知、结果如何）；
+      b) 另发一条 NOTIFY_FAILED（独立类型，**只试一次，不再重试**，避免自我放大的通知风暴）。
+
+【出站约束（与其它链路同一套，不允许裸 OkHttp）】
+  · 复用 app.outbound.* 统一超时矩阵（connect 3s / read 12s / call 15s）与 OutboundGuard
+    （有界等待 + 60s 冷却 + 半开），依赖标识 notify-webhook（冷却独立，不影响 Wazuh 与处置）
+  · app.notify.timeout-ms 只能把调用预算<b>收紧</b>，写大了也取统一预算（15s）
+  · 启动自检里 notify-webhook 的 callTimeout 取自真正建 OkHttpClient 的传送器对象
+
+【审计文件】
+  data/notify-audit.jsonl —— 只追加的单行 JSON（通知发生在告警风暴里，写入频率高，
+  用追加流水而不是"整份覆盖的 JSON 数组"）。IP 在审计里只留网段。
+  文件会一直长：按需切割，例如
+    logrotate 或  find /opt/secagent/data -name 'notify-audit.jsonl' -size +50M -exec truncate -s 0 {} \;
+  （截断而不是删除：删掉会连"曾经通知过"的证据一起丢，而这个文件本身就是"有没有通知出去"的答案。）
+
+【④ 看门狗回滚 → 通知（脚本侧接线）】
+  端点：POST /api/notify/watchdog-rollback   body {"commitFrom":..,"commitTo":..,"reason":..,"actor":"watchdog"}
+  鉴权：/api/notify/** 不在 app.auth.white-list 里 → 必须带 X-API-Token（= SECAGENT_API_TOKEN）。
+        这一步不能省：若免鉴权，任何能连到 9900 的人都能伪造"系统降级/已回滚"这类高危通知。
+  脚本：scripts/srv1-health-watchdog.sh 里的 notify_rollback() 已接在【三种结局】上
+        （dry-run / 回滚脚本缺失 / 回滚执行后的成功与失败）；取不到 token 或没有 curl 时
+        只写日志，绝不假装通知成功。dry-run 也会发，便于在不真回滚的前提下先验证链路。
+
+【如何本地验证（不依赖真手机、不依赖公网）】
+  1) 起一个本地 sink（脚本用的是标准库 http.server；用 `python3 -m http.server` 不行 ——
+     它只处理 GET，收到 POST 回 501，看起来像"通知没通"，实际是 sink 选错了）：
+       python3 scripts/notify-sink.py 18099
+  2) 编译并运行演示程序（它把同一条链路跑一遍，逐条打印每个事件的判定结果）：
+       mvn -B -o dependency:build-classpath -Dmdep.outputFile=target/cp.txt -q
+       javac -encoding UTF-8 -d target/demo -cp "target/classes:$(cat target/cp.txt)" \
+             src/test/resources/demo/org/example/notify/NotificationDemo.java
+       java -cp "target/demo:target/classes:$(cat target/cp.txt)" \
+            org.example.notify.NotificationDemo http://127.0.0.1:18099/
+     （Windows 用 `;` 分隔 classpath）
+  3) 实测输出（2026-10-13 本机，10 个事件）：
+       第 1 组（关掉合并，单看冷却）:
+         A 高危告警（HIGH，带 IP）              → SENT
+         B 同一 dedupKey 第 2 次（300s 冷却内） → SUPPRESSED（reason=冷却期内）
+         B 同一 dedupKey 第 3 次（300s 冷却内） → SUPPRESSED
+         C 无 IP 的系统降级（HIGH）             → SENT
+         D 同上降级再报一次（同键）             → SUPPRESSED
+       第 2 组（同 IP 合并=600s）:
+         E 同一来源第 1 条（进入合并窗口）      → MERGED
+         F 同一来源第 2 条（并入）              → MERGED
+         G 同一来源第 3 条（并入）              → MERGED
+         （窗口汇合后实际发出 1 条："聚合 3 次 · [高危] Web 目录扫描 …"）
+       第 3 组（夜间 23:30，静默 22:00-07:00）:
+         H 夜间 MEDIUM 解封事件                 → SUPPRESSED（被静默）
+         I 夜间 CRITICAL 看门狗回滚             → SENT（呼救不受时间影响）
+       汇总：{SENT=4, SUPPRESSED=4, MERGED=3}；sink 侧实收 4 个 POST —— 4 = SENT，降噪生效。
+       sink 实际收到的两个报文示例（证明发出的是合法 JSON 且变量已渲染）：
+         {"text": "[高危] SSH 暴力破解尝试\n规则=5712；来源=45.83.91.12；触发=poller"}
+         {"text": "聚合 3 次 · [高危] Web 目录扫描\n同一来源 198.51.100.7 在 600s 内触发 3 次：…"}
+  4) 真正的告警巡检（端到端，需要真 Wazuh）：配好 URL 后看日志
+       "高危告警通知：本轮提交 N 条新告警到通知中枢"  —— 且 MOCK 模式下这一轮不会推送
+       （内置样本不出来发真告警：样本长得太像真的，这是本项目反复吃过的亏）。
+  5) 测试门禁：mvn -B test（通知相关 6 个测试类，含"模板渲染/冷却/同 IP 合并/夜间静默/
+     未配置降级/失败重试/端点契约/本地 demo 可编译"）。CI 的 unit-tests job 就是跑它。
+
+【残余与边界（写清楚，别只写好的一面）】
+  · 通知是旁路：它挂了不会让研判/处置失败（全程吞异常并记审计）。代价是"通知自己坏了"
+    只体现在日志与审计里，没有第三方心跳；若要做到"通知挂了也能被发现"，
+    得另做一条与主站分离的探活（未做）。
+  · 巡检周期默认 60s，因此高频攻击的"第一条"通知有最多 60s 延迟；这是刻意换取的
+    "不依赖页面访问"（挂在 /api/alerts/list 上会变成"没人看屏就不通知"）。
+  · 同 IP 合并窗口内的第二条起不再单独发（一个窗口一条聚合）；窗口内如果攻击升级
+    （MEDIUM→CRITICAL），升级信息体现在聚合正文的"最近="里，而不会另发一条。
+  · 出站告警通道本身只做 HTTP POST 到运维自选的地址，应用侧不做内容加密/签名：
+    webhook 的保密责任在 URL（很多 IM 把 token 写在 URL 里）与网络路径（https）上。
 ```
