@@ -51,6 +51,24 @@ class PublicApiStoriesEndpointTest {
     @TempDir
     Path tmp;
 
+    /**
+     * 处置审计夹具的"基准时刻"（= 写夹具那一刻的 {@link LocalDateTime#now()}）。
+     *
+     * <p><b>为什么必须留着它（2026-10-14 修·CI 连续 5 个提交全红）</b>：
+     * 告警段的夹具时间是<b>固定值</b>（{@code 2026-10-14 00:10:00}，见 {@link AttackStoryFixtures}），
+     * 而处置审计段用的是<b>相对现在</b>的 {@code now-30m}（见
+     * {@link AttackStoryFixtures#writeAudit}，它刻意用相对时间以免滚动窗口把测试自己熬红）。
+     * 于是 {@code firstSeen = min(两者)} 到底落在哪一条，<b>取决于运行时区</b>：
+     * 开发机 CST(+8) 下 {@code now-30m} 晚于固定值 → firstSeen = 固定值；
+     * GitHub Actions 的 <b>UTC</b> 下 {@code now-30m} 早 8 小时 → firstSeen = {@code now-30m}。
+     * 原来把 firstSeen 钉死成固定值，等于"只在 CST 变绿"。
+     * 断言改成按算出来的 min 比，两种时区下都成立。
+     */
+    private LocalDateTime auditBase;
+
+    private static final java.time.format.DateTimeFormatter FMT =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
     private final ObjectMapper mapper = new ObjectMapper();
 
     /** 只有"公网字面量"形态的 IP 才允许出现在这个端点的响应里 */
@@ -63,7 +81,9 @@ class PublicApiStoriesEndpointTest {
     private PublicApiController controller(String mode, boolean honeypotWired, boolean maskIps,
                                            boolean withAudit) throws Exception {
         if (withAudit) {
-            AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
+            // 只取一次"现在"：写进夹具与算期望值必须用同一个基准，否则断言会抖
+            auditBase = LocalDateTime.now();
+            AttackStoryFixtures.writeAudit(tmp, auditBase);
         } else {
             AttackStoryFixtures.writeEmptyAudit(tmp);
         }
@@ -111,6 +131,20 @@ class PublicApiStoriesEndpointTest {
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
 
+    /**
+     * {@code sources[0].firstSeen} 的期望值 = {@code min(告警固定夹具, 处置审计 now-30m)}。
+     *
+     * <p>见 {@link #auditBase} 的说明：这两条谁更早取决于时区，所以期望值必须算出来，
+     * 不能钉死成固定夹具那一串 —— 钉死会让测试只在开发机的 CST 下变绿。
+     */
+    private String expectedFirstSeen() {
+        LocalDateTime alertsFixtureFirstSeen = LocalDateTime.parse("2026-10-14T00:10:00");
+        LocalDateTime auditEarliest = auditBase.minusMinutes(30);
+        LocalDateTime earliest = alertsFixtureFirstSeen.isBefore(auditEarliest)
+                ? alertsFixtureFirstSeen : auditEarliest;
+        return earliest.format(FMT);
+    }
+
     // ==================== 正常分支 ====================
 
     @Test
@@ -142,7 +176,7 @@ class PublicApiStoriesEndpointTest {
                 .andExpect(jsonPath("$.data.sources[0].severityMaxLabel").value("严重"))
                 .andExpect(jsonPath("$.data.sources[0].gaps[0]").value("honeypotLogins"))
                 .andExpect(jsonPath("$.data.sources[0].gapLabels[0]").value("蜜罐登录"))
-                .andExpect(jsonPath("$.data.sources[0].firstSeen").value("2026-10-14 00:10:00"))
+                .andExpect(jsonPath("$.data.sources[0].firstSeen").value(expectedFirstSeen()))
                 // lastSeen 是"四段里的最晚一条"：窗口内有处置审计记录时它会晚于纯 indexer 的时间
                 .andExpect(jsonPath("$.data.sources[0].lastSeen")
                         .value(org.hamcrest.Matchers.greaterThanOrEqualTo("2026-10-14 01:00:00")))
