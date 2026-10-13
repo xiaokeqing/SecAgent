@@ -146,6 +146,21 @@ services:
       APP_GEOIP_MIN_SHARE_PERCENT: "${APP_GEOIP_MIN_SHARE_PERCENT:-1.0}"
       APP_GEOIP_TOP_IPS: "${APP_GEOIP_TOP_IPS:-1000}"
 
+      # ===== 公开聚合端点 /api/public/webstats（访问日志的只读聚合，RUNBOOK §29）=====
+      # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_PUBLIC_*/APP_GEOIP_* 同一个教训：
+      #   env_file 只是"运行时兜底"，而 SPRING_APPLICATION_JSON 的优先级更高 ——
+      #   "在 .env 里加一行 APP_WEBSTATS_*" 若不在这里透传，会【不生效且不报错】。
+      # 【口径】只给聚合：不含任何 IP、不含原始路径与查询串、不含来源数与疑似扫描占比；
+      #   路径只给固定类别枚举、状态码只到类别；计数 < min-count 的只计入总量。
+      # 【怎么关】APP_WEBSTATS_ENABLED=false → 端点如实返回 available=false + WEBSTATS_DISABLED。
+      APP_WEBSTATS_ENABLED: "${APP_WEBSTATS_ENABLED:-true}"
+      APP_WEBSTATS_MIN_COUNT: "${APP_WEBSTATS_MIN_COUNT:-5}"
+      APP_WEBSTATS_TOP_CATEGORIES: "${APP_WEBSTATS_TOP_CATEGORIES:-10}"
+      APP_WEBSTATS_TOP_UAS: "${APP_WEBSTATS_TOP_UAS:-5}"
+      APP_WEBSTATS_UA_MAX_CHARS: "${APP_WEBSTATS_UA_MAX_CHARS:-60}"
+      APP_WEBSTATS_BACKFILL_MAX_MB: "${APP_WEBSTATS_BACKFILL_MAX_MB:-64}"
+      APP_WEBSTATS_FILE_PROBE_SECONDS: "${APP_WEBSTATS_FILE_PROBE_SECONDS:-10}"
+
       # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
       # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
       # 全部可留空（留空即用代码默认值，与改造前行为兼容）。

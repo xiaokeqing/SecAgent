@@ -640,6 +640,286 @@ public class PublicApiController {
         return out;
     }
 
+    // ==================== 访问日志聚合（/api/public/webstats；设计见 docs/design-webstats-public-endpoint.md） ====================
+
+    /** 聚合端点自己的快照（与 /geo 分开：它读的是内存聚合器，不碰 indexer） */
+    private final Snapshot webStatsCache = new Snapshot();
+
+    /**
+     * 访问日志聚合数据面（<b>可为空</b>：单测直接 new 控制器、或裁剪过的部署里就是 null）。
+     * 空 → 端点按 {@code WEBSTATS_DISABLED} 如实降级，绝不假装"最近没人扫"。
+     */
+    @Autowired(required = false)
+    private org.example.accesslog.WebStatsService webStatsService;
+
+    /** 入榜门槛（站主口径⑤：类别计数 ≥5 才进 topCategories，低于门槛的只进总量） */
+    @Value("${app.webstats.min-count:5}")
+    private int webStatsMinCount = 5;
+
+    @Value("${app.webstats.top-categories:10}")
+    private int webStatsTopCategories = 10;
+
+    @Value("${app.webstats.top-uas:5}")
+    private int webStatsTopUas = 5;
+
+    /**
+     * 访问日志聚合（<b>只聚合</b>）：HTTP 状态码分布 + 7 天按天 + 7×24 热力图 + 固定类别 TOP + UA TOP，
+     * 供博客"监测中心"画图。
+     *
+     * <h3>站主 2026-10-14 拍板的七条口径（都写进了测试）</h3>
+     * <ol>
+     *   <li><b>只输出聚合，绝不输出任何 IP</b>（连掩码都不给），也不给"来源数"——
+     *       "被多少人打、打得有多狠"本身就是情报；</li>
+     *   <li>路径维度<b>只给固定类别枚举</b>（{@link org.example.accesslog.WebStatsCategory}），
+     *       公网页面永不出现攻击者可控的原始字符串；</li>
+     *   <li>窗口 = 默认近 24h，另给 7 天按天汇总与 7×24 小时桶（热力图）；</li>
+     *   <li>滚动实现是<b>内存聚合器</b>（写线程顺手累加、固定内存上限），
+     *       <b>请求路径上不读任何文件</b>（RUNBOOK §23）；</li>
+     *   <li>入榜门槛：类别/UA 计数 ≥ {@code app.webstats.min-count}（默认 5）才出现，
+     *       低于门槛的只进总量；</li>
+     *   <li>状态码只到<b>类别</b>（2xx/3xx/4xx/5xx + other），不给具体码；</li>
+     *   <li><b>不公开"疑似扫描占比"</b>（那等于公开检测能力边界）。</li>
+     * </ol>
+     *
+     * <p>复用既有公开端点外壳（同一个限流器 20 次/分钟、同一个 CORS 白名单、同一个 ETag 过滤器、
+     * 同一个 15 秒 {@link Snapshot}、同一个 {@code ok(...)} 信封 → 自动带 {@code ipDisclosure}
+     * 与内部资产名过滤），不新增任何公开面机制。
+     *
+     * <p>不可用分支必须能区分：{@code WEBSTATS_DISABLED}（配置关掉）、{@code LOG_DISABLED}
+     * （访问日志关掉）、{@code LOG_FILE_MISSING}、{@code LOG_UNREADABLE}、{@code BACKFILL_RUNNING}
+     * （启动回填还没读完）、{@code WINDOW_EMPTY}（日志可读但 24h 内确实没有请求）——
+     * <b>绝不用"空分布"冒充"这段时间太平"</b>。
+     */
+    @GetMapping("/webstats")
+    public ResponseEntity<Map<String, Object>> webstats(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(webStatsCache.get(cacheSeconds, this::buildWebStats), res);
+    }
+
+    private Map<String, Object> buildWebStats() {
+        String now = generatedAt();
+        org.example.accesslog.WebStatsService svc = webStatsService;
+        if (svc == null || !svc.enabled()) {
+            return buildWebStatsUnavailable("WEBSTATS_DISABLED",
+                    "访问日志聚合已在配置中关闭（app.webstats.enabled=false）：本端点不返回任何分布，"
+                            + "也不以 0 冒充'最近没有扫描'。", cacheSeconds, now);
+        }
+        org.example.accesslog.WebStatsService.Status st = svc.status();
+        if (!st.accessLogEnabled()) {
+            return buildWebStatsUnavailable("LOG_DISABLED",
+                    "应用侧访问日志已关闭（app.accesslog.enabled=false）：没有数据源，"
+                            + "本端点不返回任何分布（URL 级扫描在应用侧不可见）。", cacheSeconds, now);
+        }
+        if (!st.fileExists()) {
+            return buildWebStatsUnavailable("LOG_FILE_MISSING",
+                    "访问日志文件当前不存在（可能被删、正在轮转，或从未写入）：不返回分布。"
+                            + "内存聚合器仍在计数，文件恢复后会自动恢复（探测间隔见配置）。", cacheSeconds, now);
+        }
+        if (!st.fileReadable()) {
+            return buildWebStatsUnavailable("LOG_UNREADABLE",
+                    "访问日志文件存在但读不出来（权限/被占用/不是普通文件）：不返回分布，"
+                            + "也不以 0 冒充'这段时间太平'。", cacheSeconds, now);
+        }
+        org.example.accesslog.WebStatsAggregator.Thresholds th = webStatsThresholds();
+        org.example.accesslog.WebStatsAggregator.Snapshot snap =
+                svc.snapshot(java.time.OffsetDateTime.now(), th);
+        if (snap.requests() <= 0) {
+            // 窗口空 = 数据源可用但确实没有请求（不是故障）。回填还没读完时单独一个 reason：
+            // 否则"刚重启还没读到日志"会被画成"24 小时零请求"。
+            if (st.backfillRunning() || !st.backfillDone()) {
+                return buildWebStatsUnavailable("BACKFILL_RUNNING",
+                        "启动回填仍在后台进行（不阻塞启动）：暂不展示分布，"
+                                + "以免把'还没读到'画成'没有请求'；稍后重试即可。", cacheSeconds, now);
+            }
+            return buildWebStatsUnavailable("WINDOW_EMPTY",
+                    "访问日志可读，但最近 24 小时窗口内没有任何请求记录（不是故障，也不是被隐藏）。",
+                    cacheSeconds, now);
+        }
+        return buildWebStatsAvailable(snap, st, cacheSeconds, now, th);
+    }
+
+    private org.example.accesslog.WebStatsAggregator.Thresholds webStatsThresholds() {
+        return new org.example.accesslog.WebStatsAggregator.Thresholds(
+                Math.max(1, webStatsMinCount), Math.max(1, webStatsTopCategories), Math.max(0, webStatsTopUas));
+    }
+
+    /** 不可用载荷（字段名与可用载荷完全一致：前端只判 {@code available} 一个开关） */
+    static Map<String, Object> buildWebStatsUnavailable(String reason, String note, int cacheSeconds, String now) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", now);
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("window", "24h");
+        data.put("available", false);
+        data.put("reason", reason);
+        data.put("totals", webStatsTotals(0L, org.example.accesslog.WebStatsAggregator.StatusClass.EMPTY));
+        data.put("topCategories", List.of());
+        data.put("topUas", List.of());
+        data.put("byDay", List.of());
+        data.put("heatmap", List.of());
+        data.put("thresholds", webStatsThresholds(DEFAULT_WEBSTATS_THRESHOLDS));
+        data.put("coverage", webStatsCoverage(null, null, null));
+        data.put("note", note + " " + WEBSTATS_NOTE_SUFFIX);
+        return data;
+    }
+
+    /** 缺口门槛兜底（没有注入配置时的默认值：≥5 次入榜） */
+    private static final org.example.accesslog.WebStatsAggregator.Thresholds DEFAULT_WEBSTATS_THRESHOLDS =
+            org.example.accesslog.WebStatsAggregator.Thresholds.defaults();
+
+    /**
+     * 可用载荷（<b>纯函数</b>：除入参外不读任何状态，方便单测直接喂各种组合）。
+     *
+     * <p>出参字段就是公开契约：{@code generatedAt / cacheSeconds / window / available / reason /
+     * totals / topCategories / topUas / byDay / heatmap / thresholds / coverage / note}
+     * （+ 出口统一加的 {@code ipDisclosure}）。<b>只许新增，不许改名/删除</b>。
+     */
+    static Map<String, Object> buildWebStatsAvailable(org.example.accesslog.WebStatsAggregator.Snapshot snap,
+                                                      org.example.accesslog.WebStatsService.Status st,
+                                                      int cacheSeconds, String now,
+                                                      org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        org.example.accesslog.WebStatsAggregator.Thresholds t =
+                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
+        long requests = Math.max(0L, snap.requests());
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", now);
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("window", "24h");
+        data.put("available", true);
+        data.put("reason", "OK");
+        data.put("totals", webStatsTotals(requests, snap.statusClass()));
+
+        List<Map<String, Object>> categories = new ArrayList<>();
+        for (org.example.accesslog.WebStatsAggregator.CategoryCount c : snap.topCategories()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("category", c.category());
+            m.put("count", c.count());
+            m.put("sharePercent", webStatsSharePercent(c.count(), requests));
+            categories.add(m);
+        }
+        data.put("topCategories", categories);
+
+        List<Map<String, Object>> uas = new ArrayList<>();
+        for (org.example.accesslog.WebStatsAggregator.UaCount u : snap.topUas()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("ua", u.ua());
+            m.put("count", u.count());
+            uas.add(m);
+        }
+        data.put("topUas", uas);
+
+        List<Map<String, Object>> byDay = new ArrayList<>();
+        for (org.example.accesslog.WebStatsAggregator.DayStat d : snap.byDay()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("date", d.date());
+            m.put("requests", d.requests());
+            m.put("statusClass", webStatsStatusClassMap(d.statusClass()));
+            byDay.add(m);
+        }
+        data.put("byDay", byDay);
+
+        List<Map<String, Object>> heatmap = new ArrayList<>();
+        for (org.example.accesslog.WebStatsAggregator.HourStat h : snap.heatmap()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("date", h.date());
+            m.put("hour", h.hour());
+            m.put("count", h.requests());
+            heatmap.add(m);
+        }
+        data.put("heatmap", heatmap);
+
+        data.put("thresholds", webStatsThresholds(t));
+        data.put("coverage", webStatsCoverage(st, snap, t));
+        data.put("note", webStatsNote(t) + " " + WEBSTATS_NOTE_SUFFIX);
+        return data;
+    }
+
+    static Map<String, Object> webStatsTotals(long requests,
+                                              org.example.accesslog.WebStatsAggregator.StatusClass sc) {
+        Map<String, Object> totals = new LinkedHashMap<>();
+        totals.put("requests", requests);
+        totals.put("statusClass", webStatsStatusClassMap(sc));
+        return totals;
+    }
+
+    /** 状态码只到类别（口径⑥）：key 固定为 2xx/3xx/4xx/5xx/other，永远是这五个 */
+    static Map<String, Object> webStatsStatusClassMap(org.example.accesslog.WebStatsAggregator.StatusClass sc) {
+        org.example.accesslog.WebStatsAggregator.StatusClass v =
+                sc == null ? org.example.accesslog.WebStatsAggregator.StatusClass.EMPTY : sc;
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("2xx", v.c2xx());
+        m.put("3xx", v.c3xx());
+        m.put("4xx", v.c4xx());
+        m.put("5xx", v.c5xx());
+        m.put("other", v.other());
+        return m;
+    }
+
+    static Map<String, Object> webStatsThresholds(org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        org.example.accesslog.WebStatsAggregator.Thresholds t =
+                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("minCount", t.minCount());
+        m.put("topCategories", t.topCategories());
+        m.put("topUas", t.topUas());
+        return m;
+    }
+
+    /**
+     * 覆盖度自证：<b>内存上限</b>（桶数/热力格数/UA 槽数）、回填与解析的实数、窗口外的丢弃数。
+     *
+     * <p>刻意<b>不</b>输出 {@code lastError} 原文：那是内部绝对路径/异常文本，
+     * 属于"内部资产名"那一类，只给一个布尔。
+     */
+    static Map<String, Object> webStatsCoverage(org.example.accesslog.WebStatsService.Status st,
+                                                org.example.accesslog.WebStatsAggregator.Snapshot snap,
+                                                org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("logReadable", st != null && st.fileReadable());
+        m.put("backfillDone", st != null && st.backfillDone());
+        m.put("backfillRunning", st != null && st.backfillRunning());
+        m.put("backfilledRecords", st == null ? 0L : st.backfilledRecords());
+        m.put("parsedRecords", st == null ? 0L : st.parsedRecords());
+        m.put("skippedLines", st == null ? 0L : st.skippedLines());
+        m.put("sourceError", st != null && st.lastError() != null && !st.lastError().isEmpty());
+        m.put("bucketCount", st == null ? org.example.accesslog.WebStatsAggregator.BUCKET_COUNT : st.bucketCount());
+        m.put("bucketSeconds", st == null ? org.example.accesslog.WebStatsAggregator.BUCKET_SECONDS : st.bucketSeconds());
+        m.put("hourCells", st == null ? org.example.accesslog.WebStatsAggregator.HOUR_CELLS : st.hourCells());
+        m.put("uaSlotsPerBucket", st == null ? org.example.accesslog.WebStatsAggregator.UA_SLOTS_PER_BUCKET : st.uaSlotsPerBucket());
+        m.put("globalUaSlots", st == null ? org.example.accesslog.WebStatsAggregator.GLOBAL_UA_SLOTS : st.globalUaSlots());
+        m.put("uaOverflowRows", snap == null ? 0L : snap.uaOverflowRows());
+        m.put("uaKeysDropped", snap == null ? 0L : snap.uaKeysDropped());
+        m.put("recordsOutsideWindow", snap == null ? 0L : snap.droppedOutOfWindow());
+        m.put("bucketStaleSkips", snap == null ? 0L : snap.staleSlotSkips());
+        return m;
+    }
+
+    /** 占比（百分数，保留两位）——只用于展示与门槛，不参与任何账目 */
+    static double webStatsSharePercent(long count, long total) {
+        if (total <= 0) {
+            return 0d;
+        }
+        return Math.round(count * 10000.0d / total) / 100.0d;
+    }
+
+    static String webStatsNote(org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        org.example.accesslog.WebStatsAggregator.Thresholds t =
+                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
+        return "只给聚合：不含任何 IP（连掩码 IP 都没有）、不含原始路径与查询串、不含来源数、不含疑似扫描占比。"
+                + "路径只以固定类别出现（" + org.example.accesslog.WebStatsCategory.ALL.stream()
+                .map(org.example.accesslog.WebStatsCategory::wireName).reduce((a, b) -> a + "/" + b).orElse("")
+                + "），低于门槛（计数>=" + t.minCount() + "）的类别/UA 只计入总量。"
+                + "statusClass 只到类别（2xx/3xx/4xx/5xx/other），不给具体状态码。";
+    }
+
+    /** 所有 webstats 响应共用的口径尾巴（含"缺格/缺天"的读法，防止读者自己脑补） */
+    static final String WEBSTATS_NOTE_SUFFIX =
+            "heatmap 是最近 7 天按日志行本地时间的整点桶（7×24=168 格，只列有请求的格，缺格=0）；"
+                    + "byDay 只含日志里真实有请求的天（缺天=那天的日志已被轮转删除，或确实没有请求）；"
+                    + "24h 窗口 = 最近 288 个 5 分钟桶（最老的 <=5 分钟落在窗口外）；时间取自日志行自带的时区偏移。";
+
     // ==================== 载荷组装 ====================
 
     private Map<String, Object> buildHoneypot() {

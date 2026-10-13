@@ -2917,3 +2917,189 @@ srv2-gen-heartbeat-key.sh、srv2-watch-srv1.sh、srv2-authorize-srv1-heartbeat-k
 srv2 的 `/etc/fail2ban/**`、`/etc/wazuh*/**`、`/etc/nginx/**`、`/opt/secagent/.env`、
 srv2 侧的 compose（蜜罐/Wazuh 那一套）、以及 `/etc/systemd/system` 下**不含 secagent/cowrie 字样**
 但其实是我们的单元。这些要用同一套"逐个算 sha256 再和仓库比"的办法补一遍 —— 属**下一步**。
+
+## 29. 公开聚合端点 `GET /api/public/webstats`（访问日志只读聚合，2026-10-14 落地）
+
+```
+【它是什么】把 §24 的应用侧访问日志（/opt/secagent/data/access.jsonl）聚合成博客"监测中心"
+  能画的两张图：HTTP 状态码分布（只到类别）+ 7 天 × 24h 热力图；另给"固定类别 TOP"与"UA TOP"。
+【站主 2026-10-14 拍板的 7 条口径 —— 实现按这 7 条写了测试，不许自行放宽】
+  ① 只输出聚合：绝不输出任何 IP（连掩码 IP 都不给），也不给"来源数"
+     （"被多少人打、打得有多狠"本身就是情报）；
+  ② 路径维度只给固定类别枚举，公网页面永不出现攻击者可控的原始字符串：
+     traversal / dotgit / dotenv / wp-login / phpmyadmin / admin-panel /
+     other-404 / other-4xx / other（后三个是兜底，保证"认不出来"只丢名字、不丢统计）；
+  ③ 窗口：默认近 24h；另给 7 天按天汇总（byDay）与 7×24 小时桶（heatmap，供热力图）；
+  ④ 滚动实现 = 内存聚合器（AccessLogWriter 的写线程落盘时顺手累加），固定内存上限，
+     请求路径上【绝不读文件】（§23 事故教训）；
+  ⑤ 入榜门槛：类别/UA 计数 >= min-count（默认 5）才出现，低于门槛的只进总量；
+  ⑥ 状态码只到类别（2xx/3xx/4xx/5xx/other），不给具体码；
+  ⑦ 不公开"疑似扫描占比"（那等于公开我们的检测能力边界）。
+【数据从哪来】启动时后台线程回填最近 7 天（不阻塞启动）；之后由写线程实时累加。
+  回填只读"启动那一刻的活动文件长度"，写线程从那个长度往后计 —— 同一行不会被数两遍
+  （这是最容易写错、且不会报错的地方，WebStatsServiceTest 专门钉住它）。
+```
+
+### 29.1 字段白名单（公开契约：只许新增，不许改名/删除）
+
+```
+generatedAt / cacheSeconds / window / available / reason
+totals{requests, statusClass{2xx,3xx,4xx,5xx,other}}      ← 永远是这五个键
+topCategories[]{category, count, sharePercent}
+topUas[]{ua, count}                                       ← UA 已截断 60 字符、控制字符→空格、IP 形态→[ip]
+byDay[]{date, requests, statusClass{...}}                 ← 只含日志里真实有请求的天
+heatmap[]{date, hour, count}                              ← 7×24=168 格里只列非零格（缺格=0）
+thresholds{minCount, topCategories, topUas}
+coverage{logReadable, backfillDone, backfillRunning, backfilledRecords, parsedRecords,
+         skippedLines, sourceError, bucketCount, bucketSeconds, hourCells,
+         uaSlotsPerBucket, globalUaSlots, uaOverflowRows, uaKeysDropped,
+         recordsOutsideWindow, bucketStaleSkips}
+note
+ipDisclosure{...}                                          ← 所有 /api/public/** 通用，自动带上
+```
+
+**为什么 `coverage` 要公开这些内部数字**：它们就是"这张图的置信边界"——
+读了多少行、跳过多少行、窗口是 288 个 5 分钟桶、UA 每桶只命名 24 个/全局 128 个。
+没有这些，"总量 707"和"总量 7"看起来一样可信。
+
+### 29.2 不可用原因码（fail-closed，**绝不用 0 冒充"这段时间太平"**）
+
+| `reason` | 含义 | 页面该怎么显示 |
+|---|---|---|
+| `OK` | 数据可用 | 正常画图 |
+| `WEBSTATS_DISABLED` | `app.webstats.enabled=false`（或 Bean 未装配） | "聚合端点已关闭" |
+| `LOG_DISABLED` | `app.accesslog.enabled=false`（数据源没开） | "访问日志未开启" |
+| `LOG_FILE_MISSING` | 活动文件不存在（被删/正在轮转/从未写入） | "日志文件不可用" |
+| `LOG_UNREADABLE` | 文件存在但读不出来（权限/被占用/不是普通文件） | "日志读不出来" |
+| `BACKFILL_RUNNING` | 启动回填还没读完（窗口为空时才给这个） | "数据准备中，稍后重试" |
+| `WINDOW_EMPTY` | 日志可读，但 24h 内确实没有任何请求（不是故障） | "窗口内无请求" |
+
+### 29.3 门槛与内存上限（都是常量/配置，攻击者刷不出增长）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 24h 窗口 | 288 个 5 分钟桶 | 窗口 = 最近 288 个桶；最老的 ≤5 分钟落在窗口外（note 里写明） |
+| 每个桶的 UA 槽 | 24 | 超出的只计 `uaOverflowRows`，不命名 |
+| 全局 UA 命名上限 | 128 | 超出的计 `uaKeysDropped` |
+| 7 天按天 | 7 个聚合（每天 24 个整点） | 热力图 168 格；脏时间戳也顶多 7+2 天 |
+| 入榜门槛 | `APP_WEBSTATS_MIN_COUNT`（默认 5） | 类别与 UA 同一门槛 |
+| 榜长 | 类别 10 / UA 5 | `APP_WEBSTATS_TOP_CATEGORIES` / `APP_WEBSTATS_TOP_UAS` |
+| 回填预算 | `APP_WEBSTATS_BACKFILL_MAX_MB`（默认 64MB） | 读满即停；读不到的天就缺天，`coverage` 如实披露 |
+| 文件状态探测 | `APP_WEBSTATS_FILE_PROBE_SECONDS`（默认 10s） | 缺文件要**连续两次**探测才置 false（躲开轮转的 rename→create 瞬间） |
+
+最坏内存占用 ≈ 288×(1+5+9) 个长整数 + 288×24 条 UA 记录 ≈ 1MB 量级，**与请求量无关**。
+
+### 29.4 怎么临时关闭 / 降级
+
+```bash
+# srv1: /opt/secagent/.env（三个键都不许留空）
+APP_WEBSTATS_ENABLED=false          # 关掉端点数据面 → available=false + WEBSTATS_DISABLED
+APP_WEBSTATS_MIN_COUNT=20           # 临时把门槛调高（抗刷榜期）
+APP_WEBSTATS_FILE_PROBE_SECONDS=60  # 磁盘很忙时把 stat 频率调低
+# 改完按发布链重建容器（★不要用 docker compose up 手工重建，会丢 digest 引用）
+# 核对：curl -s https://demo.xiaokeqing.cn/api/public/webstats | jq '.data.available,.data.reason'
+```
+⚠️ 与 `APP_QUOTA_*`/`APP_GEOIP_*` 同一个坑：`docker-compose.yml` 的 `environment` 段
+**已显式透传** `APP_WEBSTATS_*`（7 个键）。只在 `.env` 里加一行而 compose 里没有透传行，
+会**不生效且不报错**。
+
+### 29.5 实测（真实 srv1 access.jsonl + 自造样本）
+
+2026-10-14 00:35 本机实测：把 srv1 `/opt/secagent/data/access.jsonl`（33 行）与
+`access-20261014-000738.jsonl`（674 行，跨天轮转出来的）拉到本地，走真实端点（MockMvc +
+真控制器 + 真聚合器）得到的响应（**原文**，只删了缩进外的空白）：
+
+```jsonc
+{
+  "code" : 200, "message" : "success",
+  "data" : {
+    "generatedAt" : "2026-10-14 00:35:57", "cacheSeconds" : 15, "window" : "24h",
+    "available" : true, "reason" : "OK",
+    "totals" : { "requests" : 707,
+      "statusClass" : { "2xx" : 584, "3xx" : 20, "4xx" : 103, "5xx" : 0, "other" : 0 } },
+    "topCategories" : [
+      { "category" : "other",      "count" : 604, "sharePercent" : 85.43 },
+      { "category" : "other-404",  "count" : 82,  "sharePercent" : 11.6  },
+      { "category" : "dotenv",     "count" : 5,   "sharePercent" : 0.71  },
+      { "category" : "wp-login",   "count" : 5,   "sharePercent" : 0.71  } ],
+    "topUas" : [
+      { "ua" : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "count" : 556 },
+      { "ua" : "ffuf/2.1.0", "count" : 55 },
+      { "ua" : "fasthttp", "count" : 14 },
+      { "ua" : "secagent-webscan-selftest", "count" : 14 },
+      { "ua" : "curl/7.61.1", "count" : 11 } ],
+    "byDay" : [
+      { "date" : "2026-10-13", "requests" : 674,
+        "statusClass" : { "2xx" : 552, "3xx" : 20, "4xx" : 102, "5xx" : 0, "other" : 0 } },
+      { "date" : "2026-10-14", "requests" : 33,
+        "statusClass" : { "2xx" : 32, "3xx" : 0, "4xx" : 1, "5xx" : 0, "other" : 0 } } ],
+    "heatmap" : [
+      { "date" : "2026-10-13", "hour" : 20, "count" : 86 },
+      { "date" : "2026-10-13", "hour" : 21, "count" : 344 },
+      { "date" : "2026-10-13", "hour" : 22, "count" : 189 },
+      { "date" : "2026-10-13", "hour" : 23, "count" : 55 },
+      { "date" : "2026-10-14", "hour" : 0,  "count" : 33 } ],
+    "thresholds" : { "minCount" : 5, "topCategories" : 10, "topUas" : 5 },
+    "coverage" : { "logReadable" : true, "backfillDone" : true, "backfillRunning" : false,
+      "backfilledRecords" : 707, "parsedRecords" : 707, "skippedLines" : 0, "sourceError" : false,
+      "bucketCount" : 288, "bucketSeconds" : 300, "hourCells" : 168,
+      "uaSlotsPerBucket" : 24, "globalUaSlots" : 128,
+      "uaOverflowRows" : 0, "uaKeysDropped" : 0, "recordsOutsideWindow" : 0, "bucketStaleSkips" : 0 },
+    "note" : "只给聚合：不含任何 IP（连掩码 IP 都没有）、不含原始路径与查询串、不含来源数、不含疑似扫描占比。…",
+    "ipDisclosure" : { "masked" : true, "notice" : "观测到的来源地址，未经验证，仅供参考",
+      "removalContact" : "https://xiaokeqing.cn/about/" }
+  }
+}
+```
+
+读法（都是真实数据，不是造的）：
+- **状态码分布**：707 次里 2xx 584 / 3xx 20 / 4xx 103 / 5xx 0；
+- **7×24 桶**：日志是 2026-10-13 20:33 才开始写的，所以热力图只有 13 日 20–23 点与 14 日 0 点
+  —— "缺格=0"是**如实**的（那几小时确实没有日志/没有请求）；
+- **byDay**：10-13 共 674、10-14 共 33（轮转文件 + 活动文件都被回填到了）；
+- **topUas** 里能看到真实扫描器指纹（`ffuf/2.1.0`、`fasthttp`）——这是这个端点对博客的价值所在；
+- **零 IP / 零原始路径**：测试对整段响应体做正则扫描（IPv4 点分四段、IPv6 `::`、以及
+  `/wp-login.php`、`/.env`、`etc/passwd` 这些原始形态），都断言不存在；
+- ⚠️ 这段实测的 `ipDisclosure.masked=true` 是因为实测 harness 直接 `new` 控制器（没注入
+  `PublicIpPolicy` Bean，走的是代码里的**掩码兜底**）。真正部署时该字段由
+  `app.public.mask-ips`（默认 false）决定，见 §27。
+
+同一份日志再叠加自造样本（6 个类别各 6 行、UA 里塞 `1.2.3.4` 与 `2001:db8::1`）后，
+`topCategories` 变成
+`other 604 / other-404 82 / dotenv 11 / wp-login 11 / dotgit 10 / phpmyadmin 10 / traversal 9 / admin-panel 6`，
+`topUas` 里出现 `"[ip]-scanner ([ip])"`（count 36）——**IP 被替换而不是整行丢掉**，
+同时响应体里一个 IP 形态都没有。
+
+### 29.6 已知局限（如实列出，别把这张图读得比它实际更准）
+
+1. **多实例 / 重启后的回填精度**：聚合是**进程内内存**的。多实例部署时每个实例只统计"自己
+   处理的请求"（当前部署是单实例，所以不构成问题）；重启后靠回填恢复，但回填受两件事限制：
+   ①只读活动文件 + 目录里还在的 `access-*.jsonl`（保留 7 天，更早的已被删）；②受
+   `APP_WEBSTATS_BACKFILL_MAX_MB` 字节预算限制（读满即停，`coverage.backfilledRecords` 如实披露）。
+   **不承诺**"重启后 24h 数字与重启前逐条相等"——只承诺"读了多少行、跳过多少行"是公开的。
+2. **队列满时被丢弃的行不进聚合**：`AccessLogWriter.offer` 在队列满时丢行（有 WARN 与计数），
+   这些行既没落盘也没进聚合 —— 两边一致，但意味着**极端洪泛下总量会偏低**。
+3. **日志轮转跨天**：`byDay`/`heatmap` 是按**日志行自带的时区偏移**取本地日期/整点；
+   24h 窗口按**瞬时**对齐。跨时区迁移（服务器时区变了而日志偏移没变）时，这两者会短暂不一致。
+   已知且可接受；若要严格统一，需固定一个时区口径并写入配置。
+4. **窗口边界量化**：24h 窗口按 5 分钟桶对齐（最老的 ≤5 分钟落在窗口外），所以
+   "窗口内 707 次"允许有 ≤5 分钟的边界误差 —— 这是"固定内存上限"的代价，note 里已写明。
+5. **UA 噪声**：UA 是攻击者可控字符串。当前口径是"截断 60 字符 + 控制字符→空格 + IP 形态→[ip] + ≥5 才入榜"，
+   **没有**排除我方自有 UA（实测榜单里出现了 `secagent-webscan-selftest`，那是 fail2ban 自检脚本）。
+   若站主觉得公网页面上不该出现自家自检 UA，可以再加一个 `APP_WEBSTATS_EXCLUDE_UA_PREFIXES`
+   配置（默认空）——**本轮没做**，避免在没拍板前自行扩大口径。
+6. **类别枚举漏掉新扫描路径**：只影响"名字"，不影响"统计"（兜底 `other-404`/`other-4xx`/`other`
+   永远在计数里）。新增类别属于**公开契约的新增**（只许加、不许改名删），要走一次评审 + 文档更新；
+   真正要防的失败模式是"把原始 path 塞进榜单"，那被口径②与测试挡住了。
+7. **ETag/304**：载荷排序全部确定（同输入→同字节），所以 15 秒 `Snapshot` 内 ETag 稳定。
+   但 `generatedAt` 每 15 秒变一次 → 跨快照必然是不同的 ETag（与本项目其余公开端点语义一致）。
+8. **不做的事**：不给 IP、不给"来源数"、不给疑似扫描占比、不给逐条事件流（取证属内部面）。
+   这些是**刻意的非目标**，不是"还没做"。
+
+### 29.7 博客侧联动（必须做，否则新端点会被构建检查判为"未授权端点"）
+
+```
+【提醒站主】加了这个端点之后，博客仓库 scripts/assert-build.sh 的 ALLOWED 白名单需要加：
+    webstats
+（本站代码只负责把端点做好；白名单在博客侧，由站主统一处理。）
+```

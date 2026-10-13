@@ -22,6 +22,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 /**
  * 访问日志的<b>异步落盘器</b>：JSONL 追加写 + 按天/按大小轮转 + 按天保留。
@@ -71,12 +72,31 @@ public class AccessLogWriter implements AutoCloseable {
     /** WARN 节流间隔（毫秒）：磁盘坏了的时候不要每条请求打一行日志 */
     static final long WARN_INTERVAL_MS = 30_000L;
 
+    /**
+     * "活动文件还在不在"的检查频率：每 {@value #FILE_EXISTENCE_CHECK_EVERY} 行或
+     * {@value #FILE_EXISTENCE_CHECK_INTERVAL_MS} 毫秒<b>最多</b>查一次（一次 stat，不读内容）。
+     *
+     * <p>为什么必须有：在 Linux 上删掉一个已打开的文件，句柄仍然可写 —— 写进去的内容
+     * 落在<b>已被 unlink 的 inode</b> 上，{@code access.jsonl} 永远不再出现，
+     * fail2ban/Wazuh 之后什么都看不到，而且<b>不会有任何报错</b>。
+     * 外部改名（logrotate 形态）同理。这里定期 stat 一次就能发现并重开。
+     */
+    static final int FILE_EXISTENCE_CHECK_EVERY = 32;
+    static final long FILE_EXISTENCE_CHECK_INTERVAL_MS = 1_000L;
+
     private final Path dir;
     private final String activeName;
     private final int retainDays;
     private final long maxFileBytes;
     private final int queueCapacity;
     private final Clock clock;
+    /**
+     * 落盘同一行时顺手喂出去的"旁路"（公开聚合端点 {@code /api/public/webstats} 用）。
+     *
+     * <p>刻意走<b>写线程</b>而不是请求线程：请求线程只入队（RUNBOOK §23 的承诺），
+     * 聚合只是"顺手多记一个计数"。旁路抛异常绝不影响落盘（见 {@link #notifySink}）。
+     */
+    private final Consumer<String> lineSink;
 
     private final BlockingQueue<String> queue;
     private final AtomicLong queued = new AtomicLong();
@@ -99,9 +119,23 @@ public class AccessLogWriter implements AutoCloseable {
     private Path activePath;
     private long activeBytes;
     private LocalDate activeDay;
+    /** 打开时记下的文件身份（fileKey）：用来发现"路径还在、但已经不是同一个文件了" */
+    private Object activeFileKey;
+    private long linesSinceExistenceCheck;
+    private long lastExistenceCheckAt;
 
     public AccessLogWriter(Path dir, int retainDays, long maxFileBytes) {
         this(dir, DEFAULT_ACTIVE_NAME, retainDays, maxFileBytes, DEFAULT_QUEUE_CAPACITY, Clock.systemDefaultZone());
+    }
+
+    /**
+     * 带"行旁路"的构造器：写线程落盘每一行时，同时把它交给 {@code lineSink}
+     * （公开聚合端点 {@code /api/public/webstats} 的内存聚合器就挂在这里）。
+     */
+    public AccessLogWriter(Path dir, int retainDays, long maxFileBytes, Consumer<String> lineSink) {
+        this(dir, DEFAULT_ACTIVE_NAME, retainDays, maxFileBytes,
+                new ArrayBlockingQueue<>(Math.max(16, DEFAULT_QUEUE_CAPACITY)),
+                Clock.systemDefaultZone(), Math.max(16, DEFAULT_QUEUE_CAPACITY), lineSink);
     }
 
     public AccessLogWriter(Path dir, String activeName, int retainDays, long maxFileBytes,
@@ -116,6 +150,11 @@ public class AccessLogWriter implements AutoCloseable {
      */
     AccessLogWriter(Path dir, String activeName, int retainDays, long maxFileBytes,
                     BlockingQueue<String> queue, Clock clock, int queueCapacity) {
+        this(dir, activeName, retainDays, maxFileBytes, queue, clock, queueCapacity, null);
+    }
+
+    AccessLogWriter(Path dir, String activeName, int retainDays, long maxFileBytes,
+                    BlockingQueue<String> queue, Clock clock, int queueCapacity, Consumer<String> lineSink) {
         this.dir = dir;
         this.activeName = activeName;
         this.retainDays = Math.max(0, retainDays);
@@ -123,6 +162,7 @@ public class AccessLogWriter implements AutoCloseable {
         this.queueCapacity = Math.max(16, queueCapacity);
         this.clock = clock == null ? Clock.systemDefaultZone() : clock;
         this.queue = queue;
+        this.lineSink = lineSink;
     }
 
     /**
@@ -189,14 +229,14 @@ public class AccessLogWriter implements AutoCloseable {
                 flushQuietly();
                 continue;
             }
-            writeLine(line);
+            writeConsume(line);
             // 批量吸干：避免高并发时"一行一次 take"，同时保证不长时间不 flush
             for (int i = 0; i < 1024; i++) {
                 String more = queue.poll();
                 if (more == null) {
                     break;
                 }
-                writeLine(more);
+                writeConsume(more);
             }
             // 每条/每批都 flush：fail2ban 与 Wazuh 读的是这个文件，
             // 攒在用户态缓冲里 = 检测延迟；I/O 在写线程上，不影响请求。
@@ -206,8 +246,34 @@ public class AccessLogWriter implements AutoCloseable {
         closeQuietly();
     }
 
+    /**
+     * 写线程上处理一行：<b>先喂旁路（聚合计数），再落盘</b>。
+     *
+     * <p>顺序刻意是"先聚合后落盘"：磁盘坏了/目录被删了也不该让"我们已经观测到什么"
+     * 这件事凭空消失（聚合是纯内存的，落盘自有它的失败计数与 WARN）。
+     * 两件事互不影响：一边失败不会让另一边少做。
+     */
+    private void writeConsume(String line) {
+        notifySink(line);
+        writeLine(line);
+    }
+
+    private void notifySink(String line) {
+        Consumer<String> sink = lineSink;
+        if (sink == null) {
+            return;
+        }
+        try {
+            sink.accept(line);
+        } catch (Throwable t) {
+            // 旁路（公开聚合）失败绝不影响访问日志落盘，更不影响请求
+            logger.debug("访问日志旁路消费失败（只影响 /api/public/webstats 的计数）: {}", t.toString());
+        }
+    }
+
     private void writeLine(String line) {
         try {
+            selfHealIfActiveFileVanished();
             rotateIfNeeded();
             if (out == null) {
                 openOut();
@@ -222,12 +288,69 @@ public class AccessLogWriter implements AutoCloseable {
             lastError = e.getClass().getSimpleName() + ": " + e.getMessage();
             warnThrottled("访问日志写盘失败（该条丢弃，请求不受影响）: " + lastError);
             closeQuietly();
+            // 目录被整个删掉也能自愈：下一行会走 CREATE 重新建文件
+            // （openOut 用的是 CREATE+APPEND，缺文件会重建；这里补的是"缺目录"）
+            recoverDirectoryQuietly();
+        }
+    }
+
+    /**
+     * 活动文件被外部删除/改名时重开（写线程上，最多每 32 行或 5 秒一次 stat）。
+     *
+     * <p>不这么做的话，Linux 上"删掉已打开的日志文件"会变成<b>静默写进已 unlink 的 inode</b>：
+     * 文件永远不再出现，检测链路全瞎，而且没有任何异常。
+     */
+    private void selfHealIfActiveFileVanished() {
+        long now = clock.millis();
+        if (linesSinceExistenceCheck < FILE_EXISTENCE_CHECK_EVERY
+                && now - lastExistenceCheckAt < FILE_EXISTENCE_CHECK_INTERVAL_MS) {
+            linesSinceExistenceCheck++;
+            return;
+        }
+        linesSinceExistenceCheck = 0;
+        lastExistenceCheckAt = now;
+        if (activePath == null) {
+            return;
+        }
+        boolean missing = !Files.exists(activePath);
+        Object currentKey = missing ? null : fileKeyOrNull(activePath);
+        boolean replaced = !missing && activeFileKey != null && currentKey != null
+                && !activeFileKey.equals(currentKey);
+        if (!missing && !replaced) {
+            return;
+        }
+        logger.warn("访问日志活动文件{}，重建/重开：{}", missing ? "不见了（被删除？）" : "被换成了另一个文件（被外部轮转？）",
+                activePath);
+        if (missing) {
+            recoverDirectoryQuietly();
+        }
+        // 关键：丢掉旧句柄 —— 它指的是已经不存在/已经不是 access.jsonl 的那个 inode
+        closeQuietly();
+        activeBytes = 0L;
+        activeFileKey = null;
+    }
+
+    private Object fileKeyOrNull(Path p) {
+        try {
+            return Files.readAttributes(p, java.nio.file.attribute.BasicFileAttributes.class).fileKey();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** 目录被删/被移走时尝试重建（失败就继续按"写不出来"如实降级） */
+    private void recoverDirectoryQuietly() {
+        try {
+            Files.createDirectories(dir);
+        } catch (Exception ignored) {
+            // 重建不了就算了：failedWrites 会继续增长，WARN 会继续说
         }
     }
 
     private void openOut() throws IOException {
         out = Files.newBufferedWriter(activePath, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        activeFileKey = fileKeyOrNull(activePath);
     }
 
     private void rotateIfNeeded() throws IOException {
@@ -267,6 +390,7 @@ public class AccessLogWriter implements AutoCloseable {
         }
         activeBytes = Files.size(activePath);
         activeDay = currentDay();
+        activeFileKey = fileKeyOrNull(activePath);
         rotations.incrementAndGet();
         purgeOld();
     }

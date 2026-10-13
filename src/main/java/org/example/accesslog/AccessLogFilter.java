@@ -9,6 +9,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
@@ -111,6 +112,16 @@ public class AccessLogFilter extends OncePerRequestFilter {
     @Value("${app.accesslog.skip-paths:/api/health}")
     private String skipPaths = "/api/health";
 
+    /**
+     * 公开聚合端点 {@code /api/public/webstats} 的数据面（可选 Bean）。
+     *
+     * <p>为什么把它挂在<b>写线程</b>上：请求线程只做一次 {@code offer}（RUNBOOK §23），
+     * 聚合计数是写线程"顺手"做的事；公开端点只读内存，从不读文件。
+     * 这个 Bean 缺席（老部署/单测直接 new Filter）时访问日志照常工作。
+     */
+    @Autowired(required = false)
+    private WebStatsService webStatsService;
+
     private final ObjectMapper mapper = new ObjectMapper();
     private final AtomicLong reqIdSeq = new AtomicLong();
     private final List<String> skipPrefixes = new ArrayList<>();
@@ -138,7 +149,13 @@ public class AccessLogFilter extends OncePerRequestFilter {
             return;
         }
         long maxBytes = Math.max(1, maxFileMb) * 1024L * 1024L;
-        AccessLogWriter w = new AccessLogWriter(Path.of(dir), retainDays, maxBytes);
+        // 【顺序不可换】先让聚合器记下"回填读到哪一位"，再启动写线程：
+        // 回填只读 [0, 当时的长度)，写线程从那个长度往后实时计 —— 同一行不会被数两遍。
+        WebStatsService stats = webStatsService;
+        if (stats != null) {
+            stats.beginBackfill(Path.of(dir));
+        }
+        AccessLogWriter w = new AccessLogWriter(Path.of(dir), retainDays, maxBytes, this::onLinePersisted);
         try {
             w.start();
             writer = w;
@@ -380,6 +397,18 @@ public class AccessLogFilter extends OncePerRequestFilter {
             }
         }
         return skipExact.contains(uri);
+    }
+
+    /**
+     * 写线程落盘每一行时回调：顺手喂给公开聚合端点（{@code /api/public/webstats}）的数据面。
+     *
+     * <p>只做一次方法调用 + 计数，<b>不读文件、不阻塞</b>；Bean 缺席时为 no-op。
+     */
+    private void onLinePersisted(String line) {
+        WebStatsService stats = webStatsService;
+        if (stats != null) {
+            stats.acceptLine(line);
+        }
     }
 
     private void warnDegradedThrottled() {

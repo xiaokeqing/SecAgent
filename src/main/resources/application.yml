@@ -207,6 +207,27 @@ app:
     # 逗号分隔；以 * 结尾 = 前缀匹配，其余精确匹配。
     # 默认跳过 /api/health：容器 healthcheck 每 30 秒一次 = 一天 2880 行纯噪声。
     skip-paths: ${APP_ACCESSLOG_SKIP_PATHS:/api/health}
+  # ===== 公开聚合端点 GET /api/public/webstats（访问日志的只读聚合；RUNBOOK §29）=====
+  # 【口径（站主 2026-10-14 拍板 7 条）】只给聚合，绝不输出任何 IP（连掩码都不给），
+  #   也不给"来源数"与"疑似扫描占比"（那等于公开检测能力边界）；状态码只到类别
+  #   （2xx/3xx/4xx/5xx/other）；路径只给固定类别枚举（wp-login/dotenv/dotgit/phpmyadmin/
+  #   traversal/admin-panel/other-404/other-4xx/other）—— 攻击者可控字符串永不上公网页面。
+  # 【数据从哪来】写线程落盘时顺手喂内存聚合器（请求线程零成本、请求路径上不读文件，§23）；
+  #   启动时由后台线程从 access.jsonl 回填最近 7 天（不阻塞启动，见 WebStatsService）。
+  # 【内存上限（固定，与请求量无关）】24h = 288 个 5 分钟桶；每桶最多命名 24 个 UA；
+  #   全局最多命名 128 个 UA；7 天热力图 = 7×24 = 168 格。攻击者刷路径/UA 都刷不出内存增长。
+  # 【怎么关】APP_WEBSTATS_ENABLED=false —— 端点如实返回 WEBSTATS_DISABLED + available=false，
+  #   不是"空分布"（空分布会被页面渲染成"最近没人扫我们"）。
+  # ⚠️ 与 APP_QUOTA_*/APP_RAG_* 同一个坑：docker-compose.yml 的 environment 段必须显式透传
+  #    下面这些键（compose 的 SPRING_APPLICATION_JSON 优先级高于环境变量绑定）。
+  webstats:
+    enabled: ${APP_WEBSTATS_ENABLED:true}
+    min-count: ${APP_WEBSTATS_MIN_COUNT:5}                    # 入榜门槛：类别/UA 计数 ≥5 才出现
+    top-categories: ${APP_WEBSTATS_TOP_CATEGORIES:10}          # 类别榜长度
+    top-uas: ${APP_WEBSTATS_TOP_UAS:5}                         # UA 榜长度
+    ua-max-chars: ${APP_WEBSTATS_UA_MAX_CHARS:60}               # 公网 UA 截断长度（先滤控制字符、再去 IP）
+    backfill-max-mb: ${APP_WEBSTATS_BACKFILL_MAX_MB:64}         # 启动回填的字节预算（读满即停，如实披露）
+    file-probe-seconds: ${APP_WEBSTATS_FILE_PROBE_SECONDS:10}   # 日志文件状态探测间隔（秒）
   # ===== 公开面 IP 显示口径 + "永不公开"清单（站主 2026-10-14 拍板）=====
   # 【唯一开关】mask-ips 只被 PublicIpPolicy 读一次，再由它作用到【所有】公开端点 ——
   #   一处控制、一个口径来源，不会出现"某个端点自己判断掩不掩码"的第三种口径
