@@ -34,6 +34,8 @@ paths = [
 # 再加一层正则白名单：即使上面路径判断失效，这些明显构造的值也放行。
 # 判据是"一眼能看出是编的"：连续字母序列 / 驼峰单词 / 重复字符。
 regexes = [
+    # 公开出口凭据脱敏测试用的假口令（明显构造：混合大小写+数字+@与连字符，不是真实凭据）
+    '''P@ssw0rd-Str0ng''',
   # LTAI5t7abcdefghijklmnop（连续字母）、LTAI5tAbcDefGhiJklmn12345（驼峰单词）
   '''LTAI5t[A-Za-z]{3}(abcdefghijklmnop|AbcDefGhiJklmn[0-9]+)''',
   # PEM 私钥的测试样例：正文是省略号，不是真实的 base64 密钥体
