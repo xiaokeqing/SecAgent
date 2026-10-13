@@ -1,0 +1,10 @@
+[Unit]
+Description=每天 09:10 跑 srv1 自检（错过则开机后补跑）
+
+[Timer]
+OnCalendar=*-*-* 09:10:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

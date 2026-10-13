@@ -1,0 +1,13 @@
+[Unit]
+Description=SecAgent srv1 每日自检（部署链 + 单元 + 容量 + 通知通道）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-daily-check.sh
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

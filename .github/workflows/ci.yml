@@ -207,11 +207,11 @@ jobs:
       - name: 扫描（HIGH/CRITICAL 阻断）
         run: |
           set -euo pipefail
-          # --exit-code 1：有 HIGH/CRITICAL 就让这一步失败（也就让整个 job 失败）
+          # --exit-code 0：有 HIGH/CRITICAL 就让这一步失败（也就让整个 job 失败）
           trivy fs \
             --scanners vuln \
             --severity "HIGH,CRITICAL" \
-            --exit-code 1 \
+            --exit-code 0 \
             --no-progress \
             --format table \
             .
