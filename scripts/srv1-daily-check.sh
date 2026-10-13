@@ -22,7 +22,7 @@ say() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 notify() { # notify <level> <title> <body>
   local lvl="$1" title="$2" body="$3"
   if [ "$DRY" = "1" ]; then say "（dry-run）本应通知：[$lvl] $title — $body"; return 0; fi
-  if [ -x "$APP/scripts/notify.sh" ]; then
+  if [ -f "$APP/scripts/notify.sh" ]; then
     bash "$APP/scripts/notify.sh" "$lvl" "$title" "$body" >/dev/null 2>&1
     say "已尝试通知（notify.sh 退出码=$?）"
   else
@@ -34,7 +34,7 @@ FAIL=0
 DETAIL=""
 
 # 1) 部署链体检
-if [ -x "$APP/scripts/deploy-chain-check.sh" ]; then
+if [ -f "$APP/scripts/deploy-chain-check.sh" ]; then
   OUT=$(bash "$APP/scripts/deploy-chain-check.sh" --json 2>&1); RC=$?
   if [ $RC -eq 0 ]; then
     HEALTH=$(printf '%s' "$OUT" | python3 -c 'import json,sys
@@ -65,8 +65,26 @@ DISK=$(df --output=pcent / | tail -1 | tr -dc '0-9')
 say "根盘使用率: ${DISK}%"
 if [ "${DISK:-0}" -ge 90 ]; then FAIL=1; DETAIL="$DETAIL 磁盘>=90%;"; elif [ "${DISK:-0}" -ge 80 ]; then say "磁盘 >=80%（提醒级，不告警）"; fi
 
+# 3.5) docker-compose.yml 一致性 —— 【2026-10-14 新增】
+#   为什么：仓库里改 compose（加挂载/加环境变量透传）**不会自动到服务器** —— 服务器那份是手工维护的。
+#   今天就是这么踩的：GeoIP 的 `/opt/geoip` 挂载只改了仓库，部署后端点报 GEO_DB_MISSING，
+#   查了半天才发现"服务器 compose 没有这一行"。所以把它变成每天必看的一项。
+if [ -d "$APP/.git" ] && git -C "$APP" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+  R=$(git -C "$APP" show HEAD:docker-compose.yml 2>/dev/null | tr -d '\r' | sha256sum | cut -c1-16)
+  L=$(tr -d '\r' < "$APP/docker-compose.yml" 2>/dev/null | sha256sum | cut -c1-16)
+  if [ -n "$R" ] && [ -n "$L" ] && [ "$R" = "$L" ]; then
+    say "compose 一致性: OK（仓库 HEAD 与服务器一致 $R）"
+  else
+    FAIL=1; DETAIL="$DETAIL compose不一致(仓库=$R/服务器=$L);"
+    say "compose 一致性: **不一致** 仓库=$R 服务器=$L"
+    say "    → 仓库改了 compose 但服务器没跟上（或反过来）。发布链不会同步 compose，需手工对齐；"
+    say "      差异：git -C $APP diff HEAD -- docker-compose.yml"
+  fi
+else
+  say "compose 一致性: 跳过（$APP 不是 git 仓库或没有 HEAD）"
+fi
 # 4) 通知通道自检（没配 URL 也算失败——否则出事时没人知道）
-if [ -x "$APP/scripts/notify.sh" ]; then
+if [ -f "$APP/scripts/notify.sh" ]; then
   LOW=$(bash "$APP/scripts/notify.sh" INFO "每日自检：通知通道可用性检查" "如果你看到这条，说明通道正常（每天一条）" 2>&1); RC=$?
   case $RC in
     0) say "通知通道: OK" ;;
@@ -83,7 +101,7 @@ fi
 #    临时关闭：DRIFT_CHECK_DISABLED=1（或把本段注释掉）。
 if [ "${DRIFT_CHECK_DISABLED:-0}" = "1" ]; then
   say "漂移巡检: 已关闭（DRIFT_CHECK_DISABLED=1）"
-elif [ -x "$APP/scripts/srv1-drift-check.sh" ]; then
+elif [ -f "$APP/scripts/srv1-drift-check.sh" ]; then
   DOUT=$(bash "$APP/scripts/srv1-drift-check.sh" 2>&1); DRC=$?
   DLINE=$(printf '%s\n' "$DOUT" | grep -m1 '^drift:')
   if [ "$DRC" -eq 0 ]; then

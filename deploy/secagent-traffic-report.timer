@@ -1,0 +1,10 @@
+[Unit]
+Description=每天 09:20 出流量日报（超阈值才告警）
+
+[Timer]
+OnCalendar=*-*-* 09:20:00
+Persistent=true
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

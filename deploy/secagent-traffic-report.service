@@ -1,0 +1,9 @@
+[Unit]
+Description=SecAgent 流量日报与阈值告警
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/secagent/.env
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-traffic-report.sh
+Nice=10
