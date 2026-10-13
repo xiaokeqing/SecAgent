@@ -47,13 +47,18 @@ PATTERNS=(
   # 为什么这几个要进来：它们都是"手改过 /etc 或 /opt"的落点，
   # 出错时的表现都很隐蔽（规则写错 SIEM 停摆、隔离脚本被改回 -I 1 就又出洞），
   # 所以必须和其他落点一样进基线。
-  "/usr/local/sbin/srv2-dionaea-*.sh"          # 安装/自检/启停/清理
+  "/usr/local/sbin/srv2-dionaea-*.sh"          # 安装/自检/启停/清理/协议级健康检查(自愈)
+  "/usr/local/sbin/srv2-install-cowrie-rules.sh"   # Cowrie 规则安装器（带 analysisd -t 门禁）
   "/usr/local/sbin/srv2-honeypot-egress-probe.sh"  # 隔离实测探针
   "/usr/local/sbin/cowrie-egress-lock.sh"      # 蜜罐网段 egress 锁定（注释里记着那次洞的教训）
   "/opt/dionaea/*.yml"                         # docker-compose.yml
   "/opt/dionaea/etc/dionaea/dionaea.cfg"       # 被 install 脚本改过 default.levels
   "/opt/dionaea/etc/dionaea/ihandlers-available/log_json.yaml"  # 修过路径的 JSON handler
   "/opt/wazuh/config/wazuh_cluster/rules/srv2_dionaea_rules.xml"
+  # 2026-10-14 补：cowrie_rules.xml 以前【只存在于服务器】（改坏了没权威副本可比对）。
+  # 现在仓库里有权威副本 deploy/wazuh/cowrie_rules.xml，装上来之后必须进基线 ——
+  # 它承载"告警描述里不放凭据"这条红线：被人改回 $(password) 要能立刻被发现。
+  "/opt/wazuh/config/wazuh_cluster/rules/cowrie_rules.xml"
 )
 
 collect() { # 输出 "sha256  path" 行，按路径排序

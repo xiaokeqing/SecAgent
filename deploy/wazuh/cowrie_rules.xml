@@ -1,0 +1,117 @@
+<!--
+  蜜罐（Cowrie）告警规则
+  ============================================================
+  为什么要自己写：
+    Wazuh 自带 Suricata 规则（0475-suricata_rules.xml），但【没有 Cowrie】。
+    所以 Cowrie 的事件虽然被 logcollector 读进来了，却不会产生任何告警 ——
+    "接进 Wazuh" 只做到了采集，没做到告警。
+    这个区别很关键：采集了不等于有人会知道。
+
+  匹配依据：
+    Cowrie 每个事件都是一行 JSON，带 eventid 字段（如 cowrie.login.success）。
+    Wazuh 的 JSON 解码器会把 JSON 的键变成字段，所以规则里可以直接
+    用 <field name="eventid"> 匹配。
+
+  分级思路（按"这件事有多值得警惕"）：
+    session.connect  3  有人连上来了 —— 蜜罐的日常，量会很大，级别低
+    login.failed     5  有人在试口令
+    login.success   10  攻击者"登录成功"了（蜜罐故意的）—— 需要关注
+    command.input   10  攻击者开始敲命令 —— 这是最有价值的数据
+    client.version   3  记录攻击者用的 SSH 客户端（可以识别工具）
+    session.closed   3  会话结束
+    另外加一条复合规则：同一源 IP 短时间内多次失败 -> 升级为 12（爆破）
+
+  ============================================================
+  【2026-10-14 红线条目：告警描述里不放凭据】
+  ------------------------------------------------------------
+  事故：rule.description 里原样写了 `口令=$(password)`，而 Wazuh 会把它渲染成明文，
+  这段 description 又被应用侧当成 `title` / `ruleName`（见 WazuhService：ruleName
+  直接取自 rule.description），于是明文口令随 /api/public/alerts 直出公网。
+  实测（修复前，srv1 上 20 次采样）：`http://127.0.0.1:9900/api/public/alerts`
+  每次响应里都有 2 处明文（title + ruleName），隐藏形态 0 次。
+
+  修法：这里把 `$(password)` 从描述里【去掉】，换成项目既定的隐藏形态
+  `[口令已隐藏]`（= 应用侧 CredentialStructure.PASSWORD_HIDDEN 常量，
+  /honeypot 端点用的就是它）。用户名与来源保留 —— 脱敏不是删字段，
+  "用户=root" 是战报信息，该给。
+
+  【为什么必须在这一层做，而不是只靠应用侧脱敏】
+    1) 出口不止一个。应用的公开 GET 统一出口 scrubDeep() 原先只做资产名过滤、
+       从不做凭据脱敏；/honeypot 显式调了 hidePasswords() 所以是干净的，
+       而告警链路（/api/public/alerts 与下钻）一处都没调 —— 这条缝就是这么来的。
+       只要有一个出口漏调，明文就出网；把凭据在【进入告警数据之前】就去掉，
+       才对所有出口同时生效。
+    2) 数据一旦入库就到处都在。description 会被写进 alerts.json、被 filebeat 送进
+       indexer、被 API 读、被通知聚合读、被攻击故事关联读 —— 事后逐处脱敏
+       等于赌"没有下一处"。源头去掉只有一处要保证。
+    3) 历史数据的无形成本：明文口令留在索引里，谁加了新的读取路径（导出、转发、
+       报表）都会再漏一次。
+
+  【口径】公开面：不给口令原文；用户名可以给。口令结构（长度/字符类/是否弱口令）
+    需要"计算"，而 Wazuh 规则层没有字符串函数 —— 结构化的那份由应用侧
+    CredentialStructure 提供（/honeypot 的 topCredentials）。所以本文件只放
+    隐藏标记，不编造长度/字符类。
+
+  【已知残留，如实记录】100103 的 `$(input)`（攻击者执行的命令原文）会进描述。
+    如果攻击者的命令行里本身带口令形态（例如 `mysql -u root -p xxx`），
+    它仍可能被公开面看到。这里【刻意不动】：命令原文是蜜罐最有价值的战报，
+    按项目口径由应用侧出口脱敏（scrubDeep→scrubText，已提交待 CI 部署）兜底。
+  ============================================================
+-->
+<group name="cowrie,honeypot,">
+
+  <rule id="100100" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="eventid">^cowrie\.session\.connect$</field>
+    <description>蜜罐: 新的 SSH 连接来自 $(src_ip)</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+  </rule>
+
+  <rule id="100101" level="5">
+    <decoded_as>json</decoded_as>
+    <field name="eventid">^cowrie\.login\.failed$</field>
+    <!-- 口令不进描述：只保留用户名 + 隐藏标记 + 来源 -->
+    <description>蜜罐: 登录失败 用户=$(username) 口令=[口令已隐藏] 来源=$(src_ip)</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+
+  <rule id="100102" level="10">
+    <decoded_as>json</decoded_as>
+    <field name="eventid">^cowrie\.login\.success$</field>
+    <!-- 口令不进描述：只保留用户名 + 隐藏标记 + 来源 -->
+    <description>蜜罐: 攻击者"登录成功" 用户=$(username) 口令=[口令已隐藏] 来源=$(src_ip)</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+
+  <rule id="100103" level="10">
+    <decoded_as>json</decoded_as>
+    <field name="eventid">^cowrie\.command\.input$</field>
+    <description>蜜罐: 攻击者执行命令 "$(input)" 来源=$(src_ip)</description>
+    <mitre>
+      <id>T1059</id>
+    </mitre>
+  </rule>
+
+  <rule id="100104" level="3">
+    <decoded_as>json</decoded_as>
+    <field name="eventid">^cowrie\.client\.version$</field>
+    <description>蜜罐: SSH 客户端版本 $(version) 来源=$(src_ip)</description>
+  </rule>
+
+  <!-- 复合规则：同一源 IP 在 120 秒内失败 5 次 -> 判定为暴力破解 -->
+  <rule id="100110" level="12" frequency="5" timeframe="120">
+    <if_matched_sid>100101</if_matched_sid>
+    <same_source_ip />
+    <description>蜜罐: 检测到 SSH 暴力破解（120 秒内 5 次失败）来源=$(src_ip)</description>
+    <mitre>
+      <id>T1110</id>
+    </mitre>
+  </rule>
+
+</group>

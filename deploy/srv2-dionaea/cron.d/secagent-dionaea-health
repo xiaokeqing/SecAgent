@@ -1,0 +1,19 @@
+# ============================================================
+# srv2：Dionaea 协议级健康检查（每 5 分钟；不健康就自愈）
+# 安装位置：/etc/cron.d/secagent-dionaea-health
+# ------------------------------------------------------------
+# 为什么要它（2026-10-14 实测）：
+#   Dionaea 会**卡死**：MySQL 服务停止处理新连接，但 TCP 握手仍然成功
+#   （内核 accept 队列照常回 SYN-ACK），`docker ps` 也照样显示 Up。
+#   实测：18:38:47 之后 3306 不再记任何事件，而 1433 还在工作；
+#   进程状态 R、CPU 时间一路涨。用"端口连得上"判断会**完全测不出来**。
+#   所以这里按协议要应答：
+#     3306 要 MySQL 握手包 / 1433 要 TDS prelogin 响应 / 445 要 SMB1 NEGOTIATE 响应
+#   （445 只讲 SMB1：发 SMB2 没有任何回应 —— 探针用错协议会假失败）
+#
+# 不健康时：脚本带 10 分钟冷却地重启容器，并 notify.sh HIGH 发一条。
+# 注意 cron 里 `%` 是特殊字符 —— 本文件不含裸 %。
+# ============================================================
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+*/5 * * * * root /usr/local/sbin/srv2-dionaea-healthcheck.sh --heal >> /opt/secagent/logs/dionaea-health.log 2>&1

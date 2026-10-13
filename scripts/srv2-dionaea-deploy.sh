@@ -169,15 +169,24 @@ install_artifacts() {
   # 蜜罐网段隔离的每日实测（一等检查项；非 0 就 notify HIGH；探针 fail-closed）
   install -m 0644 -o root -g root "$SRC_DEPLOY/cron.d/secagent-honeypot-egress" /etc/cron.d/secagent-honeypot-egress
   ok "cron -> /etc/cron.d/secagent-honeypot-egress（每日 09:40 实测隔离，非 0 报警）"
+  # Dionaea 协议级健康检查 + 自愈（每 5 分钟；卡死会自己重启并报警）
+  install -m 0644 -o root -g root "$SRC_DEPLOY/cron.d/secagent-dionaea-health" /etc/cron.d/secagent-dionaea-health
+  ok "cron -> /etc/cron.d/secagent-dionaea-health（每 5 分钟协议级探活 + 自愈）"
   install -m 0644 -o root -g root "$SRC_DEPLOY/srv2-dionaea.service" /etc/systemd/system/srv2-dionaea.service
   ok "unit -> /etc/systemd/system/srv2-dionaea.service"
   for s in srv2-dionaea-deploy.sh srv2-dionaea-check.sh srv2-dionaea-killswitch.sh \
-           srv2-dionaea-cleanup.sh srv2-dionaea-wire-wazuh.sh \
+           srv2-dionaea-cleanup.sh srv2-dionaea-wire-wazuh.sh srv2-dionaea-healthcheck.sh \
            srv2-honeypot-egress-probe.sh srv2-honeypot-port-probe.sh; do
     [ -f "$REPO_ROOT/scripts/$s" ] || { warn "缺 $s，跳过"; continue; }
     install -m 0755 -o root -g root "$REPO_ROOT/scripts/$s" "/usr/local/sbin/$s"
     ok "脚本 -> /usr/local/sbin/$s"
   done
+  # Cowrie 规则安装器（带 analysisd -t 门禁）。cowrie_rules.xml 以前只存在于服务器，
+  # 现在仓库是权威副本 —— 改规则必须走这个脚本，别手改服务器。
+  if [ -f "$REPO_ROOT/scripts/srv2-install-cowrie-rules.sh" ]; then
+    install -m 0755 -o root -g root "$REPO_ROOT/scripts/srv2-install-cowrie-rules.sh" /usr/local/sbin/srv2-install-cowrie-rules.sh
+    ok "脚本 -> /usr/local/sbin/srv2-install-cowrie-rules.sh（Cowrie 规则，带 -t 门禁）"
+  fi
   # 诱饵脚本：本次把 1433/3306 移交给 Dionaea，并把放行规则改成"只 -A 追加"
   # （用 -I 1 插到链首就是 2026-10-13 那个 egress 洞的成因，必须让服务器上也拿到新版）
   if [ -f "$REPO_ROOT/scripts/srv2-decoy-ports.sh" ]; then

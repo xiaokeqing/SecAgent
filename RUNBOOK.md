@@ -2557,9 +2557,67 @@ mvn -B test
 6. **`/api/public/geo` 与本次改造的交集只有 `ipDisclosure` 与资产名过滤**：
    该端点本身不给任何 IP（设计如此），它的运维见 §26（由 GeoIP 那一路负责）。
 
----
+### 27.7 【硬规则】所有公开出口在 `scrubDeep` 统一做凭据脱敏（2026-10-14 红线违反的修复）
 
-## 28. 主机侧四项加固：容器守卫 / 反向心跳 / 漂移巡检 / 备份加密（2026-10-13 落地，2026-10-13 收口补录）
+> **规则一句话**：公开面**只允许有唯一一个出海闸门**；凭据脱敏必须挂在**闸门**上，
+> 不许挂在某个 `buildXxx()` 的业务组装里。今天这个闸门是
+> `PublicApiController` 的 `ok()` → `ship()` → `scrubDeep()`。
+
+**闸门现在的口径（顺序不能反）**：
+`scrubDeep()` 对每个字符串调 `scrubText(s)` = **先 `assets().scrub(s)`（内部资产名过滤）、
+再 `CredentialStructure.hidePasswords(s)`（凭据脱敏）**。两条都是"过整棵 data 树"，
+所以**今天所有公开端点一并覆盖，以后新加的公开端点默认就是安全的**。
+
+#### 这次出的事（根因）
+
+`scrubDeep()` 原先**只调 `assets().scrub()`，从不做凭据脱敏**。
+`/api/public/honeypot` 之所以干净，是它在自己的组装里**显式**调了
+`CredentialStructure.hidePasswords()`；而告警链路
+（`buildAlerts()` → `publicAggregate()` / `publicAlert()`）**一处都没调**。
+于是 Wazuh 蜜罐规则描述原文
+
+```
+蜜罐: 攻击者"登录成功" 用户=root 口令=<明文> 来源=<ip>
+```
+
+随聚合告警的 `title` 与 `ruleName` **原样直出公网**，`GET /api/public/alerts` 与
+`GET /api/public/alerts/{aggId}` 两条路径都中。泄漏的是**攻击者猜的口令**（不是我方密钥），
+但这违反本站红线"**蜜罐完整口令永不上公网**"。
+
+修复：commit `7d2c216`（生产 diff `+34/-1`，只动 `scrubDeep` 与新增 `scrubText`）。
+对 `/honeypot` 变成**双重保险**；因为 `hidePasswords` 幂等（占位符里没有 `口令=…` 形状），
+**输出逐字节不变** —— 冻结串 `masked-golden-honeypot.json` 一字未改仍然过。
+
+#### 教训（两条，都必须记住）
+
+1. **"另一条路径漏了"是最典型的失败模式，而且它不报错。**
+   `/honeypot` 记得调、`/alerts` 忘了调 —— 代码能编译、接口 200、CI 全绿，
+   只有把那个端点的响应体打出来才看得见。
+   **对策**：把安全处理放在**唯一闸门**上（本节规则），而不是"每个业务组装各自记得调"。
+   逐字段 / 逐端点手工调用的写法，失败模式必然是"新加了一个字段或端点、忘了加过滤"。
+   这与 §27 开头 `ship()` 采用"过整棵树"的理由是同一条。
+2. **间歇性缺陷会让单次自测"假通过"。**
+   这个泄露只在**取数窗口内恰好有"蜜罐登录成功"告警**时可见。手点一次、`curl | grep` 一次，
+   大概率什么都查不到，于是**修复前自测也会通过**——这种"通过"没有任何证据价值。
+   **对策（固定动作）**：
+   - 抽样必须**连续 ≥30 次、间隔 15–30 秒**，并**记录命中次数**，而不是"跑一次没看到就结论没事"；
+   - 判据要写成**修复前有命中、修复后 0 命中**的对照（本次基线：12 轮 / 12 轮命中 / 24 处明文；
+     修复后：0/30、0 处）；
+   - 每一轮的**原始响应体要落盘**，判定在原始文件上做 —— 否则"没命中"无法区分
+     "真的干净"和"扫描脚本自己写错了"。
+
+#### 验证（不许只看结论，判据在这里）
+
+| 项 | 判据 | 结果 |
+|---|---|---|
+| CI 回归 | `PublicAlertsCredentialLeakTest`（4 条：列表 / 下钻 / 跨端点形态 / 幂等） | 全绿 |
+| **测试有效性** | 把生产修复 stash 掉后同一条测试**必须变红** | 旧代码 3 条 Failures ✓ |
+| 修复前基线（线上） | `/alerts` 抽样命中明文 | **12/12 轮、24 处**（`passw0rd`/`iloveyou`/`fuckyou`/`shadow`/`dragon`） |
+| 修复后（线上） | `/alerts` 抽样命中明文 | 见下方实测（要求 **0/30、0 处**） |
+| `/honeypot` 未变 | 冻结串逐字节 + 抽样明文命中 | 冻结串仍绿；明文命中恒 0 |
+| 其余端点未破 | `/overview` `/latest` `/stories` `/story` `/geo` `/webstats` 等 200 + 结构不变 | 见下方实测 |
+
+：容器守卫 / 反向心跳 / 漂移巡检 / 备份加密（2026-10-13 落地，2026-10-13 收口补录）
 
 > **【补录说明】** 本节内容原先**只存在于 srv1 的 `/opt/secagent`**（服务器侧分支提交 `4f652c3`，从未推送到 GitHub）。
 > 服务器侧那份 RUNBOOK 把它编成"§22"，与仓库里的 §22（状态异地备份）**编号撞车**，两份 RUNBOOK 因此互有缺失
@@ -3535,9 +3593,10 @@ sudo tail -20 /opt/secagent/logs/honeypot-egress-check.log   # 每天 09:40 的�
 镜像不存在导致探测容器起不来 → rc=2；撤规则后 `iptables -S DOCKER-USER` 与测试前逐字一致。
 另：探针只在 stdout 是终端时上色（否则通知正文会带 ANSI 乱码）。
 
-仓库落点（`deploy/srv2-dionaea/`、`scripts/srv2-dionaea-*.sh`、`scripts/srv2-honeypot-*-probe.sh`）
+仓库落点（`deploy/srv2-dionaea/`、`scripts/srv2-dionaea-*.sh`、`scripts/srv2-honeypot-*-probe.sh`、
+`scripts/srv2-install-cowrie-rules.sh`、`deploy/wazuh/cowrie_rules.xml`）
 与服务器副本 **sha256 一致**，并已进落点基线
-（`srv1-installed-manifest.sh --capture`，35 个落点，`--check` 为 0 missing / 0 changed / 0 added）。
+（`srv1-installed-manifest.sh --capture`，39 个落点，`--check` 为 0 missing / 0 changed / 0 added）。
 
 ### 31.10 没做到 / 可疑的（如实列）
 
@@ -3576,6 +3635,63 @@ sudo tail -20 /opt/secagent/logs/honeypot-egress-check.log   # 每天 09:40 的�
    在 `set -o pipefail` 下会把"活着"判成"死了" —— 自检脚本里犯了一次（本 RUNBOOK 别处早已记过这个坑）；
    以及 `docker exec` 少了 `-i` 时 `wazuh-logtest` 拿不到 stdin，
    自测会输出两行横幅、看起来像"规则没命中"，实际是"根本没喂进去"。
+10. **Dionaea 会卡死（已加协议级探活 + 自愈）**：2026-10-14 实测 —— 18:38:47 之后
+    MySQL 服务不再处理新连接，但 **TCP 握手照样成功**（内核 accept 队列照常回 SYN-ACK）、
+    `docker ps` 也显示 Up、进程状态 R 且 CPU 时间一路涨；同时 1433 还在正常工作。
+    也就是说**"端口连得上"完全掩盖了"服务已经死了"**（等队列满才变成连接超时）。
+    对策：`srv2-dionaea-healthcheck.sh`（每 5 分钟，`/etc/cron.d/secagent-dionaea-health`）
+    按协议要应答（3306 要 MySQL 握手包 / 1433 要 TDS prelogin 响应 / 445 要 SMB1 negotiate 响应），
+    不健康就带 10 分钟冷却地重启并 `notify.sh HIGH`。
+    失败注入实测：`docker compose stop` → 检查 rc=1 → `--heal` 自动拉起 → 复检三协议全 OK。
+    **根因未定位**（dionaea 0.11 上游行为，容器一直在 CPU 上限内，不是宿主风险）。
+11. **Dionaea 的 SMB 只讲 SMB1**：实测发 SMB2 NEGOTIATE **没有任何回应**，
+    发 SMB1 NEGOTIATE 才回 89 字节（`\xffSMB` + 命令 0x72）。所以：
+    ① 健康探针必须用 SMB1（用 SMB2 会假失败）；② 现代扫描器用 SMB2/3 时拿不到协议级回应，
+    但**连接尝试仍会被记成 `smbd accept` 并触发规则 100300** —— 检测价值在 accept 层，如实记录。
+
+### 31.11 原则：**告警描述里不放凭据**（源头脱敏）
+
+> 事故与定位见 `docs/安全事件-20261014-蜜罐网段可出网.md` 同批的凭据线文档（§33 也涉及凭据）；
+> 本节只写这条原则本身与"为什么必须做在源头"。
+
+**一句话**：`rule.description` 里**不许引用口令字段**。蜜罐抓到的口令只进"内部面"，
+公开面只给 `口令=[口令已隐藏]`（= 应用侧 `CredentialStructure.PASSWORD_HIDDEN`，与 `/honeypot` 同一形态）。
+
+**当年那条缝**：`cowrie_rules.xml` 的 100101/100102 写的是
+`口令=$(password)`，Wazuh 渲染成明文；而应用侧 `WazuhService` 把 `rule.description`
+**直接当作 `title` / `ruleName`**，于是明文随 `/api/public/alerts`（含下钻）出公网。
+实测（修复前，srv1 上 20 次采样 `http://127.0.0.1:9900/api/public/alerts`）：
+每次响应 2 处明文（title + ruleName）、隐藏形态 0 次。
+
+**为什么不能只靠应用侧脱敏**（这次的实际教训）：
+1. **出口不止一个**。公开 GET 的统一出口 `scrubDeep()` 原先只做资产名过滤、从不做凭据脱敏；
+   `/honeypot` 显式调了 `hidePasswords()` 所以干净，而告警链路一处都没调 —— 缝就是这么来的。
+   把凭据在**进入告警数据之前**去掉，才对所有出口同时生效。
+2. **数据一旦入库就到处都是**。description 会进 `alerts.json`、被 filebeat 送进 indexer、
+   被 `/alerts` 读、被通知聚合读、被攻击故事线（§32）读 —— 事后逐处脱敏等于赌"没有下一处"。
+3. **改法**：`deploy/wazuh/cowrie_rules.xml`（本文件以前**只存在于服务器**，现在仓库是权威副本）
+   + `scripts/srv2-install-cowrie-rules.sh`（备份 → 写 → **`analysisd -t` 门禁** → 失败自动回滚 →
+   重启 → **`wazuh-logtest` 功能自测**：真的喂一条 `login.success`，断言描述里
+   有 `口令=[口令已隐藏]`、没有"口令=<非[>"形态、且用户名/来源仍在）。
+   回滚：`sudo bash /usr/local/sbin/srv2-install-cowrie-rules.sh --rollback`
+   （备份在 `/var/backups/secagent/wazuh-rules/cowrie-rules-<时间戳>/`）。
+4. **实测（2026-10-14）**：受控登录（srv1 → Cowrie:2222）后，
+   `alerts.json` 里该条描述为
+   `蜜罐: 攻击者"登录成功" 用户=secagent_probe 口令=[口令已隐藏] 来源=47.96.106.187`；
+   `/api/public/alerts` 本机入口与公网域名各采样 20 次：**明文命中 0**，隐藏形态 80 次/轮。
+
+**如实记录的三条残留**：
+- **`$(input)`（100103 攻击者命令原文）会进描述**。若攻击者命令行里本身带 `password=xxx`
+  形态，仍可能出公开面。**刻意不动**：命令原文是蜜罐最有价值的战报，按项目口径由应用侧
+  出口脱敏兜底（`scrubDeep→scrubText`，已提交待 CI 部署）。
+- **索引里的历史明文**：全库仍有约 700 条老告警描述是明文。**不需要清索引**，因为公开面
+  取的是"最近 200 条"（`PublicAlertSource.WINDOW=200`），实测这个窗口只覆盖 **约 3 分钟**
+  （200 条里只有 2 条蜜罐登录），所以修复后几分钟内自然滚出窗口。
+  **但要知道**：一旦有人把窗口放大（或加新的读取路径），老明文会重新可见 ——
+  真要做干净得清索引，本次没做。
+- **长度/字符类没做**：Wazuh 规则层没有字符串函数，算不出长度与字符类；
+  结构化的那份由应用侧 `CredentialStructure` 提供（`/honeypot` 的 topCredentials）。
+  所以规则里只放隐藏标记，**不编造长度/字符类**。
 
 
 ## 32. 公开端点 `GET /api/public/stories` + `GET /api/public/story`（攻击故事线，2026-10-14 落地）
@@ -3848,3 +3964,197 @@ curl -s "https://demo.xiaokeqing.cn/api/public/story?src=<候选里的一个>&wi
     story
 （本站代码只负责把端点做好；白名单在博客侧，由站主统一处理。）
 ```
+
+---
+
+【⚠️ 编号说明（2026-10-14 并入权威 RUNBOOK 时补）】服务器侧 `/opt/secagent/RUNBOOK.md` 里
+本节编为 **§29**；并入权威仓库时，权威 RUNBOOK 的 §29 已被「公开聚合端点
+`GET /api/public/webstats`」占用，且权威 RUNBOOK 已推进到 §32。为了**不覆盖更晚的章节、
+也不制造重复编号**，本节落在 **§33**；节内小标题与自引用已同步为 33.x。
+（同类先例见 §32 的编号说明：§31 被「Dionaea 上线」先占用，故攻击故事线落在 §32。）
+
+## 33. Indexer 凭据最小权限化与轮换（2026-10-14 落地）
+
+> 事件记录见 `docs/安全事件-20261014-indexer口令回显与轮换.md`；
+> 日志/公开面的同类问题见 `docs/安全建议-应用日志凭据脱敏评估.md`。
+> **本节只写"位置 / 步骤 / 验证 / 回滚"，不写任何口令值。**
+
+### 33.1 口令位置（唯一来源，别在别处抄）
+
+| 用途 | 主机 | 位置 | 身份 |
+|---|---|---|---|
+| 应用读告警 | srv1 | `/opt/secagent/.env` 的 `WAZUH_INDEXER_USER` / `WAZUH_INDEXER_PASS` | **`secagent_ro`（只读）** |
+| 应用读告警 | srv1 | 同值由 compose `env_file: .env` 注入容器 | 同上 |
+| 告警**写入** | srv2 | `wazuh.manager:/etc/filebeat/filebeat.yml` 的 `output.elasticsearch.username/password` | `admin` |
+| 账号定义（哈希） | srv2 | 宿主机 `/opt/wazuh/config/wazuh_indexer/internal_users.yml`（**bind-mount**） | — |
+| 角色定义 | srv2 | security 索引（`.opendistro_security`）；DR 副本 `/opt/wazuh/config/wazuh_indexer/role-secagent_alerts_ro.json` | — |
+
+**三条硬事实（踩过才写下来的）**：
+
+1. **`internal_users.yml` 是 bind-mount，改它会持久；`roles.yml` / `roles_mapping.yml` **不是**。**
+   后者改容器内文件**重启即丢**，必须用 security REST API（写进 security 索引）才是持久的。
+2. **container 内的 `hash` 字段永远读回空串**（连 `admin` 也是）——**这是设计如此，不是没写进去**。
+   别拿"hash 为空"当失败判据；**唯一判据是能不能用该口令登录**。
+3. **`securityadmin.sh` 必须显式给 `JAVA_HOME`**，否则报 `which: command not found`：
+
+   ```bash
+   sudo docker exec wazuh.indexer bash -c 'JAVA_HOME=/usr/share/wazuh-indexer/jdk \
+     bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh ...'
+   ```
+
+### 33.2 最小权限账号 `secagent_ro`（已落地）
+
+| 项 | 值 |
+|---|---|
+| 用户 | `secagent_ro` |
+| 角色 | `secagent_alerts_ro` |
+| cluster | `cluster:monitor/health`、`cluster:monitor/main` |
+| index | `wazuh-alerts-*` 的 `read` + `indices:data/read/search` + `indices:data/read/scroll` |
+| **没有** | 写/建/删索引、`_cat/indices`、cluster 管理、security API、其它索引 |
+
+**为什么可以只给这些**：应用只有一个读路径（`WazuhClient.java:426/464/533/559`、
+`WazuhService.java:379`，全部 `wazuh-alerts-*/_search`），代码注释也写明"刻意只给 `_search`，不留写口子"。
+
+**新建/重建该账号（官方方式，口令不进 argv）**：
+
+```bash
+# ① 生成口令（只在服务器本地；立即断言非空）
+NEWPW=$(openssl rand -base64 24); [ -n "$NEWPW" ] || { echo "secret empty, abort"; exit 2; }
+
+# ② 生成 bcrypt 哈希 —— 用官方 hash.sh 的 -env 模式，口令不进 argv/ps
+HASH=$(sudo docker exec -e DSH_IN="$NEWPW" wazuh.indexer bash -c \
+  'JAVA_HOME=/usr/share/wazuh-indexer/jdk bash \
+   /usr/share/wazuh-indexer/plugins/opensearch-security/tools/hash.sh -env DSH_IN 2>/dev/null')
+case "$HASH" in \$2y\$12\$*) : ;; *) echo "bad hash, abort"; exit 2 ;; esac
+
+# ③ 顺手写进 bind-mount 文件，保证容器重启后账号还在（**必须写真实哈希**，别写占位符）
+#    用 python 按行处理；**禁止** awk/sed 用变量当模式（历史事故根因）
+sudo HASH="$HASH" python3 - <<'PY'
+import os
+p = "/opt/wazuh/config/wazuh_indexer/internal_users.yml"
+h = os.environ["HASH"]
+t = open(p).read()
+if "secagent_ro:" not in t:
+    open(p, "a").write(
+        "\nsecagent_ro:\n"
+        f'  hash: "{h}"\n'
+        "  reserved: false\n  backend_roles:\n    - \"secagent_ro\"\n"
+        '  description: "SecAgent app read-only: wazuh-alerts-* only"\n')
+PY
+
+# ④ 应用（官方工具；YAML 结构不要手改）
+sudo docker exec wazuh.indexer bash -c 'JAVA_HOME=/usr/share/wazuh-indexer/jdk \
+  bash /usr/share/wazuh-indexer/plugins/opensearch-security/tools/securityadmin.sh \
+  -f /usr/share/wazuh-indexer/opensearch-security/internal_users.yml -t internalusers -icl -nhnv \
+  -cacert /usr/share/wazuh-indexer/certs/root-ca.pem \
+  -cert /usr/share/wazuh-indexer/certs/admin.pem \
+  -key /usr/share/wazuh-indexer/certs/admin-key.pem -h 127.0.0.1'
+```
+
+> **REST API 建 user 的坑（实测）**：字段名**不是** `password` 也**不是** `password_hash`，
+> 用 `hash` 且 PATCH 必须是**数组体**：
+> `PATCH /_plugins/_security/api/internalusers/<u>` body `[{"op":"replace","path":"/hash","value":"$2y$12$…"}]`。
+> 普通对象体 `{"hash":…}` 会返回 `400 Wrong request body`；`{"password":…}` 会**静默忽略**（200 但不生效）。
+> **宁可走 ④ 的 `securityadmin.sh`，它就是官方路径。**
+
+### 33.3 轮换步骤（**必须按顺序，且先读风险**）
+
+⚠️ **动 admin = 会打断 SIEM 告警写入**：`filebeat` 用**同一个 admin** 往 indexer 写告警。
+改 indexer 侧而不改 `filebeat` ⇒ 写入立刻 401。**需要维护窗口，先跟站主确认。**
+
+只轮换**应用**凭据（不影响 SIEM，推荐日常这样做）：
+
+```bash
+# 1) 备份
+sudo cp -a /opt/secagent/.env /opt/secagent/.env.bak-$(date -u +%Y%m%dT%H%M%SZ)
+# 2) 改 .env 的 WAZUH_INDEXER_USER / WAZUH_INDEXER_PASS
+#    ★ 值只能含 [A-Za-z0-9+/=]；含 { } $ 空格 ' " \ 会让 env_file 解析失败并拖垮整个部署
+#      （本项目真实事故：.env 里放 JSON 模板含 { 导致 compose 读取失败）
+# 3) 改完先证明 compose 还能读
+cd /opt/secagent && sudo docker compose -f docker-compose.yml config >/dev/null && echo "compose OK"
+# 4) 走发布链重建（**不许手工 docker compose up**）；变更窗口先停 timer 避免并发部署
+sudo systemctl stop secagent-redeploy.timer
+sudo bash /opt/secagent/scripts/srv1-redeploy.sh --force    # digest 未变时必须 --force 才会重建
+sudo systemctl start secagent-redeploy.timer
+```
+
+> **为什么必须 `--force`**：`srv1-redeploy.sh` 只比对 image digest，digest 没变就"安静退出"。
+> 改 `.env` 不改镜像，所以不加 `--force` 容器不会重建、新值不生效（且**不报错**）。
+
+轮换 **admin** 时额外要做（需维护窗口）：
+
+```bash
+# ① 同上备份 + hash.sh 生成 admin 新哈希 + securityadmin.sh 应用
+# ② 同步 filebeat.yml 的口令，然后**只重启 filebeat**（analysisd/logcollector 不动）：
+sudo docker exec wazuh.manager sh -c 's6-svc -r /var/run/s6/services/filebeat 2>/dev/null || \
+  pkill -HUP filebeat || true'
+# ③ 立刻验证写入恢复实时（见 29.4 第 4 条）
+```
+
+### 33.4 验证（缺一不可）
+
+```bash
+# 1) 应用四个端点 + 数据源必须是 REAL
+for u in /api/health /api/public/webstats /api/public/geo /api/public/alerts; do
+  printf '%-26s -> ' "$u"; curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:9900$u"
+done
+curl -s http://127.0.0.1:9900/api/public/alerts | grep -o '"wazuhMode":"[A-Z]*"'   # 期望 REAL
+
+# 2) 应用日志无鉴权失败（注意：历史日志里 "401/403" 多为时间戳噪声，要排除）
+sudo grep -acE 'Unauthorized|Forbidden' /var/log/secagent/app.log      # 期望 0
+
+# 3) 负向：新账号**必须**写不进去、读不到别的索引（在 srv2 上测，9200 只在 srv2 监听）
+#    ★ 用 --config 而不是 -u，避免口令进 argv（会落进 /var/log/secure 审计！）
+CF=$(mktemp); chmod 600 "$CF"; printf 'user = "secagent_ro:%s"\n' "$(sudo cat /root/.secagent_ro.pw)" > "$CF"
+curl -sk --config "$CF" -o /dev/null -w '写文档 -> %{http_code}\n' \
+  -X POST https://127.0.0.1:9200/wazuh-alerts-2026.10.14/_doc -H 'Content-Type: application/json' -d '{"x":1}'
+curl -sk --config "$CF" -o /dev/null -w '读别的索引 -> %{http_code}\n' \
+  https://127.0.0.1:9200/wazuh-monitoring-*/_search?size=1
+curl -sk --config "$CF" -o /dev/null -w '读告警(应 200) -> %{http_code}\n' \
+  https://127.0.0.1:9200/wazuh-alerts-*/_search?size=1
+rm -f "$CF"
+
+# 4) SIEM 未受影响：写入必须实时
+#    期望"最新告警时间与 now 之差 < 60s"；同时未分配分片数不增加
+#    （单节点 yellow 是预期的：ISM 历史索引副本无处分配，不是故障）
+```
+
+> **`_bulk` 的判据陷阱**：`_bulk` 即使被拒也返回 **HTTP 200**，
+> 真正的结论在逐项 body 的 `items[].status`（本次实测为 **403** `security_exception`）。
+> 只看 HTTP 码会把"被拒"读成"成功"。
+
+### 33.5 回滚
+
+```bash
+# 应用侧一条命令（回到改前的 .env，再走发布链）
+sudo cp -a /opt/secagent/.env.bak-<时间戳> /opt/secagent/.env \
+  && sudo bash /opt/secagent/scripts/srv1-redeploy.sh --force
+
+# indexer 侧撤销新增的 role/user（幂等；口令用 --config 传入，别用 -u）
+ADM=$(sudo docker exec wazuh.manager sh -c 'grep -E "^[[:space:]]*password:" /etc/filebeat/filebeat.yml | head -1 | sed -E "s/^[[:space:]]*password:[[:space:]]*//; s/^.(.*).$/\1/"')
+for p in rolesmapping/secagent_alerts_ro roles/secagent_alerts_ro internalusers/secagent_ro; do
+  sudo curl -sk -u "admin:$ADM" -X DELETE "https://127.0.0.1:9200/_plugins/_security/api/$p"; echo
+done
+```
+
+备份与 DR 副本清单（本次落地物）：
+
+| 对象 | 路径 |
+|---|---|
+| srv1 `.env` | `/opt/secagent/.env.bak-<时间戳>` |
+| srv2 `internal_users.yml` | `/opt/wazuh/config/wazuh_indexer/internal_users.yml.bak-<时间戳>` |
+| srv2 `roles.yml` / `roles_mapping.yml`（容器快照） | `/opt/wazuh/config/wazuh_indexer/{roles,roles_mapping}.yml.bak-<时间戳>` |
+| srv2 security 索引 REST 快照 | `/opt/wazuh/config/wazuh_indexer/{roles,internalusers,rolesmapping}.restapi-bak-<时间戳>.json` |
+| 角色 DR 副本 | `/opt/wazuh/config/wazuh_indexer/role-secagent_alerts_ro.json` |
+
+### 33.6 已知缺口（如实）
+
+1. **`roles.yml` / `roles_mapping.yml` 未挂载**：若将来有人对这两个文件执行
+   `securityadmin.sh -f`（例如镜像升级后按官方文档重放），`secagent_alerts_ro` **可能被覆盖丢失**。
+   重放前先确认 security 索引里该角色仍在。建议把 §33.2 的定义纳入配置版本化（见 §6.6 同类机制）。
+2. **旧口令副本无法通过轮换消除**：轮换只能让旧口令**在 indexer 上失效**，
+   无法收回已经落进日志/终端历史/会话记录的副本。
+3. **`/root/.secagent_ro.pw`（srv2）** 是轮换用的临时副本；不需要时可
+   `sudo shred -u /root/.secagent_ro.pw`（应用不依赖它）。删除后只能从 srv1 `.env` 取回。
+4. **明文口令一旦进 argv 就会落盘**：`sudo` 会把整条命令（含参数）写进 `/var/log/secure`。
+   查询/测试一律用 `--config`、`-env`、环境变量或 stdin，**绝不用 `-u user:pass` 或 `grep <口令>`**。

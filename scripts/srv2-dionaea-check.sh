@@ -101,10 +101,23 @@ log "3. 端口监听与对外可达"
 for p in $PORTS; do
   if docker port dionaea 2>/dev/null | grep -q ":$p$"; then ok "宿主 tcp/$p 已映射"; else bad "宿主 tcp/$p 未映射"; fi
 done
-echo "    --- 从宿主连一次（走 docker-proxy）---"
-for p in $PORTS; do
-  if timeout 4 bash -c "exec 3<>/dev/tcp/127.0.0.1/$p" 2>/dev/null; then ok "127.0.0.1:$p 可连"; else warn "127.0.0.1:$p 连不上"; fi
-done
+# 【为什么不用"能连上 TCP"来判断】2026-10-14 实测：dionaea 会卡死 ——
+#   MySQL 服务不再处理新连接，但 TCP 握手照样成功（内核 accept 队列回 SYN-ACK），
+#   `exec 3<>/dev/tcp/127.0.0.1/3306` 会【成功】、docker ps 也显示 Up，
+#   而它已经不再记任何事件。所以这里按协议要应答（3306 要 MySQL 握手包 /
+#   1433 要 TDS prelogin 响应 / 445 要 SMB1 negotiate 响应），
+#   宁可慢一点，也不能给出假的"正常"。
+if [ -x /usr/local/sbin/srv2-dionaea-healthcheck.sh ]; then
+  if HOUT=$(bash /usr/local/sbin/srv2-dionaea-healthcheck.sh 2>&1); then
+    echo "$HOUT" | sed 's/^/    /'
+    ok "协议级健康：3306/1433/445 都有正确应答"
+  else
+    echo "$HOUT" | sed 's/^/    /'
+    bad "协议级健康检查未通过（端口可能连得上但服务已不响应）"
+  fi
+else
+  warn "缺 /usr/local/sbin/srv2-dionaea-healthcheck.sh，跳过协议级检查"
+fi
 
 log "4. 日志与磁盘"
 for f in dionaea.log dionaea.json dionaea-errors.log; do
