@@ -128,3 +128,112 @@ jobs:
           path: /tmp/eval-app.log
           retention-days: 7
           if-no-files-found: ignore
+
+  # ==========================================================
+  # 4. 依赖/代码漏洞扫描（Trivy fs）
+  # ----------------------------------------------------------
+  # 为什么不和 gitleaks 合并：
+  #   两件事完全不同。gitleaks 找的是「凭据/密钥泄漏」（本项目 §18 里
+  #   那处 registry 凭据残余风险属于这一类）；Trivy 找的是
+  #   「某个依赖停在了有已知漏洞的版本上」—— 靠人 review pom.xml 是
+  #   查不出来的（传递依赖一大半不在文件里出现）。
+  #
+  # 阻断口径（写清楚，不留模糊地带）：
+  #   · severity = HIGH / CRITICAL  →  命中即 exit-code 1 → job 失败
+  #   · MEDIUM / LOW               →  不阻断（只在日志里出现）
+  #   · 不开 Trivy 的 secret 扫描器 —— gitleaks 已覆盖，重复扫只是白花 CI 时间
+  #
+  # 为什么先跑一次 mvn package（而不是直接扫）：
+  #   Trivy 解析 Java 依赖需要能算出依赖树 / 拿到构建产物。
+  #   算不出来时它的表现是「Java 依赖一条都不报」—— 而那在报告里
+  #   和「Java 依赖没问题」长得一模一样。本项目最忌讳这种静默降级
+  #   （见铁律②），所以这里先显式把依赖与 jar 准备出来再扫。
+  #
+  # 速度取舍：
+  #   这个 job 不串在 secret-scan → unit-tests → red-team-regression 链上，
+  #   与它们并行，所以不会拉长既有链路的墙钟时间；Trivy 漏洞库用
+  #   actions/cache 缓存（命中缓存时扫描本身只有几秒）。代价是
+  #   runner 总用量 +1 个 job（含一次 mvn package）。
+  #
+  # 为什么不用 aquasecurity/trivy-action：
+  #   ① 本仓库的规矩是"结论要有运行态证据"——这个 job 用的版本
+  #      （0.75.0）已经在本机真跑过一次（见交付说明里的输出摘要），
+  #      而不是我猜的一个 action tag；
+  #   ② 官方 tar.gz 的 sha256 直接钉在下面，CI 装到的东西可复现；
+  #   ③ 少一个第三方 Action 的供应链面。
+  # ==========================================================
+  trivy-fs:
+    name: 漏洞扫描（Trivy fs）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17（顺带用 maven 缓存把依赖拉起来）
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      # 产出 target/*.jar：既喂饱 Java 依赖解析，又让 Trivy 能直接扫 jar 内部依赖
+      - name: 构建（跳过测试：测试已由 unit-tests job 负责）
+        run: mvn -B -DskipTests package
+
+      - name: 缓存 Trivy 漏洞库
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          # run_id 做 key，restore-keys 复用上一份库：漏洞库每天更新，
+          # 差几个小时不影响"阻断与否"的判断，但能省掉一次全量下载
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: |
+            trivy-db-
+
+      - name: 安装 Trivy 0.75.0（校验 sha256）
+        run: |
+          set -euo pipefail
+          TRIVY_VERSION=0.75.0
+          # 本机下载 Linux-64bit 包后算出的 sha256（与下面 URL 一一对应）
+          TRIVY_SHA256=c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+          curl -sSfL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+
+      - name: 扫描（HIGH/CRITICAL 阻断）
+        run: |
+          set -euo pipefail
+          # --exit-code 1：有 HIGH/CRITICAL 就让这一步失败（也就让整个 job 失败）
+          trivy fs \
+            --scanners vuln \
+            --severity "HIGH,CRITICAL" \
+            --exit-code 1 \
+            --no-progress \
+            --format table \
+            .
+
+      # 不管拦没拦住都留一份机器可读的结果，方便回溯"当时到底报了哪些"
+      - name: 上传扫描结果（JSON）
+        if: always()
+        run: |
+          set -euo pipefail
+          trivy fs \
+            --scanners vuln \
+            --severity "HIGH,CRITICAL" \
+            --no-progress \
+            --format json \
+            --output trivy-fs.json \
+            . || true
+
+      - name: 上传 JSON 结果
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-report
+          path: trivy-fs.json
+          retention-days: 14
+          if-no-files-found: ignore

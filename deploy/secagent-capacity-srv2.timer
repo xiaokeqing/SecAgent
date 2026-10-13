@@ -1,0 +1,17 @@
+# ============================================================
+# 容量/水位告警定时器（装在 srv2）
+# ------------------------------------------------------------
+# 每 15 分钟跑一次（理由同 srv1：防刷屏靠 notify.sh 的 6 小时冷却键，不靠拉长周期）。
+# 这台同时负责 OpenSearch 的索引水位与 ISM 保留期核对。
+# ============================================================
+[Unit]
+Description=每 15 分钟运行容量与水位体检（srv2）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Unit=secagent-capacity-srv2.service
+
+[Install]
+WantedBy=timers.target

@@ -194,6 +194,65 @@ jobs:
           docker image inspect "$IMAGE_NAME:${SHORT_SHA}" \
             --format '镜像标签: {{json .Config.Labels}}'
 
+      # ---------------- 6.5 镜像漏洞扫描（Trivy，推之前跑） ----------------
+      # 为什么放在这个 workflow 而不是 ci.yml 里另起一个 job：
+      #   镜像在这一步已经构建好了。在 ci.yml 里再建一遍同一个镜像，
+      #   等于为了扫描多花一次 mvn package + docker build（runner 时间是
+      #   真实成本），而且扫的还不是"这次要发布的那个镜像"。
+      #   放在 push 之前还有个更重要的性质 —— fail-closed：
+      #   有 HIGH/CRITICAL 就连 ACR 都不登录，线上不可能拿到这个镜像。
+      #
+      # 为什么不能只靠 ci.yml 的 fs 扫描：
+      #   ① 基础镜像（eclipse-temurin:17-jre-jammy）的 OS 包漏洞只有
+      #      镜像扫描才看得到，fs 扫描看不到；
+      #   ② jar 里的传递依赖在镜像里是"实物"，比解析 pom.xml 更接近真相。
+      #
+      # 阻断口径：与 ci.yml 的 fs 扫描一致 —— HIGH/CRITICAL 命中即失败。
+      #   不额外放宽（不加 --ignore-unfixed、不加 .trivyignore）：
+      #   本项目铁律是"不许静默放过"，要放宽必须由站主显式决定并写进 RUNBOOK。
+      #
+      # 版本与校验和与 ci.yml 里的 fs 扫描一致（同一版本，已在本机实跑）。
+      - name: 镜像漏洞扫描（Trivy，HIGH/CRITICAL 阻断）
+        run: |
+          set -euo pipefail
+          TRIVY_VERSION=0.75.0
+          TRIVY_SHA256=c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
+          curl -sSfL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  /tmp/trivy.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+          trivy image \
+            --scanners vuln \
+            --severity "HIGH,CRITICAL" \
+            --exit-code 1 \
+            --no-progress \
+            --format table \
+            "$IMAGE_NAME:${SHORT_SHA}"
+
+      # 不管拦没拦住都留一份机器可读结果，方便回溯"当时到底报了哪些"
+      - name: 导出镜像扫描结果（JSON）
+        if: always()
+        run: |
+          set -euo pipefail
+          trivy image \
+            --scanners vuln \
+            --severity "HIGH,CRITICAL" \
+            --no-progress \
+            --format json \
+            --output trivy-image.json \
+            "$IMAGE_NAME:${SHORT_SHA}" || true
+
+      - name: 上传镜像扫描 JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image.json
+          retention-days: 14
+          if-no-files-found: ignore
+
       # ---------------- 7. 登录 ACR ----------------
       - name: 登录阿里云 ACR
         run: |

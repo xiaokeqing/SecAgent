@@ -1,0 +1,39 @@
+# ============================================================
+# SecAgent 状态异地备份（systemd service，srv1）
+# ------------------------------------------------------------
+# 触发者：deploy/srv1-data-backup.timer（每天 03:30）
+#         也可以随时手动触发（写入型变更之后应该手动跑一次）：
+#           systemctl start secagent-data-backup.service
+#           journalctl -u secagent-data-backup.service -n 60 --no-pager
+# 做什么：跑 scripts/srv1-data-backup.sh ——
+#   /opt/secagent/data 一致性快照 → tar.gz + sha256 → 经 SSH 强制命令通道
+#   推到 srv2:/opt/secagent-backup/<时间戳>/ → srv2 立即做恢复抽测
+#
+# 为什么必须有 backup 权限的 /root 与出网能力（两条都不能省）：
+#   · 需要读 /root/.ssh/backup_srv2_ed25519 —— 所以【不能】设 ProtectHome=yes。
+#     设了会变成"找不到密钥"，而且脚本会失败退出（不是静默成功），
+#     但定时任务半夜失败没人看，所以这里刻意不设。同类坑见 healthwatch 的
+#     DOCKER_CONFIG 说明。
+#   · 需要出网到 srv2:22 —— 所以不能把网络关掉。
+# 其余能收紧的都收紧了：ProtectSystem=full、PrivateTmp、NoNewPrivileges。
+# ============================================================
+[Unit]
+Description=SecAgent 状态异地备份（/opt/secagent/data → srv2 + 恢复抽测）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-data-backup.sh
+# 5MB 的 tar + 一次 SSH + srv2 侧抽测；给足余量，正常几秒
+TimeoutStartSec=300
+Nice=10
+MemoryMax=300M
+CPUQuota=50%
+# SSH 需要知道 known_hosts 在哪；服务环境下 HOME 不一定被设置
+Environment=HOME=/root
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes

@@ -278,6 +278,12 @@ log "3/9 与当前运行 digest 比对"
 NEED_DEPLOY=1
 if [ -z "$RUNNING_IMAGE_ID" ]; then
   warn "容器 $SERVICE 不存在 —— 需要部署"
+elif [ "$(docker inspect -f '{{.State.Running}}' "$SERVICE" 2>/dev/null || echo false)" != "true" ]; then
+  # 【2026-10-13 生产事故·必须保留这段】容器"存在但没在运行"（Created / Exited / Restarting）时，
+  # 原逻辑只比对 digest 是否相同 → 认定"无需变更"安静退出。于是发布链对这个状态**永远不自愈**：
+  # 11:52 那次 compose 重建失败把容器留在 Created，之后每 5 分钟的 timer 都判定"无需变更"，
+  # 站点一直 502，直到人工介入。这里加一道"必须真的在运行"的判定。
+  warn "容器 $SERVICE 存在但未在运行（State.Running != true）—— 必须重建"
 elif [ -n "$RUNNING_DIGEST" ] && [ "$RUNNING_DIGEST" = "$PTR_DIGEST" ]; then
   NEED_DEPLOY=0
   ok "当前运行 digest 与发布指针相同 —— 无需变更，安静退出"

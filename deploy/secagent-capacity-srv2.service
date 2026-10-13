@@ -1,0 +1,43 @@
+# ============================================================
+# 容量/水位告警（systemd service，装在 srv2）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-capacity-srv2.timer（每 15 分钟）
+# 做什么：跑 scripts/capacity-watch.sh ——
+#         · srv2 宿主磁盘（蜜罐 + Suricata 日志涨得快，这台更容易先满）
+#         · OpenSearch 水位：srv2 上跑着 wazuh.indexer（OpenSearch），
+#           所以【真正的索引水位检查在这台】：
+#           _cluster/health、cluster.routing.allocation.disk.watermark.*、
+#           _cat/allocation 的 disk.percent、ISM 保留期是否真的在删旧索引
+#         全部经 notify.sh 发出，同键 6 小时内只发一次。
+#
+# 为什么 ProtectHome=read-only 而不是 yes：
+#   索引器口令在 /root/.wazuh-new-creds.txt（0600）。read-only 允许读、
+#   不允许写 —— 既拿到口令，又不给这个服务改动 root 家目录的能力。
+#
+# 安装（root，srv2）：
+#   install -m 644 deploy/secagent-capacity-srv2.service deploy/secagent-capacity-srv2.timer /etc/systemd/system/
+#   install -m 755 scripts/capacity-watch.sh scripts/notify.sh /opt/secagent/scripts/
+#   systemctl daemon-reload && systemctl enable --now secagent-capacity-srv2.timer
+# 手工看数值（不发通知）：
+#   bash /opt/secagent/scripts/capacity-watch.sh --no-notify
+# ============================================================
+[Unit]
+Description=SecAgent 容量与水位告警（srv2：宿主磁盘 / OpenSearch 水位 / ISM 保留期）
+Documentation=file:/opt/secagent/RUNBOOK.md
+# 【刻意不写 Requires=docker.service】理由同 srv1：磁盘体检不该因为 docker 不在就停摆。
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/capacity-watch.sh
+SuccessExitStatus=0 1
+TimeoutStartSec=180
+Nice=10
+MemoryMax=200M
+CPUQuota=20%
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes

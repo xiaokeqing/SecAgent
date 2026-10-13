@@ -1006,3 +1006,447 @@ tag+push，否则 push 一个本地不存在的 tag 会因"tag 不存在"失败 
   · 出站告警通道本身只做 HTTP POST 到运维自选的地址，应用侧不做内容加密/签名：
     webhook 的保密责任在 URL（很多 IM 把 token 写在 URL 里）与网络路径（https）上。
 ```
+---
+
+## 20. 外部心跳与容量告警（2026-10-13 落地，补 P0 缺口）
+
+```
+【为什么需要它（P0 缺口的准确含义）】
+srv1 此前已有一套自检：secagent-redeploy.timer（发布巡检）+ secagent-healthwatch.timer（健康→回滚），
+外加应用内通知中枢（§19）。但三者【都跑在 srv1 上】——
+srv1 整机断电 / 云主机故障 / 内核 panic 时，它们一起死，"整机死了"这句话没有任何人能说出来。
+报警者必须活在另一台机器上 → 这里用 srv2，不引第三方服务。
+磁盘同理：磁盘写满是少数【必然发生且完全可预防】的故障（OpenSearch 写满会变只读、Wazuh 丢告警），
+而在这之前一定有几天的高水位窗口 —— 此前没有任何东西在这个窗口里说过话。
+```
+
+### 20.1 组件与落点
+
+```
+scripts/notify.sh                      → srv1 + srv2 : /opt/secagent/scripts/
+                                        服务器侧通知出口（纯 bash + curl，不依赖应用）
+scripts/srv1-heartbeat.sh              → srv1         : /opt/secagent/scripts/
+                                        被 srv2 SSH 过来时执行的【强制命令】，只读，输出一行 JSON 心跳
+scripts/srv2-watch-srv1.sh             → srv2         : /opt/secagent/scripts/
+                                        dead man switch：探 srv1 三个面，连续 3 次失败就告警
+scripts/capacity-watch.sh              → srv1 + srv2  : /opt/secagent/scripts/
+                                        宿主磁盘 + OpenSearch 水位 + ISM 保留期是否真的在删
+scripts/srv2-gen-heartbeat-key.sh      → srv2（一次性）生成探活专用密钥
+scripts/srv1-authorize-heartbeat-key.sh→ srv1（一次性）授权公钥（带 restrict + command=，含备份/校验/回滚）
+deploy/secagent-srv1deadman.{service,timer}     → srv2 : 每 3 分钟跑 watch
+deploy/secagent-capacity-srv{1,2}.{service,timer}→ 各自机 : 每 15 分钟跑体检
+
+安装（unit 文件里的注释有同款命令；改配置一律备份→改→校验→失败回滚）：
+  srv1: install -m 755 scripts/notify.sh scripts/srv1-heartbeat.sh scripts/capacity-watch.sh /opt/secagent/scripts/
+        install -m 644 deploy/secagent-capacity-srv1.{service,timer} /etc/systemd/system/
+        systemctl daemon-reload && systemctl enable --now secagent-capacity-srv1.timer
+  srv2: install -m 755 scripts/notify.sh scripts/capacity-watch.sh scripts/srv2-watch-srv1.sh /opt/secagent/scripts/
+        install -m 644 deploy/secagent-capacity-srv2.{service,timer} deploy/secagent-srv1deadman.{service,timer} /etc/systemd/system/
+        systemctl daemon-reload && systemctl enable --now secagent-capacity-srv2.timer secagent-srv1deadman.timer
+```
+
+### 20.2 三个探测面与判定（srv2 反向盯 srv1）
+
+```
+① 应用健康：GET https://demo.xiaokeqing.cn/api/health（公网路径，等价于"外部可达性"）
+             要求 HTTP 2xx 且 status=ok；顺带把 commit 记进通知正文
+② SSH 连通：ssh -i /etc/secagent/heartbeat/srv1_ed25519 root@47.96.106.187:22
+             私钥在 srv1 侧被 restrict,command=... 钉死为"只能读一份心跳"
+③ 关键单元：从 ② 拿回的心跳 JSON 里核对
+             secagent-redeploy.timer / secagent-healthwatch.timer 是否 active
+
+判定：任一面失败 = 本轮失败；连续 3 次（timer 每 3 分钟一轮）≈ 9 分钟 → 发 HIGH。
+      标题按失败面区分，【不把"单元挂了"说成"整机不可用"】：
+        health+ssh 同时失败 → 「srv1 疑似整机不可用」
+        只有 ssh 失败       → 「srv1 SSH 不可达」
+        只有 health 失败    → 「srv1 应用健康异常（公网不可达）」
+        只有 units 失败     → 「srv1 关键 systemd 单元异常」
+恢复：三面皆通时发 INFO「srv1 已恢复」，正文带"不可用/降级时长"（从 down_since 算）。
+
+状态与去重：/opt/secagent/heartbeat-state.json（state/consecutive_failures/down_since/last_alert/
+failed_faces/三个面的原始 detail + 心跳原文）。一次故障只报一次；仍不恢复则每 6 小时（REALERT_SECONDS）提醒一次。
+写状态用自建 JSON 转义：ssh 的 stderr 带 CR，原样写进字符串会产生【非法 JSON】（实测踩到，已修）。
+
+【反误报的一条实测规则】部署期间 secagent-redeploy.timer 会被重启，is-active 的瞬间读到 inactive，
+而它的 companion service 正在跑。这种"系统在正常工作"的瞬间若按"单元挂了"处理，每次发布都会误报整机故障。
+所以：timer 非 active 时再看同名 .service；若为 active/activating/deactivating 则算 OK，
+并在 detail 里写明"（部署进行中：…，timer 暂时停止，不算故障）"—— 降级可见，不隐藏。
+（2026-10-13 实测到 journal 里该 timer 成对出现 Stopped/Started，因此这条不是假想。）
+```
+
+### 20.3 notify.sh 的退出码（"没发出去"必须能被区分）
+
+```
+用法：notify.sh <级别> <标题> <正文> [--key K] [--cooldown N] [--force] [--dry-run] [--config F]
+  0 = 已发送            2 = 用法/模板错误（未知变量、渲染后非法 JSON → fail-closed，拒绝发送）
+  3 = 未配置 NOTIFY_WEBHOOK_URL（写日志后退出，绝不假装成功）
+  4 = 冷却中跳过（同键冷却期内不重复）        5 = 发送失败（curl 非 2xx/超时/连不上）
+  6 = 低于最低通知级别，或被夜间静默压到阈值以下
+读配置：NOTIFY_ENV_FILE → /opt/secagent/.env → /etc/secagent/notify.env → /opt/secagent/notify.env
+  【解析，不 source】—— source 一个 .env 等于执行它（值里的 $(...) 会被跑），改配置不该变成执行命令。
+  环境变量优先于文件（实测踩坑：默认值冒充"用户设置"把文件值挡住，导致该压制的 INFO 真发出去了，已修）。
+载荷：默认模板 {"text":"{{title}}\n{{body}}"}，与 §19 应用侧同一份模板语义（一份配置可同时喂两边）。
+  可用变量 title body severity severityLabel type typeLabel ip actor time count host source key level levelLabel；
+  未知变量直接报错退出 2（不替换成空串）。
+```
+
+### 20.4 冷却与静默（怎么不吵、怎么彻底闭嘴）
+
+```
+冷却：notify.sh 按"键"冷却，默认 600s。键由调用方给：
+  · dead man switch：srv1-down-<标题>-since-<故障起点> / srv1-recovered-since-<故障起点>
+    —— 键里带"本次故障起点"是必要的：否则 10 分钟内的第二次故障会被上一次的冷却吞掉（复验实测到）。
+    同一次故障内不重复告警由脚本的 last_alert_epoch 负责，不依赖 notify.sh 的冷却。
+  · 容量：disk-<host>-<设备> / os-flood-<host> / os-high-<host> / os-ism-stale-<host>，冷却 21600s（6h）
+夜间静默：NOTIFY_NIGHT_QUIET=22:00-07:00，NOTIFY_NIGHT_QUIET_MODE=downgrade（默认）
+  downgrade = 只把级别压低一档并在正文标注［夜间静默：HIGH → MEDIUM］，消息仍发出；
+  high-only = 与应用侧 NotificationService 同口径（只压制 INFO/LOW/MEDIUM，HIGH/CRITICAL 照发）；
+  off = 不静默。
+最低级别：NOTIFY_SERVER_MIN_SEVERITY（默认 INFO）。【刻意不复用 NOTIFY_MIN_SEVERITY】——
+  应用侧默认 HIGH，若这里跟着 HIGH，"已恢复"(INFO) 这类消息会被静默吞掉。
+手工静默某类告警：给它所在的 timer 停掉（systemctl disable --now secagent-capacity-srv2.timer），
+  而不是清空 NOTIFY_WEBHOOK_URL —— 后者会让【所有】告警都只写日志（退出码 3）。
+```
+
+### 20.5 怎么手工触发（运维最常用的五条）
+
+```
+在 srv2 看三个面的当前结果（不改状态、不发通知）：
+  bash /opt/secagent/scripts/srv2-watch-srv1.sh --status
+不写状态、不改通知地查依赖与配置：
+  bash /opt/secagent/scripts/srv2-watch-srv1.sh --self-test
+立刻跑一轮（不等 timer）：
+  systemctl start secagent-srv1deadman.service     # 退出码 0/1/2/3，看 journalctl -u secagent-srv1deadman.service
+演练（不改文件就能制造失败；下列 env 会被脚本读取）：
+  NOTIFY_ENV_FILE=/tmp/x.env STATE_FILE=/tmp/hb-state.json \
+  SRV1_HEALTH_URL=http://127.0.0.1:9/api/health SRV1_SSH_PORT=9 FAIL_THRESHOLD=2 \
+    bash /opt/secagent/scripts/srv2-watch-srv1.sh
+  # 恢复：去掉上面两个 SRV1_* 覆盖，再跑一次即会发 INFO「已恢复」
+看数值（不发通知）：
+  bash /opt/secagent/scripts/capacity-watch.sh --no-notify      # 也可 --json
+容量演练阈值（只改脚本比较，绝不改集群设置）：
+  DISK_WARN_PCT=20 DISK_HIGH_PCT=90 bash .../capacity-watch.sh            # 压成 MEDIUM
+  WATERMARK_FLOOD_OVERRIDE=40 bash .../capacity-watch.sh                  # 压成 flood_stage
+```
+
+### 20.6 srv2 → srv1 那把钥匙的最小权限（实测）
+
+```
+authorized_keys 条目：restrict,command="/opt/secagent/scripts/srv1-heartbeat.sh" ssh-ed25519 …
+  restrict 关掉 pty/agent/X11/端口转发/~/.ssh/rc；command= 把能力钉死在"读一份只读心跳"。
+  未加 from=（来源 IP）：srv2 出口 IP 一旦变动，dead man switch 会【静默失效】—— 悄悄不报警的报警器比没有更坏。
+  要加就 HEARTBEAT_FROM_IP=43.143.114.79 重跑 srv1-authorize-heartbeat-key.sh（脚本会备份 + 读回校验 + 失败回滚）。
+实测（2026-10-13，从 srv2 发起）：
+  ssh … secagent-heartbeat → 心跳 JSON                        ✔
+  ssh … id                 → 同样只得到心跳 JSON（拿不到 uid=0）✔ 强制命令生效
+  ssh … 'cat /etc/shadow'  → 同样只得到心跳 JSON              ✔
+  ssh … -R（远端转发）      → ssh: remote port forwarding failed（rc=255）✔
+  ssh … -L 后真的往里连     → channel 1: open failed: administratively prohibited ✔
+  ssh … -t（申请 pty）      → 只得到心跳 JSON                  ✔
+私钥落点：/etc/secagent/heartbeat/srv1_ed25519（600，root），known_hosts 在 /var/lib/secagent/heartbeat/
+  —— 因为服务以 ProtectHome=yes 跑（蜜罐机 srv2 没有理由碰 /root）。
+```
+
+### 20.7 2026-10-13 实测证据（本机与两台服务器真跑）
+
+```
+【notify.sh 十项自测】对本地 sink（scripts/notify-sink.py 18099）实跑，全部符合预期：
+  未配置 URL → exit 3；正常发送 → HTTP 200；同键第二次 → exit 4；换键 → 0；
+  夜间 downgrade → 发出但级别变 MEDIUM（正文带标注）；high-only 下 INFO → exit 6；
+  MIN_SEVERITY=HIGH 下 INFO → exit 6；模板写错 {{titel}} → exit 2 且不发；
+  正文含引号/换行/反斜杠 → 载荷仍是合法 JSON；对端不可达 → exit 5；--dry-run → 不发。
+  （其中"MIN_SEVERITY=HIGH 下 INFO 却发出去了"是本次自测抓到的真 bug，已修。）
+
+【dead man switch 制造失败→告警→恢复 全过程】sink 收到的原始 POST（节选）：
+  --- srv1 疑似整机不可用（经 3 次失败触发）---
+  连续 3 次探测失败（≥阈值 3，约 9 分钟），判定：整机不可用。
+  失败面：health ssh units
+  ① 应用健康：curl 失败(rc=7)：http://127.0.0.1:9/api/health
+  ② SSH 连通：ssh rc=255 root@47.96.106.187:9 | ssh: connect to host 47.96.106.187 port 9: Connection timed out
+  ③ 关键单元：SSH 不可达，无法核对单元（顺带失败）
+  不可用起点：2026-10-13 11:47:02（已持续 0 分 20 秒）
+  --- srv1 已恢复 ---
+  srv1 三个探测面已全部恢复。不可用/降级时长：0 分 30 秒（自 2026-10-13 11:47:02）。健康详情：HTTP 200 status=ok commit=c4f3f24
+  --- srv1 关键 systemd 单元异常（③ 面单独演练，标题没有错误地说成"整机不可用"）---
+  失败面：units ｜ ③ 关键单元：关键单元非 active： secagent-nonexistent.timer=missing
+  演练说明：三个面在演练中各失败过一次；生产节奏下 3 次之间各隔 3 分钟（≈9 分钟），
+  演练里为省时间连续调用（阈值与状态机逻辑完全相同），并用 FAIL_THRESHOLD=2 复验过一次。
+  【真实故障捕获（非演练）】2026-10-13 11:54:19 公网 /api/health 真的返回 HTTP 502（另一实施方改
+  /opt/secagent/.env 触发 compose 重建失败，容器停在 Created）。本告警按设计触发，标题是
+  「srv1 应用健康异常（公网不可达）」——【没有】误报成"整机不可用"（当时 SSH 与两个单元都正常），
+  与"标题按失败面区分"的设计一致；同时它如实报告"没发出去（退出码 3）"（当时 srv2 未配 webhook）。
+
+【容量告警四条路径 + 6 小时冷却】（srv2 真实数值上压低阈值验证，sink 实收）
+  POST: 磁盘告警：VM-0-10-ubuntu 使用率 51%（MEDIUM 阈值 20%）
+  POST: 磁盘告警：VM-0-10-ubuntu 使用率 51%（HIGH 阈值 20%）
+  POST: OpenSearch 已达 flood_stage：VM-0-10-ubuntu 磁盘 52%（判断阈值 40%，集群现值 95%）
+  POST: OpenSearch 接近水位：VM-0-10-ubuntu 磁盘 52%（判断阈值 40%，集群现值 90%；flood_stage=95%）
+  再跑同一配置 → "[冷却中，未重复发送]"（21600s 内不刷屏）✔
+
+【当前真实数值（2026-10-13 11:50，capacity-watch 原始输出）】
+  srv1 宿主：/ = 31%（12.09G/40.9G，设备 /dev/vda3）；/opt/secagent = 31%【同一设备，不是独立卷】；
+             /var/lib/docker = 31%。docker system df：Images 1.88GB(可回收 1.609GB)、Build Cache 1.431GB
+  srv2 宿主：/ = 51%（19.8G/41.2G，设备 /dev/vda2）；/opt/secagent 与 /var/lib/docker 同为该设备
+  OpenSearch（在 srv2！）：status=green，active_shards=22，unassigned=0，索引 13 个
+    索引器节点 wazuh.indexer：disk.percent = 52%（disk.avail 18.6gb / disk.total 39.2gb）
+    水位现值：low=85% high=90% flood_stage=95%；cluster.routing.allocation.disk.watermark.enable_for_single_data_node=false
+    Top5 占用：wazuh-alerts-4.x-2026.10.12 137.2mb(211364 docs) ｜ wazuh-alerts-4.x-2026.10.13 25.2mb ｜
+              wazuh-alerts-4.x-2026.10.11 24.6mb ｜ wazuh-statistics-2026.42w 1.1mb ｜
+              wazuh-states-vulnerabilities-wazuh.manager 1020.6kb
+    ISM 策略：secagent-alerts-30d（适用 wazuh-alerts-*，保留 30d）、
+              secagent-stats-14d（适用 wazuh-statistics-*,wazuh-monitoring-*，保留 14d）
+    保留期核对结果：当前没有超过保留期的索引 —— 保留策略与现状一致
+    【必须知道的一条】enable_for_single_data_node=false 意味着这个单数据节点集群上磁盘水位【不生效】：
+    磁盘写满时 OpenSearch 不会自动置只读/停分配，唯一的防线就是本告警。
+```
+
+### 20.8 未做 / 疑虑（如实记录，别当成已经做完）
+
+```
+1) 【最关键】srv2 上 NOTIFY_WEBHOOK_URL 尚未配置：此时 srv1 整机断电，srv2 确实会探测到并"试图报警"，
+   但 notify.sh 会返回退出码 3、只把消息写进 /opt/secagent/logs/notify.log（在失联的 srv1 之外，日志是安全的），
+   【手机上不会响】。所以"整机死了有人知道"这句话，在配置 webhook 之前只完成了一半。
+   落地条件：在 srv2（以及 srv1）的 /opt/secagent/.env 或 /etc/secagent/notify.env 里配好
+   NOTIFY_WEBHOOK_URL（0600，root），然后手工跑一次：
+     bash /opt/secagent/scripts/notify.sh HIGH "通知链路自检" "看到这条说明出口通了" --force   # 期望 exit 0
+2) 【与任务假设不符】OpenSearch 不在 srv1，而在 srv2 的 wazuh.indexer 容器（只监听 127.0.0.1:9200）。
+   capacity-watch.sh 两台都装：srv1 上会如实打印"本机不是索引器，跳过"，真正的索引水位检查在 srv2。
+   若希望在 srv1 侧也看索引水位，需要走 app 容器上的 wazuh-tunnel（本次没做，避免 exec 进应用容器）。
+3) /opt/secagent 不是独立卷：srv1 上它与 / 同为 /dev/vda3，srv2 上与 / 同为 /dev/vda2。
+   脚本仍单独列出（将来拆盘即自动生效），但"容器卷单独看"目前拿到的就是根盘数字，不要误以为有独立配额。
+4) 检测延迟：3 次 × 3 分钟 = 最多约 9 分钟才知道 srv1 失联（外加通知出站时间）。这是刻意的抖动过滤，
+   想更快就调小 timer 的 OnUnitActiveSec，代价是更容易被网络抖动触发。
+5) 通知链路自身没有外部监督：只做了 srv2→srv1 一个方向。若 srv2 也整机挂了，"没人知道"的问题依旧存在
+   （真正的闭环需要第三个互不相关的观测点；本次未做，也不该假装做了）。
+6) 演练期间观察到 srv1 的 secagent-redeploy.timer 处于 inactive（list-timers 显示 NEXT=n/a，LAST 11:35:26），
+   secagent-redeploy.service 为 failed。这不是本次改动造成的（本改动没有碰发布链），但它是"发布巡检已经不跑了"
+   的真实状态 —— 需要人工确认（另有多方在并行改动同一仓库/同一台机）。
+7) ISM 保留期对照依赖 python3（两台已预装；缺 python3 时脚本会如实打印"跳过"，不假装检查过）。
+   另外：本告警只核对"索引是否超过其 ISM 策略保留期"，不核对 ISM 是否真的执行了 delete 动作
+   （更强的做法是查 GET /_plugins/_ism/explain/<index>，本次未做）。
+8) dead man switch 的 ③ 面依赖一把 SSH 钥匙；若这把钥匙被误删/被 authorized_keys 改动覆盖，
+   ③ 会失败并（正确地）在 9 分钟后告警 —— 但它也可能掩盖"密码学层被改过"这件事，
+   所以 srv1 侧 authorized_keys 的改动都留了带时间戳的备份，撤销命令写在脚本输出里。
+9) 通知未送达时【不】记录 last_alert（"没发出去"≠"报过了"）：下一轮 3 分钟后重试，
+   这样 webhook 配好之后会把仍在持续的故障立刻补发出去。代价是未配置期间每 3 分钟一行日志。
+10) 【并行改动造成的事故，留档供对照，不是本节的实现】2026-10-13 11:52-11:58 srv1 全站 502：
+   /opt/secagent/.env 里一行含 `{{body}}` 的 NOTIFY_WEBHOOK_TEMPLATE 让 docker compose 的 .env
+   解析器报 `unexpected character "{"`，compose 重建失败并把容器留在 Created；发布链因
+   `/opt/secagent/scripts/srv1-redeploy.sh` 是 644（line 385 自调用 `"$0" --rollback-to` 需要 +x）
+   而回滚失败，且下一轮 timer 以"digest 相同、无需变更"安静退出 —— 于是不会自愈。
+   紧接着 dockerd 也起不来：`ZONE_CONFLICT: 'docker0' already bound to a zone`（firewalld 与 docker0
+   冲突，参见 §16.4"顺带关掉的项：srv1 docker bridge"）。两条都需要人工处置。
+   教训（与本节直接相关）：**告警出口的配置本身也是发布链的输入** —— 往 .env 里写模板必须
+   确认 `docker compose config --quiet` 仍然 rc=0，否则"加一个通知"就能把应用打下去。
+11) 容量体检的 unit 【刻意不写 Requires=docker.service】（只保留 After= 排序）。理由就是第 10 条：
+   dockerd 起不来的那一刻，你更需要知道磁盘还剩多少；硬依赖会让监控跟着被监控对象一起消失。
+   2026-10-13 在 docker 处于 failed 的状态下实测 `systemctl start secagent-capacity-srv1.service`
+   仍然成功并给出磁盘数值（这就是这个选择的验证）。
+```
+
+---
+
+## 22. 状态异地备份 + CI 漏洞扫描 + 博客自动发布（2026-10-13 落地）
+
+> 三件加固，都是外部评审指出、站主确认后做的。每条都带运行态证据（命令 + 真实输出）。
+> **动 CI 之前先看 22.7「已知会红的地方」** —— 两个门禁接入时的第一次运行本来就是红的，
+> 那是它们在正确工作，不是谁把东西弄坏了。
+
+### 22.1 为什么 data/ 必须异地备份（P0）
+
+```
+/opt/secagent/data/ 是【唯一状态】：没有数据库、没有第二份副本。
+  blocked-ips.json        封禁名单
+  response-audit.json     处置审计（不可重建 —— 审计记录没法"重新生成"）
+  model-quota*.json       三池额度
+  还有 tool-call-audit.json / security-events.json / kb-pending.json / vector-store.json
+它在 srv1 上是 bind-mount（docker-compose.yml: ./data:/app/data，rw）。
+磁盘坏 / 误删 / 误 mount 覆盖 → 处置审计链直接断掉，而且回不来。
+```
+2026-10-13 实测规模：10 个文件、4.8 MB → tar.gz 1741565 字节。
+
+### 22.2 备份链（通道 / 落点 / 保留 / 定时）
+
+| 项 | 值 |
+|---|---|
+| 打包源 | srv1 `/opt/secagent/data` |
+| 脚本 | srv1 `/opt/secagent/scripts/srv1-data-backup.sh`（仓库 `scripts/srv1-data-backup.sh`，unit 在 `deploy/`）|
+| 本地暂存 | srv1 `/var/backups/secagent-data/archives/`，保留最近 3 份 |
+| 异地落点 | srv2 `/opt/secagent-backup/<YYYYMMDD-HHMMSS>/`，保留最近 14 份（目录 700 / 文件 600）|
+| 定时 | srv1 `srv1-data-backup.timer`，每天 03:30（`Persistent=true`，错过窗口开机补跑）|
+| 手动 | `sudo systemctl start srv1-data-backup.service` —— **写入型变更（封禁/审计/额度）之后应手动跑一次** |
+| 日志 | srv1 `journalctl -u srv1-data-backup.service` + `/var/log/secagent-backup/backup.log`；srv2 `/var/log/secagent-backup/receive.log` |
+
+**通道（与最初的设想不同，必须知道）**：项目里已有的 srv1→srv2 SSH 通道是一把
+**只允许端口转发**的隧道密钥 —— srv2 侧写的是 `restrict,port-forwarding,permitopen="127.0.0.1:55000"`，
+它连 shell 都开不了，**根本传不了文件**。所以这里另开了一把专用密钥（而不是把隧道钥匙放宽）：
+
+- srv1 私钥：`/root/.ssh/backup_srv2_ed25519`（注释 `secagent-backup-from-srv1`）
+- srv2 授权行（`/root/.ssh/authorized_keys`）：
+  `command="/usr/local/sbin/secagent-backup-receive",restrict ssh-ed25519 AAAA…secagent-backup-from-srv1`
+- 这把钥匙只有三个动词：`push`（收 tar 流）/ `drill`（抽测）/ `list`（清单）
+- 接收端会拒收含绝对路径或 `..` 成员的归档（那是任意写原语），也拒收白名单外的成员
+
+2026-10-13 实测（从 srv1 出发）：
+```
+$ ssh -i /root/.ssh/backup_srv2_ed25519 root@<srv2> hostname
+错误：命令不在白名单内：hostname（只接受 push / drill / list）          exit=64
+$ ssh -i … -N -R 19999:127.0.0.1:22 root@<srv2>
+Error: remote port forwarding failed for listen port 19999            exit=255
+$ ssh -i … root@<srv2> list                                            exit=0   ← 白名单内的动词正常
+```
+
+**为什么"先快照再打包"**：data/ 里是活文件（容器一直在写），直接 tar 可能读到写了一半的文件，
+产出一份"能解开、但内容自相矛盾"的备份 —— 那比没有备份更危险，因为它看起来是成功的。
+脚本先把整树 cp 到暂存目录，再逐文件复核 sha256，对不上就重拷（最多 3 次）；
+仍对不上就**失败退出、不推送**（fail-closed）。
+
+**保留策略实测**（2026-10-13，人为造 16 份旧备份再推一份）：
+```
+保留策略：删除旧备份 20240101-000005 … 000001   （旧的 5 份被删）
+剩余 14 份；最新的三份真实备份全部完好，sha256 复验 MATCH
+```
+
+### 22.3 恢复抽测（每收一份自动做 + 随时手动做）
+
+抽测 = 把备份**真的解压还原一次**，比对四个量：外层 sha256、文件数、路径集合、逐文件 sha256。
+只比 sha256 不够 —— "数量对了但换了个文件"也要拦下来。
+
+```
+# 收备份时 srv2 会自动抽测；抽测不过就【删掉这份备份】并让推送失败（fail-closed）
+# 手动抽测（默认最新一份）—— 本节最常用的命令：
+ssh secagent-srv2 "sudo /usr/local/sbin/secagent-backup-drill.sh /opt/secagent-backup/<stamp>"
+
+# 从 srv1 触发（走备份通道的 drill 动词，不必人工登 srv2）：
+ssh secagent-srv1 "sudo bash /opt/secagent/scripts/srv1-data-backup.sh --drill"
+
+# 看两边清单 / 只打包不推送（演练）：
+ssh secagent-srv1 "sudo bash /opt/secagent/scripts/srv1-data-backup.sh --status"
+ssh secagent-srv1 "sudo bash /opt/secagent/scripts/srv1-data-backup.sh --dry-run"
+```
+
+2026-10-13 实测（三次备份都通过）：
+```
+--- 恢复抽测 20261013-112609 ---
+data-20261013-112609.tar.gz: OK
+文件数：manifest=10  实际解出=10
+逐文件 sha256 比对：全部 OK
+恢复抽测 20261013-112609：10/10 一致（文件数 10 个，内容与归档时逐字节相同）
+```
+
+### 22.4 真的出事时怎么恢复（下面每条都在 2026-10-13 实跑过）
+
+```
+# ① 确认恢复哪一份，并且【先抽测】——别拿没验证过的去覆盖线上
+ssh secagent-srv2 "sudo ls -1 /opt/secagent-backup/"
+ssh secagent-srv2 "sudo /usr/local/sbin/secagent-backup-drill.sh /opt/secagent-backup/<stamp>"
+
+# ② 在 srv2 上把归档放到 ubuntu 读得到的地方
+#    （备份文件是 600 root:root，直接 scp 会 exit 1 —— 这是刻意的）
+ssh secagent-srv2 "sudo cp /opt/secagent-backup/<stamp>/data-<stamp>.tar.gz /opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.sha256 /tmp/ && sudo chmod 644 /tmp/data-<stamp>.tar.gz*"
+
+# ③ 取回本机（备份通道是单向"只写"的，恢复必须走运维自己的 SSH 通道）
+scp secagent-srv2:/tmp/data-<stamp>.tar.gz secagent-srv2:/tmp/data-<stamp>.tar.gz.sha256 .
+
+# ④ 传到 srv1，先验归档自身没坏
+scp data-<stamp>.tar.gz data-<stamp>.tar.gz.sha256 secagent-srv1:/tmp/
+ssh secagent-srv1 "cd /tmp && sudo sha256sum -c data-<stamp>.tar.gz.sha256"
+#    实测输出：data-20261013-112609.tar.gz: OK
+
+# ⑤ 【恢复前先保住现状】——恢复错了还能回来
+ssh secagent-srv1 "sudo cp -a /opt/secagent/data /opt/secagent/data.before-restore-$(date +%Y%m%d-%H%M%S)"
+
+# ⑥ 取 manifest，解压到 data 的父目录
+#    （归档里带数字 uid/gid 与权限，root 解压会原样恢复）
+ssh secagent-srv2 "sudo cp /opt/secagent-backup/<stamp>/manifest.sha256 /tmp/ && sudo chmod 644 /tmp/manifest.sha256"
+scp secagent-srv2:/tmp/manifest.sha256 .
+scp manifest.sha256 secagent-srv1:/tmp/
+ssh secagent-srv1 "sudo rm -rf /opt/secagent/data && sudo tar -xzf /tmp/data-<stamp>.tar.gz -C /opt/secagent data"
+
+# ⑦ 校验（cwd 必须是 data 的父目录：manifest 里是 data/xxx 相对路径）
+ssh secagent-srv1 "cd /opt/secagent && sudo sha256sum -c /tmp/manifest.sha256"
+
+# ⑧ 核对属主/权限（必须与原状一致，否则容器写不进去）
+ssh secagent-srv1 "sudo stat -c '%n mode=%a owner=%u:%g' /opt/secagent/data /opt/secagent/data/blocked-ips.json"
+#    期望：目录 mode=750 owner=999:999；文件 mode=644 owner=999:999
+#    ⚠️ 999 在 srv1 上叫 systemd-coredump:input、在 srv2 上叫 lxd:input ——
+#       名字不同、数字相同。所以只用数字（或直接 tar 解压），不要按名字 chown。
+
+# ⑨ 让容器重新加载状态（会短暂中断服务，何时执行由站主定）
+ssh secagent-srv1 "sudo docker restart secagent"
+```
+
+> 本会话只做了「还原到临时目录 + 逐文件比对 + 属主核对」，**没有**在线上做覆盖恢复
+> （那会破坏真实状态）。⑥ 里"解压到目标父目录"这个动作是在 `/tmp/owntest` 用同一份归档
+> 实跑验证的：解出来正是 `data/ mode=750 owner=999:999`、`blocked-ips.json mode=644 owner=999:999`，
+> 与线上逐项吻合，manifest 校验 10/10 OK。
+> 另：完整链路（srv2 解出 → scp 回本机 → scp 到 srv1）也实跑过，10/10 一致 —— 即"异地那份
+> 真的能拿回 srv1"，不是只在本机自证。
+
+### 22.5 CI 加 Trivy 漏洞扫描（Gitleaks 之外，别重复）
+
+Gitleaks 管「凭据泄漏」，Trivy 管「依赖停在了有已知漏洞的版本上」—— 两件事，别混。
+两个门禁都是 **HIGH/CRITICAL 命中即失败**：
+
+| 位置 | 扫什么 | 怎么阻断 | 备注 |
+|---|---|---|---|
+| `ci.yml` → job `trivy-fs` | 仓库：Maven 依赖（pom.xml + 构建出的 jar）| `--exit-code 1` | 与既有三 job **并行**，不拉长它们的墙钟时间；漏洞库走 `actions/cache` |
+| `build-image.yml` → 步骤 6.5 | **本次要发布的镜像**（OS 包 + jar 内依赖）| `--exit-code 1` | 放在推 ACR **之前**：有高危就连 ACR 都不登录（fail-closed）|
+
+- 版本钉死 **Trivy 0.75.0**，并校验官方 tar.gz 的 **sha256**（不用 `trivy-action`，理由写在 workflow 注释里）。
+- 不开 Trivy 的 secret 扫描器：gitleaks 已覆盖，重复扫只是白花 CI 时间。
+- **什么级别阻断**：只有 HIGH / CRITICAL 阻断；MEDIUM / LOW 只打印、不拦。
+- 2026-10-13 本机实跑（同一个 0.75.0）fs 扫描：**59 项 HIGH/CRITICAL（48 HIGH + 11 CRITICAL）**，
+  全部是"有补丁"的，集中在 `tomcat-embed-core`（23）、`spring-webmvc`/`spring-webflux`/`spring-web`、
+  `jackson-databind`、`spring-ai-*`。
+- ⚠️ **image 扫描本机没能验证**：Trivy 第一次扫镜像必须先下载 Java DB
+  （`ghcr.io/aquasecurity/trivy-java-db`），本机网络在这一步长时间卡住（35 分钟只花了 20s CPU），
+  而 `--skip-java-db-update` 被 Trivy 明确拒绝（"first run cannot skip downloading Java DB"）。
+  所以这一步**需要 CI 首跑验证**（GitHub runner 网络正常，预期可跑通）。
+
+### 22.6 博客：push 自动构建发布（补上"第十轮改完没上线"的根因）
+
+`F:\7AAA\AI\blog` 新增 `.github/workflows/deploy.yml`：
+push main → 装 Hugo **0.167.0**（钉版本 + 校验 sha256）→ `hugo --gc --minify --cleanDestinationDir`
+→ `bash scripts/assert-build.sh public` → 发 gh-pages。
+
+- **为什么选 peaceiris/actions-gh-pages 而不是官方 actions/deploy-pages**：本站是**分支部署**
+  （源码在 main、产物在 gh-pages —— 本来就是 `deploy.ps1` 在做的事）。官方 `actions/deploy-pages`
+  要求去 Settings → Pages 把 Source 改成 "GitHub Actions"，那是一次手工改设置、改错站点直接 404；
+  用 peaceiris 与现有设置**零差异**，站主不用动任何设置，CI 只是把手工作业变自动。
+- `force_orphan: true`：与 `deploy.ps1` 的 `git push -f` 行为对齐，gh-pages 保持单提交。
+- **断言失败就不发布**：断言在发布步骤之前，失败即 job 失败，gh-pages 保持上一次的产物。
+- 断言脚本放 `scripts/assert-build.sh`（**不是** `_dev/`）：博客 `.gitignore:45` 是 `_*/`，
+  `_dev/` 整个目录被忽略（`git check-ignore -v _dev/assert-build.sh` → `.gitignore:45:_*/`），
+  而 git 无法"重新包含"父目录已被排除的文件 —— 放 `_dev/` 的脚本根本进不了仓库，CI 也拿不到它。
+
+断言清单（每条对应一种真实翻车方式）：产物非空 / index.html 存在 / CNAME=xiaokeqing.cn /
+sitemap.xml 含 `https://xiaokeqing.cn/` / 全站无 `localhost` / 全站无 `/api/public/latest`。
+
+2026-10-13 本机实测（Hugo 0.167.0 构建 49 个文件）：
+```
+[PASS] 产物有 49 个文件
+[PASS] index.html 存在（61033 字节）
+[PASS] CNAME = xiaokeqing.cn
+[PASS] sitemap.xml 存在且是合法 urlset
+[PASS] sitemap.xml 里的基址是 https://xiaokeqing.cn/
+[PASS] 没有任何文件包含 localhost
+[FAIL] 有文件引用已下线的 /api/public/latest      ← 见 22.7
+```
+假失败验证（都实跑过，撤销后恢复原状）：塞入 `localhost` → 断言 ⑤ 拦下；
+删掉 CNAME → 断言 ③ 拦下；删掉 sitemap.xml → 断言 ④ 拦下。
+阳性对照：在**副本**里去掉那两处死端点引用后，**7/7 全过**（证明这道闸可通过，不是永久红）。
+
+### 22.7 已知会红的地方（动 CI 前必看）
+
+两处"第一次跑就是红的"，都是门禁在正确工作：
+
+1. **Trivy fs 首次必红**：仓库当前依赖树实测 **59 项 HIGH/CRITICAL（11 CRITICAL）**，都是真问题
+   （`tomcat-embed-core 10.1.16`、`spring-webflux`/`spring-webmvc 6.1.1`、`spring-ai-vector-store`、
+   `fastjson 1.2.83` 等）。要么升依赖，要么由站主**显式**决定放宽口径
+   （`--ignore-unfixed` / `.trivyignore`）—— 在决定之前不要偷偷加：铁律是"不许静默放过"。
+2. **博客断言首次必红**：站点的「关于」页把已下线的 `/api/public/latest` 当作"未上线端点"在**探测**，
+   而这个字符串进了**每一个**页面 + `js/app.js`：
+   - `static/js/app.js:1886` → `['/api/public/latest', '可选端点：最近事件（未上线时主页改用 audit）'],`
+   - `layouts/partials/spa-view-about.html:72` → `② 可选端点 <code>/api/public/latest</code> …`
+   在这两处被删掉之前，deploy.yml 会**正确地拦住发布**（gh-pages 不更新）。删掉后本机实测 7/7 全过。

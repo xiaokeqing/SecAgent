@@ -1,0 +1,49 @@
+# ============================================================
+# srv1 dead man switch（systemd service，装在 srv2 上）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-srv1deadman.timer（每 3 分钟）
+# 做什么：跑 scripts/srv2-watch-srv1.sh —— 从 srv2 反向探 srv1 的三个面
+#         （公网 /api/health、SSH 连通性、srv1 上关键 systemd 单元），
+#         连续 3 次失败（≈9 分钟）→ notify.sh 发 HIGH「srv1 疑似整机不可用」；
+#         恢复时发 INFO「srv1 已恢复（不可用时长达 …）」。
+#
+# 为什么必须有它（这是外部评审指出的 P0 缺口）：
+#   srv1 上已经有看门狗（secagent-healthwatch）和应用内通知中枢，
+#   但它们都跑在 srv1 上。srv1 整机断电/云主机故障时，它们【一起死】——
+#   "整机死了有人知道"这件事，物理上不可能由 srv1 自己完成。
+#
+# 安装（root，srv2）：
+#   install -m 644 deploy/secagent-srv1deadman.service deploy/secagent-srv1deadman.timer /etc/systemd/system/
+#   install -m 755 scripts/srv2-watch-srv1.sh scripts/notify.sh /opt/secagent/scripts/
+#   systemctl daemon-reload && systemctl enable --now secagent-srv1deadman.timer
+# 前置条件（缺一不可，用 --self-test 自查）：
+#   · /etc/secagent/heartbeat/srv1_ed25519（私钥，600）已由 scripts/srv2-gen-heartbeat-key.sh 生成，
+#     且公钥已用 scripts/srv1-authorize-heartbeat-key.sh 装到 srv1 的 authorized_keys（带 command= 强制命令）
+#   · /opt/secagent/.env 里 NOTIFY_WEBHOOK_URL 已配置 —— 否则 notify.sh 返回退出码 3，
+#     告警只会写进 /opt/secagent/logs/notify.log（这一点在 RUNBOOK §20 里如实写明）
+# ============================================================
+[Unit]
+Description=srv1 dead man switch（srv2 反向探测 srv1：健康/SSH/关键单元）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/srv2-watch-srv1.sh
+# 退出码语义：0=健康 1=失败未达阈值 2=已告警 3=已恢复。
+# 1/2/3 都是"探测正常工作、只是 srv1 不健康"，不该被记成 unit 失败
+# （否则 journal 里满是 failed，真正的问题反而看不见）。
+SuccessExitStatus=0 1 2 3
+# ssh 单次 10s + curl 15s，加通知最多 60s 足够；给它宽一点但别无限
+TimeoutStartSec=180
+Nice=10
+MemoryMax=200M
+CPUQuota=20%
+# 私钥在 /etc（只读可读），known_hosts 在 /var/lib（要写）；
+# ProtectHome=yes 是刻意的：蜜罐机 srv2 上，这个服务没有任何理由碰 /root。
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

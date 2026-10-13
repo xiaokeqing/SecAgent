@@ -1,0 +1,41 @@
+# ============================================================
+# 容量/水位告警（systemd service，装在 srv1）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-capacity-srv1.timer（每 15 分钟）
+# 做什么：跑 scripts/capacity-watch.sh ——
+#         · 宿主磁盘 >80% 告警、>90% 用 HIGH（同一文件系统只报一次）
+#         · OpenSearch 水位（本机没有端点就如实跳过；索引器在 srv2）
+#         · ISM/保留策略是否真的在删旧索引
+#         全部经 notify.sh 发出，同键 6 小时内只发一次（不刷屏）。
+#
+# 安装（root，srv1）：
+#   install -m 644 deploy/secagent-capacity-srv1.service deploy/secagent-capacity-srv1.timer /etc/systemd/system/
+#   install -m 755 scripts/capacity-watch.sh scripts/notify.sh /opt/secagent/scripts/
+#   systemctl daemon-reload && systemctl enable --now secagent-capacity-srv1.timer
+# 手工看数值（不发通知）：
+#   bash /opt/secagent/scripts/capacity-watch.sh --no-notify
+# ============================================================
+[Unit]
+Description=SecAgent 容量与水位告警（srv1：宿主磁盘 / OpenSearch 水位 / ISM 保留期）
+Documentation=file:/opt/secagent/RUNBOOK.md
+# 【刻意不写 Requires=docker.service】容量体检只需要 df + curl，不依赖 docker 在工作。
+#   2026-10-13 实测教训：srv1 的 dockerd 因 firewalld/docker0 冲突起不来时，
+#   若这里硬依赖 docker，"磁盘快满了"这个信号会跟着一起消失 —— 而这恰恰是最该报警的时刻。
+#   保留 After= 只是排序（不是依赖）：docker 在起时不会与之并发。
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/capacity-watch.sh
+# 0=未触发阈值 1=发现问题（都算"体检跑完了"，不该记成 unit 失败）
+SuccessExitStatus=0 1
+TimeoutStartSec=180
+Nice=10
+MemoryMax=200M
+CPUQuota=20%
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes

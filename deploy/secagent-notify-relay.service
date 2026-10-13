@@ -1,0 +1,19 @@
+[Unit]
+Description=SecAgent 通知中继（应用/脚本 → 飞书 + QQ 邮件）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/secagent/scripts/notify-relay.py
+Restart=always
+RestartSec=5
+User=root
+# 只监听 127.0.0.1，不对外暴露
+Environment=NOTIFY_RELAY_PORT=8899
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
