@@ -76,8 +76,19 @@ public class PublicKbService {
 
         List<VectorSearchService.SearchResult> hits;
         try {
-            // 多取一些：被可见性过滤掉的可能不少，取少了公开结果会莫名偏少
-            hits = vectorSearchService.searchSimilarDocuments(query, Math.max(topK * 4, 12));
+            // 多取一些：被可见性过滤掉的可能不少，取少了公开结果会莫名偏少。
+            // 走混合检索（BM25 稀疏 + 稠密 → RRF → 轻量重排）—— 与内部 RAG 同一套检索口径，
+            // 区别只在出海前的可见性过滤与字段白名单（见类注释）。
+            //
+            // ⚠️ 安全语义没有变，且必须写清楚：**稀疏通道建立在全量语料之上**，
+            // 也就是说 BM25 的统计里包含内部文档。这不构成泄露，因为：
+            //   ① 该接口的出海路径上，**每一条**结果都必须先过 visibility.denyReason()
+            //      （下面那个循环），非白名单来源一律丢弃，公开结果里不可能出现内部片段；
+            //   ② BM25 的中间量（词频/文档频率）从不离开本方法，不进响应体；
+            //   ③ 公开身份完全不允许调用内部检索工具（InternalDocsTools 直接拒绝，见其注释）。
+            // 这条不变量由 PublicKbVisibilityIsolationTest 用"内部文档在语料里、
+            // 且会被稠密或稀疏命中"的夹具钉住。
+            hits = vectorSearchService.searchHybrid(query, Math.max(topK * 4, 12));
         } catch (Exception e) {
             // 无真实 Embedding Key / 网络异常：如实上抛"检索不可用"，不降级成关键字匹配
             // （关键字匹配会绕过向量库的可见性元数据，等于换了另一套口径）

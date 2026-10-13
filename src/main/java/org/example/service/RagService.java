@@ -95,8 +95,10 @@ public class RagService {
             logger.info("收到 RAG 流式查询: {}", question);
 
             // 1. 从向量数据库检索相关文档
+            // 走混合检索（BM25 稀疏 + 稠密 → RRF → 轻量重排）；稀疏通道不可用时
+            // 会自动退化成纯稠密并在日志里如实写明，行为与改造前一致。
             List<VectorSearchService.SearchResult> searchResults = 
-                vectorSearchService.searchSimilarDocuments(question, topK);
+                vectorSearchService.searchHybrid(question, topK);
 
             // 发送检索结果
             callback.onSearchResults(searchResults);

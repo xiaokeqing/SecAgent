@@ -113,6 +113,16 @@ services:
       APP_QUOTA_EVAL_DAILY_LIMIT: "${APP_QUOTA_EVAL_DAILY_LIMIT:-60}"
       APP_QUOTA_PUBLIC_DAILY_LIMIT: "${APP_QUOTA_PUBLIC_DAILY_LIMIT:-30}"
 
+      # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
+      # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
+      # 全部可留空（留空即用代码默认值，与改造前行为兼容）。
+      # 回退纯稠密：把 APP_RAG_SPARSE_ENABLED 与 APP_RAG_RERANK_ENABLED 同时置 false。
+      APP_RAG_SPARSE_ENABLED: "${APP_RAG_SPARSE_ENABLED:-true}"
+      APP_RAG_RRF_K: "${APP_RAG_RRF_K:-60}"
+      APP_RAG_RERANK_ENABLED: "${APP_RAG_RERANK_ENABLED:-true}"
+      APP_RAG_TOP_K: "${APP_RAG_TOP_K:-3}"
+      APP_RAG_MIN_SCORE: "${APP_RAG_MIN_SCORE:-0.30}"
+
       # ===== 评测身份（独立凭据 + 独立额度 + 流量打标）=====      # 为什么必须显式写在这里，而不是只依赖 env_file:
       #   env_file 是"运行时兜底"—— .env 里漏了 APP_EVAL_TOKEN 时容器照样起来，
       #   评测身份静默关闭（app.eval.token 为空即功能关闭），外部看不出任何异常；

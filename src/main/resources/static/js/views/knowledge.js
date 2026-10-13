@@ -27,9 +27,15 @@
         } catch (e) { return ''; }
     }
 
-    function scorePct(s) {
+    // 分数语义（2026-10-13 混合检索改造后）：后端返回的不再是余弦相似度，
+    // 而是【最终检索分】（两路召回 RRF + 轻量重排信号）。它是一个排序分，
+    // 绝对值不可解释（RRF 分数量级约 0.01~0.05），所以这里不显示绝对分数，
+    // 而是显示"相对本次结果里最高分"的百分比 —— 至少它说的是一件真实的事：
+    // 这条结果相对于第一条有多接近。
+    function scoreRel(s, best) {
         if (s === null || s === undefined || isNaN(s)) return '-';
-        return (Math.round(s * 100)) + '%';
+        if (!best || isNaN(best) || best <= 0) return '-';
+        return Math.round(100 * s / best) + '%';
     }
 
     function mount(root) {
@@ -169,6 +175,10 @@
             return;
         }
         var html = '';
+        var bestScore = 0;
+        list.forEach(function (r) {
+            if (typeof r.score === 'number' && r.score > bestScore) bestScore = r.score;
+        });
         list.forEach(function (r) {
             html += '<div class="kb-result">' +
                 '<div class="kb-result-head">' +
@@ -179,7 +189,8 @@
                 '<div class="kb-result-meta">' +
                 '  <span>来源：' + SecUI.escapeHtml(r.source || '-') + '</span>' +
                 '  <span class="kb-origin">' + SecUI.escapeHtml(r.origin || '') + '</span>' +
-                '  <span>相似度：' + SecUI.escapeHtml(scorePct(r.score)) + '</span>' +
+                '  <span title="两路召回(稠密+BM25)融合后的排序分，相对于本次第一条">相关度：' +
+                SecUI.escapeHtml(scoreRel(r.score, bestScore)) + '</span>' +
                 '</div></div>';
         });
         box.innerHTML = html;

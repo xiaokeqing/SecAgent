@@ -73,8 +73,10 @@ public class InternalDocsTools {
 
         try {
             // 使用向量搜索服务检索相关文档
+            // 走混合检索（BM25 稀疏 + 稠密 → RRF → 轻量重排）：内部链路本来就允许看全量知识，
+            // 所以这里不需要可见性过滤；公开面一律走 PublicKbService（白名单）。
             List<VectorSearchService.SearchResult> searchResults = 
-                    vectorSearchService.searchSimilarDocuments(query, topK);
+                    vectorSearchService.searchHybrid(query, topK);
             
             if (searchResults.isEmpty()) {
                 return "{\"status\": \"no_results\", \"message\": \"No relevant documents found in the knowledge base.\"}";

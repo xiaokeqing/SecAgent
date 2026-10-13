@@ -1508,3 +1508,188 @@ sitemap.xml 含 `https://xiaokeqing.cn/` / 全站无 `localhost` / 全站无 `/a
 · 启动自检把"通知未配置"从"静默失效"变成"日志里明写"，才让 ②/③ 这两处暴露
 · 容器"存在但没运行"的盲区、脚本缺 +x、env_file 不能放 JSON —— 三条都写进了文档与门禁
 ```
+
+---
+
+# 24. （保留位）
+
+本节号刻意留空：§25 是这次检索改造与 stats24h 修复的正式落点，
+编号与交付说明（TODO 板 / 交接文档）一致，便于对照。**不要在本节下新增内容。**
+
+---
+
+## 25. 混合检索（两路召回 + RRF + 轻量重排）与 stats24h 状态语义（2026-10-13 落地）
+
+### 25.1 一句话说清这次改了什么
+
+```
+改造前：查询 → embedding → 余弦相似度 topK（剔 <0.30）→ 直接给模型
+改造后：查询 ─┬→ 稠密通道（同上，候选取 30 条）
+              └→ 稀疏通道（BM25，中文按字符 bigram、英文/数字按整词切，候选取 30 条）
+                     ↓
+              RRF 融合（按名次，k=60）        ← 免疫两路分数不同量纲
+                     ↓
+              轻量重排（稀有词IDF覆盖度 / 覆盖度 / 标题 / 长度惩罚 / 字符n-gram）
+                     ↓
+                    topK（默认 3，与改造前一致）
+```
+
+**为什么值得做（实测数字，不是"应该更准"）** —— 同一批 28 条 query、同一份 318 条语料、
+同一套判据（`docs/rag-eval/` 里三份原始输出就是它的证据）：
+
+| 口径 | fileHit@3 | evidenceHit@3 | evidenceHit@5 | MRR(evidence) |
+|---|---|---|---|---|
+| 改造前（纯稠密） | 27/28 = 96.4% | 27/28 = 96.4% | 27/28 = 96.4% | 0.8690 |
+| **改造后（两路+RRF+重排）** | **28/28 = 100%** | **28/28 = 100%** | **28/28 = 100%** | **0.9821** |
+
+消融（回答"到底是谁的功劳"）：
+
+| 配置 | fileHit@3 | evidenceHit@3 | MRR |
+|---|---|---|---|
+| A 纯稠密（=改造前） | 27/28=96.4% | 27/28=96.4% | 0.8690 |
+| B 稠密+重排（无稀疏） | 28/28=100% | 28/28=100% | 0.9583 |
+| C 稠密+稀疏→RRF（无重排） | 28/28=100% | 28/28=100% | 0.9821 |
+| D 稠密+稀疏+RRF+重排（默认） | 28/28=100% | 28/28=100% | 0.9821 |
+| E 纯稀疏（BM25 单路） | 28/28=100% | 28/28=100% | 0.9583 |
+
+**如实说明（不许省）**：
+- `@3` 三项在 B/C/D/E 都到顶了，**能区分的只有 MRR**；28 条样本上
+  "96.4% → 100%"就是 1 条 query 的差别，**不要当成"显著提升"**（Wilson 95% 区间在这个 n 下很宽）。
+- 重排与稀疏各自都能把 MRR 推上去，**D 相对 C 的 +0.0000 说明重排在稀疏已经召回对的情况下
+  没有再加分**；也就是说这份评测集测不出"重排的独立收益上限"。
+- 稀疏单路（E）在本集上 fileHit@3 = 100% 是**评测集局限**造成的：期望关键词取自语料原文，
+  与查询用词高度重合，天然对 BM25 有利（详见 25.5）。
+- 重排是**词袋级统计**，不是 Cross-Encoder（差距见 25.5）。
+
+### 25.2 参数（都在 `app.rag.*`，全部可不填；`.env.example` 里列了同一份）
+
+| 环境变量 | 配置项 | 默认 | 含义 |
+|---|---|---|---|
+| `APP_RAG_SPARSE_ENABLED` | `app.rag.sparse.enabled` | `true` | 稀疏（BM25）通道开关 |
+| `APP_RAG_RRF_K` | `app.rag.rrf.k` | `60` | RRF 的 k：越小越看重头部名次 |
+| `APP_RAG_RERANK_ENABLED` | `app.rag.rerank.enabled` | `true` | 轻量重排开关 |
+| `APP_RAG_TOP_K` | `app.rag.top-k` | `3` | 给模型的片段数（老键 `rag.top-k` 仍生效） |
+| `APP_RAG_MIN_SCORE` | `app.rag.min-score` | `0.30` | 稠密相似度门槛（老键 `rag.min-score` 仍生效） |
+
+代码内还有一批默认值（不打算暴露成环境变量，真要调就改 `RagProperties`）：
+`candidateK=30`（两路各取多少进融合）、`sparseK1=1.2` / `sparseB=0.75`（BM25 标准值）、
+`sparseLatinTrigram=true`、`rerankWeightRareCoverage=0.45` / `Coverage=0.25` / `Title=0.15` /
+`Length=0.10` / `Bigram=0.05`、`rerankBothChannelBoost=0.05`、`rerankLengthRefChars=400`。
+
+⚠️ **两个必须记住的坑**：
+1. 只在 `.env` 里加一行 `APP_RAG_*` **不会生效**：`docker-compose.yml` 的 `environment:`
+   段是显式透传的（同 `APP_QUOTA_*` 那个坑）。改配置要同时确认 compose 里有对应透传行
+   —— 那几行已经加好了（`docker-compose.yml` 的"混合检索参数"段）。
+2. `minScore` 只管**稠密通道**。只被 BM25 命中的片段（语义上与查询正交但没有它出现的词）
+   **会**进入结果 —— 这是混合检索的定义，不是泄漏。实测例子：
+   查询"CWE-918 的 SSRF 内部处置手册"里，一篇只含"漏洞/防御"的公开文档会以词面证据入选。
+   如果哪天需要"必须语义也像"的严格口径，那要用 `APP_RAG_SPARSE_ENABLED=false`。
+
+### 25.3 怎么复跑评测（离线、零费用、可重复）
+
+```bash
+# ① 门禁：28 条回归集 + 组件单测（CI 里跑的就是这条）
+mvn -B test
+#    新增的门禁测试：
+#      org.example.rag.RagRetrievalRegressionTest        （28 条逐条 + 整体门槛 + 口径断言 + 回退一致性）
+#      org.example.rag.RagRetrievalComponentsTest        （分词/BM25/RRF/重排的方向性断言）
+#      org.example.publicapi.PublicKbVisibilityIsolationTest （可见性隔离安全不变量）
+
+# ② 改前/改后对比（打印对照表，不需要任何 Key、不联网）
+mvn -q -B test-compile
+mvn -q -B dependency:build-classpath -Dmdep.outputFile=target/cp.txt -Dmdep.includeScope=test
+java -cp "target/classes;target/test-classes;$(cat target/cp.txt)" \
+     org.example.rag.RagRetrievalEvalMain --mode both      # 改前 vs 改后 + 逐条差异
+java -cp "..." org.example.rag.RagRetrievalEvalMain --mode ablation   # A/B/C/D/E 消融
+java -cp "..." org.example.rag.RagRetrievalEvalMain --trace q11       # 单条逐信号追踪（排障用）
+
+# ③ 落档：把 ② 的输出写进 docs/rag-eval/（这三份就是上面那张表）
+#      baseline-dense-only.txt   改前
+#      after-hybrid-both.txt     改后 + 对照表
+#      ablation.txt              A/B/C/D/E 消融
+#    ⚠️ 放在 docs/ 而不是 scripts/rag-eval/out/：`.gitignore` 有 `out/` 规则（构建产物），
+#       放 out/ 下不会入库，RUNBOOK 引用的证据文件就会"找不到"。
+
+# ④ 查询集变了（增删 query / 改期望关键词）→ 必须重新生成查询向量，否则向量与查询对不上
+python3 scripts/rag-eval/build-query-fixture.py            # 需要 .env 里有真实 DASHSCOPE_API_KEY
+python3 scripts/rag-eval/build-query-fixture.py --dry-run  # 只自检期望可达性，不调接口
+#    ⚠️ 换 embedding 模型（dashscope.embedding.model）后同样必须重跑
+```
+
+### 25.4 怎么回退纯稠密（一条配置，不改代码、不重新部署）
+
+```bash
+# srv1: /opt/secagent/.env
+APP_RAG_SPARSE_ENABLED=false
+APP_RAG_RERANK_ENABLED=false
+# 然后重启容器（compose 的透传行已就位）
+cd /opt/secagent && docker compose up -d
+# 核对生效：启动日志里应出现
+#   混合检索参数：稀疏=false ... 重排=false ...
+#   检索链路就绪：... 稀疏语料来源=InMemoryVectorStoreGateway
+```
+
+回退**不会**改变排序口径 —— `RagRetrievalRegressionTest#denseOnlyFallbackMatchesLegacyOrdering`
+会逐条比对"两个开关关掉后"与"改造前算法"的 top-3 列表，必须完全一致；
+门禁跑红说明回退路径被改坏了，**这时候不许上线**。
+
+### 25.5 已知局限（如实列，别让"CI 全绿"被读成"检索有保障"）
+
+```
+· 重排不是 Cross-Encoder：四个信号都是词袋统计量，读不出"限定词修饰的是哪个成分"这类交互。
+  它的收益主要来自【纠名次】（把 RRF 里靠后的精确命中提到前面），补不回"两路都没召回的漏检"。
+  代价换来的是常数级 CPU —— 本项目要能在 2C2G 小机上跑，所以没上模型重排。
+· 重排的四个权重是在【这 28 条 query】上人工定档的，没有交叉验证 → 有 overfit 风险。
+  换语料/换域名后应当重新跑 --mode ablation 再定，不要照抄这几个数字。
+· 中文分词是字符 bigram，没有词典/句法：它会把"路径穿越"与"穿越路径"当近似词袋，
+  也会让"的/了"这类高频字参与打分（由 IDF 自然压低）。需要词性/依存才能区分的语义差别它做不到。
+· 评测夹具 28 条、集中在安全知识这一域，且期望关键词取自语料原文（对词面检索有利）。
+  它测的是"能不能找到已知的正确答案"，**测不出**"问语料里根本没有的东西会不会硬答"
+  （后者由拒答阈值与评测卷覆盖）。
+· 本地 `mvn -B test` 与 CI 都是离线跑缓存向量：量的不是"线上 embedding 接口当次返回什么"。
+```
+
+### 25.6 `alerts.stats24h` 的状态语义（2026-10-13 修复冷启动抖动）
+
+**现象**：同一 URL 连续请求，`stats24h.available` 在 true/false 之间交替，博客 Hero 第一个数字跟着抖。
+
+**根因（两个确定性缺陷，不是网络随机）**：
+```
+① 查询路径把一个"每 60s 才异步刷新"的可用性标记当查询前提：
+   `if (!available) return {available:false}` —— 标记为假时**根本不查**。
+   而 docker compose up -d 会同时重启隧道与应用，隧道要 30+ 秒才连上，
+   启动那次探测必然失败 → 从进程起来到下一次重探（最长 60s）之间，
+   每个缓存过期的请求都在说"数据源不可用"，而 indexer 其实早就绪了。
+② 查询失败与"查询成功但 24h 内 0 条"返回的是同一个 {available:false}，
+   前端无法区分"我们坏了"与"这段时间太平"。
+```
+
+**修完之后的语义（`available` 口径不变，只新增字段 —— 公开 API 契约只增不改）**：
+
+| `state` | `available` | 含义 | 前端应当 |
+|---|---|---|---|
+| `ok` | true | 查询成功且有数据 | 正常显示数字 |
+| `no_data` | true | **查询成功**，24h 内确实 0 条 | 显示 0（这是真实结果） |
+| `degraded` | false | 对端可达，但这次查询失败（`reason=QUERY_FAILED` / `CLIENT_NOT_READY`） | 显示降级 + 稍后重试 |
+| `warming` | false | 链路尚未就绪（隧道/鉴权在建立，或熔断冷却中）`reason=DATA_SOURCE_WARMING` | 显示"正在预热"+重试，**不要报故障** |
+
+另有两条自愈行为：**查询成功会把进程内的可用性标记扶正**（不必等下一次重探）；
+`degraded`/`warming` 由"现场探测一次"区分（探测过 = degraded，探测不过 = warming）。
+
+**修前/修后 10 次连续请求的 available 序列**（`WazuhSummary24hColdStartTest`，假 indexer 夹具）：
+
+```
+前置状态：available 字段 = false（模拟"启动探测失败、尚未重探"），但 indexer 已就绪
+修复前： [false, false, false, false, false, false, false, false, false, false]   ← 标记永不被扶正
+修复后： [true,  true,  true,  true,  true,  true,  true,  true,  true,  true ]   ← 首个请求即真值
+链路真没起来时（探测也失败）：state 序列 = warming, warming, degraded, ok, ok, ok
+                              available 序列 = false, false, false, true, true, true（单调朝好，无回抖）
+```
+
+**怎么用**：
+```bash
+curl -s http://127.0.0.1:9900/api/public/alerts | python3 -m json.tool | grep -A3 stats24hState
+# 期望： "stats24hState": "ok" / "no_data" / "warming" / "degraded"
+# 排查"数字在抖"时先看 state：如果一直是 ok 而数字还在变，那才是数据本身在变。
+```
+

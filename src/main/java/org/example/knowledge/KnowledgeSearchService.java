@@ -53,8 +53,11 @@ public class KnowledgeSearchService {
 
         // 1) 向量检索（无真实 Embedding Key 时可能报错，容错降级：不拖垮整个知识库页）
         try {
+            // 混合检索（BM25 稀疏 + 稠密 → RRF → 轻量重排）。注意 score 的语义随之变化：
+            // 改造前是余弦相似度（0~1），现在是"最终检索分"（RRF + 重排信号，量纲不同）。
+            // 所以前端不再把它当"相似度百分比"展示，而是当作相关度排序分（见 knowledge.js 的说明）。
             List<VectorSearchService.SearchResult> hits =
-                    vectorSearchService.searchSimilarDocuments(query, FETCH_TOP_K);
+                    vectorSearchService.searchHybrid(query, FETCH_TOP_K);
             for (VectorSearchService.SearchResult h : hits) {
                 Map<String, Object> meta = h.getMetadata();
                 String fileName = meta == null ? null : String.valueOf(meta.get("_file_name"));

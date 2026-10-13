@@ -218,14 +218,52 @@ public class WazuhService implements WazuhGateway {
      * 告警流取的是"最新 N 条"。网络侧低危告警一刷屏，高危就被挤出窗口，
      * 面板上于是显示「严重 0 / 高危 0」——让人以为没出事，其实只是被噪声挤掉了。
      * 口径问题只能靠口径解决。
+     *
+     * <h3>2026-10-13 修复：冷启动首个请求为什么判 false（"查询失败"与"确实无数据"必须分开）</h3>
+     * <b>现象</b>：同一 URL 连续请求，{@code stats24h.available} 在 true/false 之间交替，
+     * 博客 Hero 的第一个数字因此会抖。
+     *
+     * <p><b>根因（两个独立缺陷叠在一起）</b>：
+     * <ol>
+     *   <li><b>可用性判据是异步缓存的，查询却拿它当"现在能不能查"</b>：
+     *       {@code available} 由 {@link #reprobe()} 每 60 秒刷新一次，启动时也探测一次。
+     *       而 {@code docker compose up -d} 会同时重启隧道与应用，隧道要 30 多秒才连上 ——
+     *       启动那次探测必然失败。于是<b>从进程起来到下一次重探（最多 60 秒）之间</b>，
+     *       每个缓存过期的请求都会在 {@code if (!available)} 处直接返回
+     *       {@code available=false}，<b>根本没有去查一次</b>。
+     *       indexer 明明已经就绪，页面却在说"数据源不可用"。</li>
+     *   <li><b>失败形态被吞成同一个值</b>：原来 catch 分支只 {@code put("available", false)}
+     *       就返回，与"查询成功但 24 小时内 0 条告警"这个<b>完全不同的含义</b>
+     *       在响应里长得一模一样。前端无法区分"我们坏了"与"这段时间太平"，
+     *       而这两件事对看板主人的含义正好相反。</li>
+     * </ol>
+     *
+     * <p><b>修法</b>：
+     * <ol>
+     *   <li>本方法<b>不再把缓存的 {@code available} 当查询前提</b>，而是直接查；
+     *       indexer 真的可达时会正常返回 —— 冷启动后的首个请求因此就能拿到真值；</li>
+     *   <li>查询失败时<b>现场探一次</b>（{@link #probe()}，有界）来区分两种失败：
+     *       探测通过 = 对端在、只是这次查询失败 → {@code state=degraded}；
+     *       探测不过 = 链路还没起来 → {@code state=warming}（这是"正在预热"，
+     *       不是"后端故障"，前端应当重试而不是显示故障）；</li>
+     *   <li>新增机读字段 {@code state}（{@code ok} / {@code no_data} / {@code warming} / {@code degraded}）
+     *       与 {@code reason}（人读原因）。{@code available} 的口径保持不变
+     *       （只有"真拿到了 24h 聚合"才为 true）—— 公开 API 契约只增不改，
+     *       已有前端按 {@code available} 降级的逻辑不受影响。</li>
+     * </ol>
+     *
+     * <p>为什么不做"重试一次"：初次失败最常见的两种原因（隧道未就绪、熔断冷却）
+     * 都不会因为立刻重试而消失 —— 重试只会让首个请求多等一次超时（实测最坏 15s+15s）。
+     * 真正有效的动作是<b>尝试一次查询</b>（本来就这么做了）＋<b>如实标注状态</b>。
      */
     @Override
     public Map<String, Object> summary24h() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("available", false);
 
-        if (!available || client == null) {
-            return out;      // fail-closed：宁可显示"数据源不可用"，也不编造 0
+        if (client == null) {
+            return degraded(out, "CLIENT_NOT_READY",
+                    "Wazuh 客户端未初始化（未启用或初始化失败），无法查询 24h 概览");
         }
         try {
             JsonNode root = client.fetchSummary24h();
@@ -255,11 +293,49 @@ public class WazuhService implements WazuhGateway {
             out.put("bySeverity", bySeverity);
             out.put("trend", trend);
             out.put("windowHours", 24);
+            out.put("state", total > 0 ? "ok" : "no_data");
+            out.put("reason", total > 0 ? "OK" : "NO_ALERTS_IN_24H");
+            out.put("note", total > 0
+                    ? "24 小时聚合已取到（按 @timestamp 时间范围聚合，不受取数窗口影响）"
+                    : "查询成功：最近 24 小时确实没有任何告警（这是真实结果，不是数据源故障）");
+            // 查询成功说明链路是通的：顺手把可用性标记扶正，省掉"最多 60 秒"的空窗
+            if (!available) {
+                available = true;
+                logger.info("24h 聚合查询成功 —— 可用性标记由 false 扶正为 true（无需等下一次重探）");
+            }
             return out;
         } catch (Exception e) {
-            logger.warn("24h 聚合查询失败，前端会显示数据源不可用：{}", e.getMessage());
+            // 区分"查询失败"与"确实无数据"：现场探一次，探测结果为真说明对端在、只是这一查失败。
+            boolean reachable = false;
+            try {
+                reachable = probe();
+            } catch (Exception probeErr) {
+                logger.debug("查询失败后的现场探测也失败：{}", probeErr.getMessage());
+            }
+            if (reachable) {
+                available = true;       // 链路通：把可用性标记扶正，避免后续请求继续按"不可用"短路
+                logger.warn("24h 聚合查询失败，但现场探测通过（对端可达）—— 按 degraded 上报，不是无数据：{}",
+                        e.getMessage());
+                return degraded(out, "QUERY_FAILED",
+                        "数据源可达，但这次 24h 聚合查询失败（" + e.getMessage() + "）；"
+                                + "这不是'这段时间没有告警'，前端应显示为降级并重试");
+            }
+            logger.warn("24h 聚合查询失败且现场探测不通过 —— 按 warming 上报（链路尚未就绪/正在自愈）：{}",
+                    e.getMessage());
+            out.put("state", "warming");
+            out.put("reason", "DATA_SOURCE_WARMING");
+            out.put("note", "数据链路尚未就绪（隧道/鉴权正在建立或处于熔断冷却），本次没有拿到 24h 聚合；"
+                    + "这是预热状态，不是'没有告警'，也不是后端故障判定 —— 稍后重试即可");
             return out;
         }
+    }
+
+    /** 统一的降级载荷：{@code state=degraded} 表示"能连上但这次没查成"，与 {@code no_data} 明确区分 */
+    private static Map<String, Object> degraded(Map<String, Object> out, String reason, String note) {
+        out.put("state", "degraded");
+        out.put("reason", reason);
+        out.put("note", note);
+        return out;
     }
 
     /** 蜜罐规则描述里的取值（实测形状见下）；用全限定名避免再加 import */
