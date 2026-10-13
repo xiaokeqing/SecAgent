@@ -188,6 +188,13 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!--
+          注：webhook 出站的测试曾经想引 mockwebserver，最终改成用 JDK 自带的
+          com.sun.net.httpserver.HttpServer —— 项目纪律是"不引新依赖"，
+          而且引它不仅多一个构件，还要求构建环境能访问 Maven 中央仓库
+          （本机离线构建会直接因为下载不到而失败）。JDK 自带的 HTTP 服务够用：
+          起一个真实端口、真收 POST、真回 500，测试的价值（验证真发出去的字节形状）不打折。
+        -->
     </dependencies>
 
 

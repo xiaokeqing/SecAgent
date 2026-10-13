@@ -35,15 +35,26 @@ public class UnblockScheduler {
     private final AuditService auditService;
     private final ObjectProvider<WazuhGateway> wazuhGatewayProvider;
 
+    /** 通知门面（解封属于低等级事件，夜间会被静默）——可缺失，缺失时行为与改造前一致 */
+    private final ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider;
+
     @Value("${response.unblock.enabled:true}")
     private boolean enabled;
 
     public UnblockScheduler(BlockRecordStore blockRecordStore,
                             AuditService auditService,
                             ObjectProvider<WazuhGateway> wazuhGatewayProvider) {
+        this(blockRecordStore, auditService, wazuhGatewayProvider, null);
+    }
+
+    public UnblockScheduler(BlockRecordStore blockRecordStore,
+                            AuditService auditService,
+                            ObjectProvider<WazuhGateway> wazuhGatewayProvider,
+                            ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider) {
         this.blockRecordStore = blockRecordStore;
         this.auditService = auditService;
         this.wazuhGatewayProvider = wazuhGatewayProvider;
+        this.notifierProvider = notifierProvider;
     }
 
     /** 网关是否可用：存在 Bean 且 isAvailable() 为真（与 ResponseActionService 同一判据） */
@@ -97,12 +108,28 @@ public class UnblockScheduler {
                             + "min; 来源=" + r.getSource() + "; 原审计=" + r.getAuditId()));
             logger.info("已自动解封 IP {}（到期时间 {}，封禁时长 {}min，来源 {}）",
                     r.getIp(), r.getExpiresAt(), r.getDurationMinutes(), r.getSource());
+            notifyUnblock(r.getIp(), result.getMode());
         } else {
             // 解封失败不标记，下一轮调度重试
             auditService.append(ResponseAudit.of("scheduler", "unblock-ip", r.getIp(),
                     "到期解封执行失败", "LOW", result.getMode(), false,
                     "到期时间=" + r.getExpiresAt() + "; " + result.getMessage()));
             logger.warn("自动解封失败 IP {}（到期时间 {}）：{}", r.getIp(), r.getExpiresAt(), result.getMessage());
+        }
+    }
+
+    /** ② 解封通知：低等级（夜间静默会压制它——这是刻意的，解封不是呼救） */
+    private void notifyUnblock(String ip, String mode) {
+        if (notifierProvider == null) {
+            return;
+        }
+        try {
+            org.example.notify.SecurityEventNotifier n = notifierProvider.getIfAvailable();
+            if (n != null) {
+                n.unblockIp(ip, mode, "scheduler");
+            }
+        } catch (Exception e) {
+            logger.warn("解封通知失败（不影响解封结果）：{}", e.getMessage());
         }
     }
 }

@@ -45,16 +45,48 @@ public class ResponseActionService {
      */
     private final ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider;
 
+    /**
+     * 通知门面（② 自动封禁成功/失败）。
+     *
+     * <p>用 {@code ObjectProvider} 而不是直接注入：通知是旁路能力，
+     * 它在裁剪构建/单测里可能整个不存在，缺失时必须<b>照旧完成处置</b>
+     * —— 不允许"因为通知组件不在，封禁就不做了"。
+     */
+    private final ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider;
+
     public ResponseActionService(ResponseGuard responseGuard,
                                  AuditService auditService,
                                  BlockRecordStore blockRecordStore,
                                  ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
                                  ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider) {
+        this(responseGuard, auditService, blockRecordStore, wazuhGatewayProvider, sshBlockProvider, null);
+    }
+
+    public ResponseActionService(ResponseGuard responseGuard,
+                                 AuditService auditService,
+                                 BlockRecordStore blockRecordStore,
+                                 ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
+                                 ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider,
+                                 ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider) {
         this.responseGuard = responseGuard;
         this.auditService = auditService;
         this.blockRecordStore = blockRecordStore;
         this.wazuhGatewayProvider = wazuhGatewayProvider;
         this.sshBlockProvider = sshBlockProvider;
+        this.notifierProvider = notifierProvider;
+    }
+
+    /** 通知门面（可能不存在）；任何异常都不影响处置链路 */
+    private org.example.notify.SecurityEventNotifier notifier() {
+        if (notifierProvider == null) {
+            return null;
+        }
+        try {
+            return notifierProvider.getIfAvailable();
+        } catch (Exception e) {
+            logger.warn("取通知门面失败（不影响处置）：{}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -143,7 +175,30 @@ public class ResponseActionService {
         if (result.isSuccess() && result.getMode() != null && !"BLOCKED".equals(result.getMode())) {
             blockRecordStore.register(target, duration, source, actor, result.getAuditId(), result.getMode());
         }
+
+        // ② 自动封禁通知：成功与失败都通知（失败等级更高，见 NotifyEvent.defaultSeverity）。
+        // 刻意放在"审计与登记之后"：通知是最后一步，它慢了/挂了都不该改变处置结果。
+        notifyBlock(target, result, reason, actor, duration);
         return result;
+    }
+
+    /** 封禁结果 → 通知（封禁被护栏拦截属于"没执行"，不通知，避免噪声） */
+    private void notifyBlock(String target, ActiveResponseResult result, String reason,
+                             String actor, int durationMinutes) {
+        org.example.notify.SecurityEventNotifier notifier = notifier();
+        if (notifier == null) {
+            return;
+        }
+        try {
+            if ("BLOCKED".equals(result.getMode())) {
+                logger.info("封禁被护栏拦截（{}），不触发通知（未执行的动作不是「处置结果」）", target);
+                return;
+            }
+            notifier.blockIp(target, result.isSuccess(), result.getMode(),
+                    reason == null ? result.getMessage() : reason, actor, durationMinutes);
+        } catch (Exception e) {
+            logger.warn("封禁通知失败（不影响处置结果）：{}", e.getMessage());
+        }
     }
 
     /**

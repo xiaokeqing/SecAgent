@@ -81,6 +81,7 @@ public class PublicApiController {
     private final Snapshot alertsCache = new Snapshot();
     private final Snapshot honeypotCache = new Snapshot();
     private final Snapshot auditCache = new Snapshot();
+    private final Snapshot latestCache = new Snapshot();
 
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
     @Autowired
@@ -343,6 +344,38 @@ public class PublicApiController {
         return ok(auditCache.get(cacheSeconds, this::buildAudit), res);
     }
 
+    /**
+     * 最近一次同步 / 最近一条事件的聚合摘要。
+     *
+     * <h3>这个端点为什么存在（2026-10-13 收口）</h3>
+     * 前端曾经调用 {@code /api/public/latest}，而它从未实现 —— 探测拿到 404 之后，
+     * 页面上出现了一段技术免责文字（"latest 未就绪 HTTP 500 / 用 audit 替代"）。
+     * 那段文字后来从前端移走了，但<b>端点本身仍然悬空</b>：谁都可以再调一次，
+     * 然后再造一次同样的含糊提示。缺口只能二选一收口：实现它，或彻底删掉并写明"不得调用"。
+     *
+     * <p>这里选<b>实现</b>，理由：
+     * <ol>
+     *   <li>数据全部来自既有公开白名单口径（{@link PublicAlertSource#readAlerts()} 的
+     *       掩码字段 + {@link PublicAuditReader} 的掩码记录），<b>没有新增任何数据面</b>：</li>
+     *   <li>不放宽公开面 —— 它不返回标题、不返回内网目的地址、不返回聚合 id 与成员 id，
+     *       只返回"窗口内多少条 / 什么等级分布 / 最近一次是什么时间、哪一类、来自哪个网段"；</li>
+     *   <li>限流 / CORS / 掩码 / ETag 与其余公开端点走同一条通路（同一个 {@code Snapshot} 缓存、
+     *       同一个 {@code ok(...)}，因此 ETag Filter 与 CORS 拦截器照样生效）。</li>
+     * </ol>
+     * 若将来需要"最近一条的标题"，那属于扩大公开面，必须在 RUNBOOK §10 里显式评审后再做 ——
+     * 不要顺手加。
+     *
+     * <p>无数据时如实返回 {@code available=false} + 可读原因（machine-readable 的 {@code reason}
+     * 与人读的 {@code note} 成对给出），绝不用 0 冒充"这段时间太平"。
+     */
+    @GetMapping("/latest")
+    public ResponseEntity<Map<String, Object>> latest(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(latestCache.get(cacheSeconds, this::buildLatest), res);
+    }
+
     // ==================== 载荷组装 ====================
 
     private Map<String, Object> buildHoneypot() {
@@ -382,6 +415,130 @@ public class PublicApiController {
         data.put("blocks", auditReader.blocks(20));
         data.put("actions", maskActionText(auditReader.actions(30)));
         return data;
+    }
+
+    /** {@code /latest} 的取数入口（控制器方法，便于测试时只换数据源） */
+    private Map<String, Object> buildLatest() {
+        List<SecurityAlert> alerts = source.readAlerts();
+        String mode = source.mode();
+        boolean available = source.realData() && !alerts.isEmpty();
+
+        List<Map<String, Object>> blocks = auditReader == null ? List.of() : auditReader.blocks(1);
+        return buildLatest(alerts, available, mode, source.windowSize(), cacheSeconds, generatedAt(), blocks);
+    }
+
+    private String generatedAt() {
+        return LocalDateTime.now().format(FMT);
+    }
+
+    /**
+     * {@code /latest} 的载荷组装 —— <b>纯函数</b>（除入参外不读任何状态）。
+     *
+     * <p>抽成 static 是为了能被单测直接喂数据：这条端点的关键承诺是
+     * "无数据时如实 available=false + reason"，而那个分支在真环境里很难复现
+     * （要刚好把隧道掐在某一步）。给它一个纯函数入口，就能把每种失败形态都钉住。
+     *
+     * <h3>字段白名单（不加字段是纪律，不是偷懒）</h3>
+     * 出参只有：生成时间、缓存秒数、可用性与原因、窗口大小与条数、等级分布、
+     * 来源分布（已掩码）、最近一条事件的<b>时间/等级/类型/来源网段</b>、最近一次封禁的
+     * <b>时间/网段/动作</b>。刻意<b>不含</b>：标题、规则名、内网目的地址与资产名、
+     * 聚合 id 与成员 id、原始日志、reason 正文（可能含内网信息）。
+     *
+     * @param alerts       已经过 fail-closed 过滤的真实告警（内置样本已在数据源侧剔除）
+     * @param available    数据源是否真的拿到了真实数据
+     * @param mode         数据源模式（REAL / MOCK / OFF），如实回显
+     * @param windowSize   取数窗口大小（口径说明用）
+     * @param cacheSeconds 应用内快照 TTL，同时作为 Cache-Control 的 max-age
+     * @param generatedAt  本次载荷生成时间
+     * @param latestBlocks 最近一次封禁记录（已掩码；可为空）
+     */
+    static Map<String, Object> buildLatest(List<SecurityAlert> alerts, boolean available, String mode,
+                                           int windowSize, int cacheSeconds, String generatedAt,
+                                           List<Map<String, Object>> latestBlocks) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("generatedAt", generatedAt);
+        data.put("cacheSeconds", cacheSeconds);
+        data.put("available", available);
+        data.put("wazuhMode", mode);
+        data.put("windowSize", windowSize);
+        data.put("windowAlertCount", alerts == null ? 0 : alerts.size());
+
+        if (!available) {
+            // 如实说原因。两种"没有数据"必须区分开：数据源不可用 vs 确实这段时间没有告警 ——
+            // 前者是故障，后者是常态，混在一起会让前端把"链路断了"渲染成"一切太平"。
+            String reason = "REAL".equalsIgnoreCase(mode == null ? "" : mode.trim())
+                    ? "NO_DATA_IN_WINDOW" : "DATA_SOURCE_UNAVAILABLE";
+            data.put("reason", reason);
+            data.put("note", "DATA_SOURCE_UNAVAILABLE".equals(reason)
+                    ? "告警数据源不可达（或未拿到真实数据），本次不展示任何告警数字，也不以内置样本顶替"
+                    : "数据源可用，但当前取数窗口内没有任何真实告警（不是故障）");
+            data.put("latestEvent", null);
+            data.put("latestBlock", latestBlocks == null || latestBlocks.isEmpty() ? null : latestBlocks.get(0));
+            return data;
+        }
+
+        data.put("reason", "OK");
+        data.put("note", "字段全部来自公开白名单：来源 IP 已掩码到网段，不含标题/内网目的地址/聚合 id");
+
+        data.put("severityCounts", severityCounts(alerts));
+        data.put("sourceCounts", sourceCounts(alerts));
+
+        SecurityAlert newest = newest(alerts);
+        Map<String, Object> ev = new LinkedHashMap<>();
+        ev.put("occurredAt", newest == null ? null : newest.getOccurredAt());
+        putEnum(ev, "severity", newest == null ? null : newest.getSeverity());
+        putEnum(ev, "type", newest == null ? null : newest.getType());
+        putEnum(ev, "source", newest == null ? null : newest.getSource());
+        ev.put("srcIp", PublicIpMask.mask(newest == null ? null : newest.getSrcIp()));
+        data.put("latestEvent", ev);
+        data.put("latestBlock", latestBlocks == null || latestBlocks.isEmpty() ? null : latestBlocks.get(0));
+        return data;
+    }
+
+    /** 等级分布（固定枚举顺序，前端不必自己兜底缺失档位） */
+    private static List<Map<String, Object>> severityCounts(List<SecurityAlert> alerts) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (AlertSeverity s : AlertSeverity.values()) {
+            out.add(bucketOf(s.name(), s.getLabel(),
+                    alerts.stream().filter(a -> a.getSeverity() == s).count()));
+        }
+        return out;
+    }
+
+    /** 来源分布（固定枚举顺序） */
+    private static List<Map<String, Object>> sourceCounts(List<SecurityAlert> alerts) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (AlertSource s : AlertSource.values()) {
+            out.add(bucketOf(s.name(), s.getLabel(),
+                    alerts.stream().filter(a -> a.getSource() == s).count()));
+        }
+        return out;
+    }
+
+    /** 窗口内最近一条（按 occurredAt 倒序；时间解析不了的一律排到最后，不拿它冒充"最近"） */
+    private static SecurityAlert newest(List<SecurityAlert> alerts) {
+        SecurityAlert best = null;
+        LocalDateTime bestTime = null;
+        for (SecurityAlert a : alerts) {
+            LocalDateTime t = parseTime(a == null ? null : a.getOccurredAt());
+            if (t == null) {
+                continue;
+            }
+            if (bestTime == null || t.isAfter(bestTime)) {
+                bestTime = t;
+                best = a;
+            }
+        }
+        return best;
+    }
+
+    /** {@link #bucket} 的 static 版本（{@link #buildLatest} 是静态方法，不能调实例方法） */
+    private static Map<String, Object> bucketOf(String key, String label, long count) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("key", key);
+        m.put("label", label);
+        m.put("count", count);
+        return m;
     }
 
     /** 审计流水的文本字段（reason）也过一遍 IP 掩码 —— 文本里可能内嵌 IP */
@@ -569,7 +726,7 @@ public class PublicApiController {
     }
 
     /** 枚举字段统一输出 {枚举名, 中文标签}，前端不必自己维护映射表 */
-    private void putEnum(Map<String, Object> target, String field, Object value) {
+    private static void putEnum(Map<String, Object> target, String field, Object value) {
         if (value == null) {
             target.put(field, null);
             target.put(field + "Label", null);

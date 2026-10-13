@@ -90,6 +90,15 @@ public class WazuhService implements WazuhGateway {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private SshBlockExecutor sshExecutor;
 
+    /**
+     * 通知门面（③ 系统降级事件）。
+     *
+     * <p>可空注入：{@code OutboundSelfCheckTest} 之类的单测直接 new 本类，
+     * 不该被迫连通知一起造。缺失时本类行为与改造前完全一致。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.example.notify.SecurityEventNotifier securityEventNotifier;
+
     private WazuhClient client;
     private volatile boolean available;
 
@@ -112,9 +121,29 @@ public class WazuhService implements WazuhGateway {
                 logger.warn("Wazuh 数据链路不可用（manager={} indexer={}），本次降级为内置样本（MOCK）；"
                         + "后台会周期性重探，恢复后自动切回 REAL", baseUrl, indexerUrl);
             }
+            observeModeForNotify();
         } catch (Exception e) {
             this.available = false;
             logger.warn("Wazuh 初始化异常，降级为内置样本（MOCK）：{}", e.getMessage());
+            observeModeForNotify();
+        }
+    }
+
+    /**
+     * ③ 系统降级通知的触发点。
+     *
+     * <p>只在"模式真的变了"时通知（由 {@code SecurityEventNotifier.observeMode} 判定），
+     * 首次调用只记录不通知 —— 否则每次启动都会推一条"系统降级"，
+     * 而它可能只是隧道还没起来的时序问题（实测 30 秒后就会自己恢复）。
+     */
+    private void observeModeForNotify() {
+        if (securityEventNotifier == null) {
+            return;
+        }
+        try {
+            securityEventNotifier.observeMode(mode());
+        } catch (Exception e) {
+            logger.warn("系统降级通知失败（已吞掉，不影响探测）：{}", e.getMessage());
         }
     }
 
@@ -175,6 +204,10 @@ public class WazuhService implements WazuhGateway {
         } else if (!available && was) {
             logger.warn("Wazuh 数据链路断开：模式 REAL -> MOCK。"
                     + "对外页面会如实显示「数据源不可用」，不会拿内置样本填充", baseUrl);
+        }
+        if (available != was) {
+            // 每次真实的状态切换都推一次（降级与恢复都推）：只报坏消息的通道会被当成噪声
+            observeModeForNotify();
         }
     }
 

@@ -83,6 +83,25 @@ public class OutboundSelfCheck {
     @Value("${app.outbound.max-inflight-per-dependency:2}")
     private int maxInflight;
 
+    /**
+     * 通知中枢（webhook 出站）。
+     *
+     * <p>用 {@code required=false} 可空注入而不是构造器参数：加进构造器会让
+     * "只关心出站超时矩阵"的单测被迫连通知 Bean 一起造，
+     * 而那些测试的价值恰恰在于"不依赖 Spring 上下文"。缺失时自检如实写 MISSING。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.example.notify.NotificationService notificationService;
+
+    /**
+     * webhook 传送器（真实出站对象）。
+     *
+     * <p>自检打印的调用预算取自<b>它</b>，而不是再读一遍 {@code app.notify.timeout-ms} ——
+     * 后者在"配置改了但客户端没拿到"时会打印骗人的值（这正是本类存在的理由）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private org.example.notify.HttpWebhookTransport notificationTransport;
+
     public OutboundSelfCheck(OutboundTimeouts timeouts,
                              DashScopeConfig dashScopeConfig,
                              VectorEmbeddingService embeddingService,
@@ -199,6 +218,39 @@ public class OutboundSelfCheck {
                     "DISABLED",
                     "NONE",
                     "未启用 Milvus（默认 memory 向量库）"));
+        }
+
+        // ---- 8) 通知中枢（webhook）：未配置必须显式打印，不许静默 ----
+        //
+        // 这一行是"通知没配"唯一能被看见的地方：功能开关就是"URL 是否为空"，
+        // 而空 URL 的默认表现是"什么都没发生" —— 如果自检不写出来，
+        // 运维会以为通知在工作（高危告警"应该"会来），直到真正出事那天。
+        if (notificationService == null) {
+            rows.add(new Dependency("notify-webhook",
+                    MISSING + "(通知组件未接入)",
+                    MISSING + "(通知组件未接入)",
+                    MISSING + "(通知组件未接入)",
+                    "NONE",
+                    "app.notify.webhook-url：未接入通知中枢 Bean（本地单测/裁剪构建）"));
+        } else if (!notificationService.configured()) {
+            rows.add(new Dependency("notify-webhook",
+                    "DISABLED(通知未配置:NOTIFY_WEBHOOK_URL 为空)",
+                    "DISABLED(通知未配置)",
+                    "DISABLED(通知未配置)",
+                    "NONE",
+                    "app.notify.webhook-url 为空 → 通知功能关闭；事件只写 data/notify-audit.jsonl 与日志"));
+        } else {
+            String notifyCall = (notificationTransport == null)
+                    ? MISSING + "(传输器未接入)"
+                    : notificationTransport.effectiveCallTimeoutMs() + "ms";
+            rows.add(new Dependency("notify-webhook",
+                    timeouts.getConnectTimeoutMs() + "ms",
+                    timeouts.getReadTimeoutMs() + "ms",
+                    notifyCall,
+                    notificationTransport != null && notificationTransport.guardEnabled()
+                            ? guardCircuit() : MISSING + "(守卫未接入)",
+                    "通用 webhook（Telegram/飞书/钉钉同一形状：HTTP POST JSON）："
+                            + notificationService.describe()));
         }
 
         return rows;

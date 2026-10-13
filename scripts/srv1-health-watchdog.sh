@@ -33,6 +33,42 @@ ROLLBACK_SCRIPT=/opt/secagent/scripts/srv1-rollback.sh
 DRY_RUN=0
 MODE=check
 
+# ---------- ④ 看门狗回滚 → 手机通知（2026-10-13 新增）----------
+# 为什么走本机 HTTP 端点而不是 CLI：容器镜像里没有 python3，脚本也发不了 HTTPS，
+# 而宿主机有 curl、应用本来就监听 127.0.0.1:9900 —— 复用现成通路最省事也最容易验证。
+# 端点不在免鉴权白名单里，所以必须带 X-API-Token（取自 /opt/secagent/.env 的 SECAGENT_API_TOKEN）。
+# 未配置时如实写日志（不会假装通知成功）；默认 dry-run 也会通知，便于先验证链路。
+NOTIFY_URL=${NOTIFY_URL:-http://127.0.0.1:9900/api/notify/watchdog-rollback}
+ENV_FILE=${ENV_FILE:-/opt/secagent/.env}
+
+notify_rollback() {
+  # $1=回滚前 commit  $2=目标 commit  $3=原因
+  local from="$1" to="$2" reason="$3" token="" body rc
+  if [ -f "$ENV_FILE" ]; then
+    token=$(grep -E '^SECAGENT_API_TOKEN=' "$ENV_FILE" | tail -n1 | cut -d= -f2-)
+  fi
+  if [ -z "$token" ]; then
+    log "[notify] 未取到 SECAGENT_API_TOKEN（$ENV_FILE）—— 只记录，不发通知"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    log "[notify] 宿主机没有 curl —— 只记录，不发通知"
+    return 0
+  fi
+  body=$(printf '{"commitFrom":"%s","commitTo":"%s","reason":"%s","actor":"watchdog"}' \
+           "$from" "$to" "$(printf '%s' "$reason" | tr -d '"\\')")
+  rc=0
+  curl -sS -m 10 -o /tmp/secagent-notify-rollback.out -w '%{http_code}' \
+    -X POST "$NOTIFY_URL" \
+    -H "X-API-Token: $token" -H 'Content-Type: application/json' \
+    -d "$body" >/tmp/secagent-notify-rollback.code 2>/dev/null || rc=$?
+  if [ "$rc" != "0" ]; then
+    log "[notify] 回滚通知请求失败（curl exit=$rc）—— 已如实记录，不影响回滚结果"
+    return 0
+  fi
+  log "[notify] 回滚通知已提交（HTTP $(cat /tmp/secagent-notify-rollback.code 2>/dev/null)）：$(head -c 300 /tmp/secagent-notify-rollback.out 2>/dev/null)"
+}
+
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
   --status)  MODE=status ;;
@@ -130,12 +166,15 @@ fi
 log "决定回滚：现状 commit=${CUR_COMMIT:0:7} → last-known-good commit=${LKG_COMMIT:0:7} digest=${LKG_DIGEST:0:19}…"
 if [ "$DRY_RUN" = "1" ]; then
   log "[dry-run] 不真正执行回滚（若真跑会执行：bash $ROLLBACK_SCRIPT）"
+  # dry-run 也发通知：这样"通知链路通不通"能在不真回滚的前提下先验证一次
+  notify_rollback "${CUR_COMMIT:0:7}" "${LKG_COMMIT:0:7}" "dry-run: 连续 $FAILS 次不健康（$REASON）"
   save_state "$FAILS" "$LAST_ROLLBACK" "$REASON"
   exit 2
 fi
 
 if [ ! -x "$ROLLBACK_SCRIPT" ] && [ ! -f "$ROLLBACK_SCRIPT" ]; then
   log "[X] 找不到回滚脚本 $ROLLBACK_SCRIPT —— 只告警，请人工介入"
+  notify_rollback "${CUR_COMMIT:0:7}" "${LKG_COMMIT:0:7}" "回滚脚本缺失: $ROLLBACK_SCRIPT"
   save_state "$FAILS" "$LAST_ROLLBACK" "$REASON"
   exit 1
 fi
@@ -149,12 +188,14 @@ else
 fi
 if "${ROLLBACK_CMD[@]}" 2>&1 | sed 's/^/    /'; then
   log "回滚脚本返回成功，稍后复查健康"
+  notify_rollback "${CUR_COMMIT:0:7}" "${LKG_COMMIT:0:7}" "连续 $FAILS 次不健康（$REASON）→ 已回滚"
   save_state 0 "$(now)" "连续 $FAILS 次不健康（$REASON）→ 已回滚到 ${LKG_COMMIT:0:7}"
   sleep 25
   R2=$(probe) && log "回滚后健康：$R2" || log "[!] 回滚后仍不健康：$R2 —— 需要人工介入"
   exit 2
 else
   log "[X] 回滚脚本失败 —— 需要人工介入"
+  notify_rollback "${CUR_COMMIT:0:7}" "${LKG_COMMIT:0:7}" "回滚脚本执行失败: $REASON"
   save_state "$FAILS" "$LAST_ROLLBACK" "$REASON"
   exit 1
 fi

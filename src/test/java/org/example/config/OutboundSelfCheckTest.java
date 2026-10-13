@@ -38,7 +38,10 @@ class OutboundSelfCheckTest {
             "public-indexer",
             "ssh-block",
             "prometheus",
-            "milvus");
+            "milvus",
+            // 通知中枢的 webhook 出站：它也必须出现在自检里，
+            // 否则"通知没配"这件事在运行期完全不可见（URL 为空的表现就是什么都没发生）
+            "notify-webhook");
 
     private static OutboundSelfCheck selfCheck(long connect, long read, long call) {
         OutboundTimeouts timeouts = new OutboundTimeouts(connect, read, call);
@@ -149,6 +152,57 @@ class OutboundSelfCheckTest {
                 "prometheus 本次不发请求，必须显式标注：" + rowOf(line, "prometheus"));
         assertTrue(rowOf(line, "milvus").contains("DISABLED(vector.store=memory)"),
                 "未启用 Milvus 必须显式标注：" + rowOf(line, "milvus"));
+    }
+
+    /**
+     * 通知未配置时，启动自检必须显式写出来。
+     *
+     * <p>这条断言的意义不在于"日志好看"：{@code NOTIFY_WEBHOOK_URL} 留空的表现是
+     * <b>什么都没发生</b> —— 高危告警不会来，但也没有任何报错。如果自检不写，
+     * 运维会一直以为通知在工作，直到真的出事那天才发现手机从来没响过。
+     */
+    @Test
+    @DisplayName("通知未配置时自检显式写 DISABLED(通知未配置)，不许静默")
+    void notificationNotConfiguredIsExplicit() throws Exception {
+        OutboundSelfCheck check = selfCheck(3000, 12000, 15000);
+        org.example.notify.NotificationService notify =
+                new org.example.notify.NotificationService((url, body) -> null,
+                        new org.example.notify.NotificationAudit());
+        // webhook-url 保持空（默认值），即"功能关闭"
+        ReflectionTestUtils.setField(check, "notificationService", notify);
+
+        String row = rowOf(check.buildLine(), "notify-webhook");
+        assertTrue(row.contains("DISABLED(通知未配置"),
+                "配置为空时必须显式打印「通知未配置」，而不是留空：" + row);
+        assertTrue(row.contains("NOTIFY_WEBHOOK_URL"),
+                "要写清楚是哪个配置项没配，否则运维不知道该填什么：" + row);
+    }
+
+    /** 配了 webhook 时，自检要打出实际生效的调用预算与守卫（值取自传送器对象） */
+    @Test
+    @DisplayName("通知已配置时自检给出 webhook 的 connect/read/callTimeout 与 OutboundGuard")
+    void notificationConfiguredShowsEffectiveValues() throws Exception {
+        OutboundSelfCheck check = selfCheck(3000, 12000, 15000);
+        org.example.notify.NotificationService notify =
+                new org.example.notify.NotificationService((url, body) -> null,
+                        new org.example.notify.NotificationAudit());
+        ReflectionTestUtils.setField(notify, "webhookUrl", "https://example.invalid/hook");
+        ReflectionTestUtils.setField(notify, "minSeverityRaw", "HIGH");
+        ReflectionTestUtils.setField(check, "notificationService", notify);
+
+        org.example.llm.OutboundGuard guard = new org.example.llm.OutboundGuard();
+        ReflectionTestUtils.setField(guard, "defaultCooldownMs", 60000L);
+        ReflectionTestUtils.setField(guard, "maxInflightPerDependency", 2);
+        org.example.notify.HttpWebhookTransport transport =
+                new org.example.notify.HttpWebhookTransport(new OutboundTimeouts(3000, 12000, 15000), guard, 10000);
+        ReflectionTestUtils.setField(check, "notificationTransport", transport);
+
+        String row = rowOf(check.buildLine(), "notify-webhook");
+        assertTrue(row.contains("connect=3000ms"), row);
+        assertTrue(row.contains("read=12000ms"), row);
+        assertTrue(row.contains("callTimeout=10000ms"),
+                "调用预算要取自真正建 OkHttpClient 的传送器（这里被 app.notify.timeout-ms 收紧了）：" + row);
+        assertTrue(row.contains("OutboundGuard"), "webhook 出站必须复用 OutboundGuard：" + row);
     }
 
     /** 从一行自检里取出某个依赖的片段（到下一个依赖之前） */

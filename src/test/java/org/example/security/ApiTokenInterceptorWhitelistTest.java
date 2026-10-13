@@ -76,6 +76,11 @@ class ApiTokenInterceptorWhitelistTest {
         assertFalse(preHandle("POST", "/api/response/block"), "/api/response/block 需要鉴权");
         assertFalse(preHandle("GET", "/api/kb/pending"), "/api/kb/pending 需要鉴权");
         assertFalse(preHandle("GET", "/api/response/audit"), "/api/response/audit 需要鉴权");
+        // 通知中枢的入口绝不能在白名单里：否则任何人只要能连到 9900，
+        // 就能伪造"系统降级/看门狗已回滚"这类高危通知（通知通道本身就变成了攻击面）
+        assertFalse(preHandle("POST", "/api/notify/watchdog-rollback"),
+                "看门狗回滚触发点必须要求 API Token");
+        assertFalse(preHandle("GET", "/api/notify/state"), "/api/notify/state 需要鉴权");
     }
 
     @Test

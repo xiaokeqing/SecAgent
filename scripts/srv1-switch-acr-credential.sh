@@ -100,9 +100,12 @@ echo "== ④ 负向验证：推送必须【失败】（证明只有拉取权限�
 TAG="$VPC/$REPO_PATH:verify-pull-only-$TS"
 docker tag "$VPC/$REPO_PATH:stable" "$TAG" >/dev/null 2>&1
 if docker push "$TAG" >/dev/null 2>&1; then
-  bad "推送竟然成功了 —— 这个凭据权限过大（不是只读子账号）！"
-  info "请检查 RAM 策略：srv1-puller 只应有 cr:GetAuthorizationToken + cr:PullRepository"
+  bad "推送竟然成功了 —— 这个凭据权限过大（不是只读）！"
+  info "真实原因是 ACR 控制台里设的是【读写】固定密码；要只读请在访问凭证页改用只读密码/RAM 只读策略"
+  info "已把服务凭据回滚为原凭据（避免留下一个可推送的凭据）"
   docker rmi "$TAG" >/dev/null 2>&1 || true
+  # 【2026-10-13 修】失败必须回滚：原脚本只回滚"拉取失败"分支，推送成功时把读写凭据留在了服务目录
+  if [ -f "$BAK" ]; then cp -a "$BAK" "$NEW_CFG_DIR/config.json" && info "已回滚：$NEW_CFG_DIR/config.json ← $BAK"; fi
   exit 1
 else
   ok "推送被拒绝（符合预期：只读子账号推不了镜像）"
