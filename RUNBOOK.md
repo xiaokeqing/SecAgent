@@ -3104,3 +3104,210 @@ APP_WEBSTATS_FILE_PROBE_SECONDS=60  # 磁盘很忙时把 stat 频率调低
     webstats
 （本站代码只负责把端点做好；白名单在博客侧，由站主统一处理。）
 ```
+
+---
+
+## 30. 公开端点 `POST /api/public/tts`（文字转语音，2026-10-14 落地）
+
+```
+【它是什么】博客页面上的 🔊 按钮：把【站方预设的固定短语】或【刚刚生成过的回答】
+  合成成 mp3 播出来。匿名可达、会真花钱（调上游 TTS），所以有三道闸 + 内容寻址缓存。
+【默认关闭】app.tts.enabled 默认 false —— 站主还没给 Fish Audio 的 Key。
+  关掉时端点如实返回 503 TTS_DISABLED，前端据此【隐藏】🔊
+  （而不是显示一个点了必报错的按钮）。
+【⚠️ 真实上游未验证】本轮的端到端验证全部打的是【本地桩上游】（JDK 自带 HttpServer）。
+  下面的接口形状来自 Fish Audio 的公开 OpenAPI 描述（POST /v1/tts、Bearer 鉴权、
+  model 走请求头、JSON 体 {text, reference_id, format}、响应 audio/mpeg 二进制），
+  【没有】用真实 Key 打过一次真实上游 —— 没有 Key。站主拿到 Key 后，
+  第一件事是按 §30.7 的 curl 复跑一遍并核对形状。
+```
+
+### 30.1 三道闸（顺序就是成本顺序）
+
+| # | 闸 | 判据 | 不通过 |
+|---|---|---|---|
+| 0 | 总开关 | `app.tts.enabled=true` | 503 `TTS_DISABLED` |
+| 1 | **只认服务端给过的文本** | `phraseId` 命中服务端短语表 `app.tts.phrases.*`，**或** `textHash` 命中"最近生成过的回答"（sha512 前 32 位，进程内 LRU，容量 `APP_TTS_HISTORY_SIZE`，默认 200） | 400 `TEXT_NOT_ALLOWED`（两个都缺 / 都给了 / 短语表里没有 / textHash 不在记录里） |
+| 2 | 长度 | 字符数 ≤ `APP_TTS_MAX_CHARS`（默认 120；硬顶 600，配大了会被夹回） | 400 `TEXT_TOO_LONG` |
+| 3 | 每日额度 | 单 IP 每日 ≤ `APP_TTS_PER_IP_DAILY`（默认 20）；全局每日 ≤ `APP_TTS_GLOBAL_DAILY`（默认 500）。账本落盘 `data/tts-quota.json`，**重启不丢** | 429 `PER_IP_DAILY_LIMIT` / `GLOBAL_DAILY_LIMIT` |
+
+**为什么公开端点不许收自由文本**：匿名 + 花钱 + 能合成任意内容的口播 = 三件事凑齐就是一个
+"免费 TTS 接口"（还外带一个"让本站念任何话"的挂点）。所以文本只有两个来源：
+服务端短语表，或**服务端自己刚生成过、并被记录下来的回答**。
+答复里返回的 `ttsTextHash`（字段名固定）就是给前端 🔊 用的键。
+
+**缓存与额度的先后**：查缓存 → 命中直接返回（**不再调上游、也不吃每日额度**）→
+Key 缺失判定 → 每日额度 → 调上游。缓存命中不吃额度是刻意的：
+否则访客"重播一次"就少一次额度，而他完全看不出为什么。
+
+### 30.2 响应契约
+
+```
+成功：200 + Content-Type: audio/mpeg + Content-Type 由全站 encoding 过滤器追加 ;charset=UTF-8
+      Cache-Control: public, max-age=<app.public-api.cache-seconds>（默认 15）
+      X-Tts-Cache: MISS | HIT        ← 一眼看出"这次有没有花上游的钱"
+      X-RateLimit-Limit: 20          ← 与其它公开端点同一本频率账
+      body = 原始 mp3 字节（前端 fetch→blob / <audio> 直接用）
+失败：<400/429/502/503/504> + application/json（与其它公开端点同一个信封）：
+      {"code":400,"message":"必须给 phraseId 或 textHash（本端点不接受自由文本）",
+       "reason":"TEXT_NOT_ALLOWED"}
+      Cache-Control: no-store        ← 错误不被边缘/浏览器缓存（否则"明天恢复"要等缓存过期）
+```
+
+**为什么成功给字节、失败给 JSON（而不是把音频 base64 包进 JSON）**：音频是这个端点唯一的
+"数据"，包一层 JSON 只会让它膨胀 33% 并迫使前端多做一次解码；而错误必须能被人和页面按
+`code`/`reason` 处理。两种形状各自做最擅长的事，且**错误一律复用公开面既有的信封与 reason 口径**。
+
+### 30.3 reason 码表（前端按它决定显示什么）
+
+| `reason` | HTTP | 含义 / 前端该怎么做 |
+|---|---|---|
+| `TTS_DISABLED` | 503 | `app.tts.enabled=false`（或 Bean 未装配）→ **隐藏 🔊** |
+| `KEY_MISSING` | 503 | `APP_TTS_API_KEY` 为空 → 隐藏 🔊（站主侧：去配 Key） |
+| `TEXT_NOT_ALLOWED` | 400 | 不是短语、也不是记录过的回答 → 不要重试 |
+| `TEXT_TOO_LONG` | 400 | 超过 `max-chars` → 不要重试 |
+| `BAD_REQUEST` | 400 | `phraseId` 与 `textHash` 同时给了 → 只给一个 |
+| `PER_IP_DAILY_LIMIT` | 429 | 本来源今日额度用完 → 提示"明日恢复"，别自动重试 |
+| `GLOBAL_DAILY_LIMIT` | 429 | 全站今日额度用完 → 提示"明日恢复" |
+| `RATE_LIMITED` | 429 | 频率超限（每 IP 每分钟 20，与其它公开端点同一本账）→ 60 秒后重试 |
+| `UPSTREAM_TIMEOUT` | 504 | 上游超时 / 熔断冷却中 / 在飞已满 → 稍后重试（对前端是同一件事） |
+| `UPSTREAM_HTTP_<code>` | 502 | 上游非 2xx（**只有状态码**，不含上游原文） |
+| `UPSTREAM_BAD_BODY` | 502 | 上游 200 但空 body / 超大 / 声明长度超限 |
+| `UPSTREAM_IO` | 502 | 传输层失败（非超时） |
+
+**绝不透给前端的东西**：上游 Key（Authorization 头）、上游响应原文、上游 URL 细节。
+上游非 2xx 时响应片段只写服务端日志（截断 200 字符，且 401/403 **不打印 body** —— 与
+DeepSeek 链路同一纪律）。
+
+### 30.4 参数（`application.yml` / `.env.example` / `docker-compose.yml` 三处一致）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `app.tts.enabled` / `APP_TTS_ENABLED` | `false` | 总开关 |
+| `app.tts.voice-id` / `APP_TTS_VOICE_ID` | 空 | 上游音色/模型 id（`reference_id`）；空 = 用上游默认音色 |
+| `app.tts.model` / `APP_TTS_MODEL` | `s1` | 上游请求头 `model`（`s1` / `s2-pro`） |
+| `app.tts.base-url` / `APP_TTS_BASE_URL` | `https://api.fish.audio` | 上游基地址（自建代理时改） |
+| `app.tts.api-key` / `APP_TTS_API_KEY` | **空** | **只从环境变量注入**，绝不写默认值 |
+| `app.tts.max-chars` / `APP_TTS_MAX_CHARS` | `120` | 长度闸（硬顶 600） |
+| `app.tts.per-ip-daily` / `APP_TTS_PER_IP_DAILY` | `20` | 单 IP 每日次数 |
+| `app.tts.global-daily` / `APP_TTS_GLOBAL_DAILY` | `500` | 全局每日次数（换 IP 也绕不过） |
+| `app.tts.cache-dir` / `APP_TTS_CACHE_DIR` | `data/tts-cache` | 音频缓存目录 |
+| `app.tts.max-cache-mb` / `APP_TTS_MAX_CACHE_MB` | `64` | 缓存上限；超限按**最旧**淘汰 |
+| `app.tts.quota-file` / `APP_TTS_QUOTA_FILE` | `data/tts-quota.json` | 每日额度账本 |
+| `app.tts.history-size` / `APP_TTS_HISTORY_SIZE` | `200` | "最近生成过的回答"LRU 容量 |
+| `app.tts.phrases-file` / `APP_TTS_PHRASES_FILE` | `classpath:tts-phrases.yml` | 短语表位置（`classpath:` 或 `file:`） |
+
+⚠️ 与 `APP_QUOTA_*`/`APP_WEBSTATS_*` 同一个坑：`docker-compose.yml` 的 `environment` 段
+**已显式透传**上面全部 13 个 `APP_TTS_*` 键；只在 `.env` 里加一行而 compose 里没有透传行，
+会**不生效且不报错**。除 `APP_TTS_API_KEY`/`APP_TTS_VOICE_ID` 外，其余键**不要留空**
+（空字符串绑到 boolean/int 会让应用直接启动失败）。
+
+启动时打一行自检，核对它而不是只看配置文件（"配置改了但 Bean 没拿到"不会报错）：
+
+```
+TTS-SELFCHECK enabled=true voiceId=voice-abc model=s1 baseUrl=http://127.0.0.1:18099
+  key=SET phrases=4 maxChars=120 perIpDaily=2 globalDaily=500
+  cacheDir=target/tts-stub/e2e/cache maxCacheMb=64 quotaFile=... historySize=200
+```
+
+### 30.5 缓存位置与上限
+
+```
+键：sha256(voiceId + "\n" + text) → <cache-dir>/<hash>.mp3        （内容寻址）
+命中：直接返回字节，不调上游、不吃额度；顺带刷新 mtime（LRU 语义）
+淘汰：每次写入后统计目录大小，超过 max-cache-mb 时按【修改时间最旧】删，
+      至少保留刚写进去的那一个（否则新算出来的音频会在同一个请求里被自己删掉）
+读坏/写坏：单条缓存按"未命中"处理（绝不把损坏字节当音频发出去），只告警
+```
+
+### 30.6 怎么开 / 怎么关 / Key 放哪
+
+```bash
+# srv1: /opt/secagent/.env（600 权限；Key 绝不进 git、绝不写进 compose 默认值）
+APP_TTS_ENABLED=true
+APP_TTS_API_KEY=<站主从 https://fish.audio/app/api-keys 取的 Key>
+APP_TTS_VOICE_ID=<站主在 fish.audio 上创建的音色 id>
+# 改完按发布链重建容器（★不要用 docker compose up 手工重建，会丢 digest 引用）
+# 核对：docker compose logs --tail=200 app | grep TTS-SELFCHECK   → key=SET
+# 关掉：APP_TTS_ENABLED=false（端点回到 503 TTS_DISABLED，前端隐藏 🔊）
+# 临时省钱：把 APP_TTS_GLOBAL_DAILY 调小（例如 20）；额度账本按天自动清零
+```
+
+### 30.7 实测（本地桩上游，2026-10-14；真起应用 + 真 curl）
+
+桩上游 = JDK 自带 `com.sun.net.httpserver.HttpServer`（`target/tts-stub/TtsStub.java`，
+**零新增依赖**），每收到一次请求打印一行 `STUB-CALL #N` 并写 `calls.txt`。
+应用以 `APP_TTS_BASE_URL=http://127.0.0.1:18099`、`APP_TTS_PER_IP_DAILY=2`、
+`APP_TTS_MAX_CHARS=120`、`APP_TTS_PHRASES_FILE=file:.../phrases.yml`（4 条短语）启动：
+
+```
+[1] 成功（短语命中）
+  $ curl -s -D - -X POST .../api/public/tts -d '{"phraseId":"welcome"}'
+  HTTP/1.1 200
+  Content-Type: audio/mpeg;charset=UTF-8      ← charset 来自全站 server.servlet.encoding.force=true
+  Cache-Control: public, max-age=15
+  X-Tts-Cache: MISS
+  X-RateLimit-Limit: 20
+  body = ID3-STUB-AUDIO-CALL-1                （21 字节，桩上游发的字节原样透传）
+  桩计数: calls=1
+
+[2] 缓存命中（同一短语第二次）
+  HTTP/1.1 200 / X-Tts-Cache: HIT / body 与 [1] 逐字节相同
+  桩计数: calls=1                             ← 【端到端证明】缓存命中没有再调上游
+
+[3] 闸① 自由文本
+  {"code":400,"message":"必须给 phraseId 或 textHash（本端点不接受自由文本）","reason":"TEXT_NOT_ALLOWED"}
+  HTTP=400        桩计数: calls=1
+
+[4] 闸② 长度超限（短语 208 字符 > 120）
+  {"code":400,"message":"文本长度 208 超过上限 120 字符","reason":"TEXT_TOO_LONG"}
+  HTTP=400        桩计数: calls=1
+
+[5] 换一个短语 → 真调上游，单 IP 额度用满 2/2
+  HTTP/1.1 200 / X-Tts-Cache: MISS          桩计数: calls=2
+
+[6] 闸③ 单 IP 日额度用尽
+  {"code":429,"message":"本来源今日语音额度已用完（上限 2 次/天），明日恢复","reason":"PER_IP_DAILY_LIMIT"}
+  HTTP=429        桩计数: calls=2             ← 被额度挡下时不调上游
+
+额度账本 data/tts-quota.json（落盘，重启不丢）：
+  {"schemaVersion":1,"date":"2026-10-14","globalUsed":2,"perIp":{"127.0.0.1":2}}
+缓存目录：7658028f....mp3(21B) / c4b50155....mp3(21B)      ← 两个短语各一份
+
+[7] 重启应用（同一个 quota-file / cache-dir）后再打一次
+  {"code":429,...,"reason":"PER_IP_DAILY_LIMIT"}   ← 额度【重启没丢】
+  {"phraseId":"welcome"} → HTTP 200 / X-Tts-Cache: HIT   ← 缓存【重启没丢】
+  桩计数仍是 calls=2（重启后这两次都没调上游）
+```
+
+**测试**（进 CI 门禁，全部零新增依赖；桩同样是 JDK HttpServer）：
+
+| 测试类 | 条数 | 钉住的验收点 |
+|---|---|---|
+| `org.example.publicapi.TtsServiceTest` | 15 | 短语命中形状、自由文本/未知 id/非法 hash 全拒且**零出网**、长度闸、单 IP 与全局额度、额度落盘跨实例、缓存命中不调上游且不吃额度、按最旧淘汰、`TTS_DISABLED`、`KEY_MISSING`、上游 500/401/空 body/超时归一化、LRU 容量 |
+| `org.example.publicapi.TtsEndpointTest` | 9 | MVC 契约：200 字节 + `audio/mpeg` + 缓存头、HIT 第二次桩计数不变、400/429/502/503 的 JSON 信封与 reason、**响应零 IP**、上游原文与 Key 不外泄、限流与其它公开端点共用 |
+| `org.example.config.TtsConfigContractTest` | 7 | yml/compose/.env **三处键齐全**、默认值、短语表可解析、值对象夹回、`describe()` 不打印 Key、`ApplicationContextRunner` 装配成立（`TtsConfig` 恰好一个 Bean） |
+
+`mvn -B test`：**540 run / 0 fail / 4 skip**（本轮新增 31 条；改造前 509）。
+
+### 30.8 已知局限 / 疑虑（如实列，别把"CI 全绿"读成"跟真实上游对过"）
+
+1. **真实 Fish Audio API 未验证**：没有 Key，一次真实调用都没发生过。接口形状来自其公开
+   OpenAPI 描述（`POST /v1/tts`、`Authorization: Bearer`、`model` 走**请求头**、
+   体 `{text, reference_id, format:"mp3"}`、响应 `audio/mpeg` 二进制）。**是否核实过**：
+   核实过"文档里的形状"，**没有**核实过真实上游行为（真实音色 id 的取值、真实错误码分布、
+   真实音频字节流是否分块）。拿到 Key 后按 §30.7 复跑一遍再对外开 🔊。
+2. **成功响应的 `charset=UTF-8`**：全站 `server.servlet.encoding.force=true` 的副作用
+   （既有 `/api/public/latest`、`/api/health` 同样带 charset）。媒体类型仍是 `audio/mpeg`，
+   播放器忽略该参数；测试按"媒体类型兼容"断言，不假装线上是逐字节相同的那串头。
+3. **额度账本是按天的进程内计数 + 落盘**：多实例部署时每个实例各写各的账本文件
+   （当前是单实例部署，所以不构成问题）。要严格跨实例，需要把计数挪到共享存储 —— 本轮没做。
+4. **`textHash` 的 LRU 重启即空**：刻意不落盘（落盘等于把用户可见的回答原文写进磁盘）。
+   重启后旧回答的 🔊 会返回 400 `TEXT_NOT_ALLOWED`（前端应把 🔊 与当次回答一起渲染）。
+5. **短语表读不到时按空表处理（fail-closed）**：只影响 phraseId 路径，打 WARN 不静默；
+   自检行里的 `phrases=N` 就是核对点。
+6. **额度落盘失败只告警**：本进程内的计数仍然生效，但"重启后沿用今天已用额度"这一条会失效
+   （ERROR 日志）。取舍：一次磁盘抖动不该让功能整体不可用。
+7. **没做的事**：不做自由文本、不做流式/边合成边播、不做多音色选择、不做上传音色 ——
+   这些都是刻意的非目标，不是"还没做"。
+
