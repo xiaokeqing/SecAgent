@@ -115,8 +115,13 @@ EOF
       --restart unless-stopped \
       --memory 128m --cpus 0.3 --pids-limit 256 \
       $PORTARGS alpine:latest sh -c '
-        for p in '"$(echo $PORTS | tr ' ' ',')"'; do
-          ( while true; do nc -l -p "$p" -e /bin/echo "decoy" >/dev/null 2>&1 || nc -l -p "$p" >/dev/null 2>&1; done ) &
+        # 【2026-10-13 踩坑修正】这里原来写成 `for p in '"$(echo $PORTS | tr " " ",")"'`，
+        # 会把端口拼成 "21,23,1433,…" 一个词，nc 收到非法端口立刻退出、while 空转，
+        # 结果容器看着在跑（Up）但**一个端口都没监听**，外面连进来是 RST。
+        # 正确写法：直接展开空格分隔的端口列表（外层 shell 展开，内层逐个监听）。
+        # 另外 busybox 的 nc 不支持 -e，别再依赖它。
+        for p in '"$(echo $PORTS)"'; do
+          ( while true; do nc -l -p "$p" >/dev/null 2>&1 || sleep 1; done ) &
         done
         wait' >/dev/null 2>&1 && ok "诱饵容器已启动" || warn "诱饵容器启动失败（可能需要先 docker pull alpine）"
     echo "== DOCKER-USER 放行这些端口（保持其余规则不变） =="
