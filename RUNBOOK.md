@@ -2615,9 +2615,61 @@ mvn -B test
 | 修复前基线（线上） | `/alerts` 抽样命中明文 | **12/12 轮、24 处**（`passw0rd`/`iloveyou`/`fuckyou`/`shadow`/`dragon`） |
 | 修复后（线上） | `/alerts` 抽样命中明文 | 见下方实测（要求 **0/30、0 处**） |
 | `/honeypot` 未变 | 冻结串逐字节 + 抽样明文命中 | 冻结串仍绿；明文命中恒 0 |
-| 其余端点未破 | `/overview` `/latest` `/stories` `/story` `/geo` `/webstats` 等 200 + 结构不变 | 见下方实测 |
+| 其余端点未破 | `/overview` `/latest` `/stories` `/story` `/geo` `/webstats` 等 200 + 结构不变 | 实测：7 个既有端点键签名逐一相同；`/stories` `/story` 上线后 200 |
 
-：容器守卫 / 反向心跳 / 漂移巡检 / 备份加密（2026-10-13 落地，2026-10-13 收口补录）
+#### 落实记录（2026-10-14 实际发布的那一版）
+
+| 项 | 实测 |
+|---|---|
+| 上线 commit | `7d2c216`（生产修复）+ `7599dd2`（CI 修复，见下） |
+| 修复前基线 | `/alerts` 连续 12 轮 **每轮都命中**、合计 **24 处明文**（`passw0rd`/`iloveyou`/`fuckyou`/`shadow`/`dragon`）；`/honeypot` 同批 0 处 |
+| 修复后（线上 `7599dd2`） | `/alerts` 连续 **30 轮 × 15 秒**：`alerts_rounds_with_plaintext=0`、`alerts_total_plaintext_hits=0`；`/honeypot` 同批 0 处 |
+| 修复仍然"真的在脱敏" | 抽样期间聚合流里**仍有 3 条**蜜罐"登录成功"告警，`title`/`ruleName` 都是 `口令=[口令已隐藏]`（修复后 `/alerts` 响应里 `[口令已隐藏]` 出现 6 次）—— 不是"告警没了所以看着干净" |
+| 下钻 | `/api/public/alerts/{aggId}` 对"含口令"的 aggId 复测 200、明文 0（另 2 个 aggId 因滚动窗口已挪动返回 404，属端点文档写明的正常行为） |
+| `/honeypot` 未变 | 字段集合一致、`note` 逐字节一致、`ipDisclosure` 逐字节一致、`timeline` 40 条且隐藏形态都在、四个数组的 **entry schema 逐一相同**（计数/口令长度随真实数据自然增长，不是契约变化） |
+| 其余端点未破 | `/overview` `/latest` `/alerts` `/honeypot` `/audit` `/geo` `/webstats` 修前修后 **键签名逐一相同**；`/stories` `/story` 在旧镜像上 404（该功能晚于 `c07fd27` 才入库），新镜像上 200 且明文 0 |
+| 8 个端点整段响应体正则扫描 | 明文口令字段 **全部 0** |
+
+#### 发布链为什么晚了：真正的闸门是单元测试，**密钥扫描一直是绿的**（2026-10-14 CI 复盘）
+
+修复本身是好的，但**镜像整整一个小时没能产出**，原因不在修复，而在 CI。这段必须写下来，
+因为第一轮排查**猜错了方向**：
+
+1. **现象**：`7d2c216` push 后 ACR `:stable` 一直停在 `c07fd27`，线上一直泄露。
+2. **错误的第一判断**：以为是 `ci.yml` 的 **gitleaks 密钥扫描**拦了镜像，于是加了一条
+   `.gitleaks.toml` 白名单、并改了一条注释（commit `ae867b4` / `a4c9e37`）。
+   **这个判断是错的**（这两条提交无害但没必要，保留不回退，看到的人别误以为 gitleaks 拦过构建）。
+3. **实测证据（从 srv1 的公网 IP 打 GitHub API 拿到 run/job 明细，本机 api.github.com 配额已耗尽）**：
+   - `Build & Push Image` 失败的步骤是 **"5. 全量测试（不过就不推镜像）"**；
+   - `CI` 失败的 job 是 **「单元测试」**；
+   - **「密钥扫描」每个 run 都是 `success`**；
+   - 分界点很清楚：`c07fd27` = success，`53e78df` / `77197da` / `7d2c216` / `ae867b4` / `a4c9e37` **全部 failure**。
+   另外用真 gitleaks 8.28.0 在本地复算：按 push 区间扫（`--log-opts`）**0 命中**，全历史扫的 23 处
+   **全是既有**（`srv2-*.sh` 的 `curl-auth-user` 等），没有一处来自新测试文件。
+4. **真根因 = 时区**：`53e78df` 引入的 `PublicApiStoriesEndpointTest` 里，
+   告警段的夹具时间是**固定值**（`2026-10-14 00:10:00`），而处置审计段用的是**相对现在**的
+   `now-30m`（夹具刻意用相对时间，见 `AttackStoryFixtures.writeAudit` 的注释）。
+   断言把 `firstSeen`（= `min(两者)`）**钉死成固定值** → 开发机 CST(+8) 下成立，
+   GitHub Actions 的 **UTC** 下 `now-30m` 早 8 小时、变成更早的那条 → 断言必红 →
+   `mvn -B test` 失败 → **两个 workflow 的测试步骤同时红 → 永不产出镜像**。
+   本地一行命令就能复现：`mvn -B -Dtest=PublicApiStoriesEndpointTest -DargLine=-Duser.timezone=UTC test`
+   → `$.data.sources[0].firstSeen expected:<2026-10-14 00:10:00> but was:<2026-10-13 18:07:06>`。
+5. **修复**：只改测试断言（`7599dd2`，一个文件、不碰生产逻辑）——期望值改成"算出来的 `min`"。
+   之后 `CI` 与 `Build & Push Image` **双双 success**，镜像正常产出。
+
+**教训（两条，比这次的具体修复更值钱）**：
+
+- **凡是"本地绿、CI 红"，第一个要查的环境差异就是时区（UTC vs +8）与默认字符集**，
+  而不是先怀疑密钥扫描。**单元测试才是发布链的硬闸门**（`ci.yml` 的 `unit-tests`、
+  `build-image.yml` 的"全量测试"），`secret-scan` 与 `trivy` 都不在镜像产出的必经路径上
+  —— 排查时要先看**到底哪个 job/步骤红了**，别从"最像安全问题的那个"开始猜。
+  拿不到 CI 日志时，**从未被限流的那台机器（srv1/srv2）的公网 IP 打 GitHub API** 是一条可行路径。
+- **测试里不要把"固定时间戳"和"相对现在"混着用**。两者谁更早会随时区翻转；
+  要断言 `min/max` 就得**算出来**再比（`7599dd2` 的做法），不要钉死成一个环境下的观测值。
+  同类隐患的排查口径：一个测试文件里**同时出现** `LocalDateTime.now()`/`OffsetDateTime.now()`
+  与硬编码的 `YYYY-MM-DD HH:MM:SS` 断言，就是可疑点。
+
+## 28. 主机侧四项加固：容器守卫 / 反向心跳 / 漂移巡检 / 备份加密（2026-10-13 落地，2026-10-13 收口补录）
 
 > **【补录说明】** 本节内容原先**只存在于 srv1 的 `/opt/secagent`**（服务器侧分支提交 `4f652c3`，从未推送到 GitHub）。
 > 服务器侧那份 RUNBOOK 把它编成"§22"，与仓库里的 §22（状态异地备份）**编号撞车**，两份 RUNBOOK 因此互有缺失
