@@ -1,0 +1,80 @@
+# ============================================================
+# srv2（腾讯云）Dionaea 蜜罐 —— 对外只提供 SMB / MSSQL / MySQL 协议仿真
+# （镜像本身还能仿真 FTP/HTTP(S)/TFTP/SIP/…，但那些端口不发布，见下方"端口"一节）
+# ------------------------------------------------------------
+# 为什么这里每一条都是硬约束（不是装饰）：
+#
+#  · image 固定 tag（0.11.0），禁止 latest。
+#    digest: sha256:6f06d0a6035c865cb60ef51bd96ff3b1f25ee4bfcd852dad3f551bc2d93464ca
+#
+#  · 必须挂在【已有的】cowrie_honeypot 这套隔离网络上（external network）。
+#    该网段的 egress 被 DOCKER-USER DROP（scripts/srv2-cowrie-egress-lock.sh）。
+#    **绝不能**给它单独的 bridge/masquerade 网络，否则它就能主动外连当跳板。
+#
+#  · read_only: true —— 根文件系统只读。
+#    实测容器真的只写这几个位置，所以只需要三个可写挂载点：
+#      /opt/dionaea/etc  配置（首次从镜像 template 播种）
+#      /opt/dionaea/var  日志 + dionaea.json + sqlite + bistreams + 下载样本
+#      /tmp              tmpfs（16MB，够用；不给就是只读，dionaea 会报错）
+#
+#  · no-new-privileges —— 容器内进程无法通过 setuid/setgid 提权。
+#
+#  · 资源上限：内存 384m / CPU 0.5 核 / 256 进程。
+#    宿主只有 3.7GB，实测 Dionaea 空载只用 ~33MB，
+#    但上限是"失控时牺牲它自己，别拖死整台机器"的保险丝。
+#
+#  · 端口只发布协议仿真端口，不发布任何管理端口。
+#    【范围由站主 2026-10-14 明确划定】Dionaea 只接管它真的会仿真的三个：
+#      445->445 SMB   /  1433->1433 MSSQL  /  3306->3306 MySQL
+#    21/23/6379/8080/8443/27017 **继续留给 secagent-decoy**（既有行为不变）。
+#    9200 永不碰（那是 srv2 上真 indexer 的端口）。
+#    容器内部还会 listen 21/80/443/135/1883/11211/27017 等，但**不发布** → 外部摸不到，
+#    所以"只暴露这三个协议端口"是成立的。
+#
+#  · 日志：容器自己的 stdout 也设上限（json-file 10m×3），
+#    文件日志由 /etc/logrotate.d/secagent-dionaea 轮转。
+# ============================================================
+services:
+  dionaea:
+    image: dinotools/dionaea:0.11.0
+    container_name: dionaea
+    hostname: dionaea
+    restart: unless-stopped
+
+    read_only: true
+    mem_limit: 384m
+    cpus: 0.5
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+
+    # 配置与数据都由安装脚本预置好了，不需要 entrypoint 再"首次初始化"
+    # （只读根文件系统下它也没权限初始化）
+    environment:
+      - DIONAEA_SKIP_INIT=1
+
+    ports:
+      - "445:445"     # SMB
+      - "1433:1433"   # MSSQL   （从 secagent-decoy 移交）
+      - "3306:3306"   # MySQL   （从 secagent-decoy 移交）
+
+    volumes:
+      - /opt/dionaea/etc:/opt/dionaea/etc
+      - /opt/dionaea/var:/opt/dionaea/var
+
+    tmpfs:
+      - /tmp:rw,size=16m,mode=1777
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    networks:
+      - honeypot
+
+networks:
+  honeypot:
+    external: true
+    name: cowrie_honeypot

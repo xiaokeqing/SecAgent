@@ -1,0 +1,21 @@
+# ============================================================
+# srv2：Dionaea 的磁盘上限（bistreams / 下载样本 / sqlite）
+# 安装位置：/etc/cron.d/secagent-dionaea-cleanup
+# ------------------------------------------------------------
+# 为什么要它：
+#   Dionaea 会把每一条 TCP 连接的原始字节流 dump 到
+#     /opt/dionaea/var/lib/dionaea/bistreams/<日期>/
+#   这在取证时很有用，但它【没有内建清理】，被测得越多长得越快，
+#   19GB 可用磁盘会被慢慢吃掉。日志有 logrotate 管，bistreams 没有。
+#
+# 清理口径（见 scripts/srv2-dionaea-cleanup.sh）：
+#   · bistreams  : 保留最近 2 天；目录总量超过 1GB 时从最旧的开始删
+#   · binaries   : 下载到的样本连留存（是蜜罐最有价值的产物）——
+#                  总量只做"报表 + 超 2GB 时报警"，不自动删
+#   · 每次跑完把用量写进 /opt/secagent/logs/dionaea-cleanup.log
+#
+# 时间刻意避开整点（04:00 是备份/部署窗口），并且用 root 跑。
+# ============================================================
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 4 * * * root /usr/local/sbin/srv2-dionaea-cleanup.sh --apply >> /opt/secagent/logs/dionaea-cleanup.log 2>&1

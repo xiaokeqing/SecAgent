@@ -1,0 +1,117 @@
+<!--
+  ============================================================
+  Dionaea 蜜罐（srv2）—— manager 侧自定义规则
+  ------------------------------------------------------------
+  装机位置（srv2）：
+    /opt/wazuh/config/wazuh_cluster/rules/srv2_dionaea_rules.xml
+    （容器里是 /var/ossec/etc/rules/，是 bind mount，文件落在宿主上）
+  落盘方式：scripts/srv2-dionaea-wire-wazuh.sh --rules
+    —— 备份 -> 写 -> wazuh-analysisd -t 校验 -> 失败自动回滚 -> 重启 -> 核对
+       （踩过的坑：规则语法错会让 wazuh-analysisd 直接起不来，
+        也就是"加一条规则把整个 SIEM 弄挂"，所以必须有 -t 这道门）
+
+  为什么规则写在 manager：
+    Wazuh 的规则匹配在 manager（analysisd），agent/容器只负责采集。
+
+  ------------------------------------------------------------
+  匹配依据：dionaea.json 的真实结构（2026-10-14 在 srv2 实测抓取）
+  ------------------------------------------------------------
+    {"connection": {"protocol": "mysqld", "transport": "tcp", "type": "accept"},
+     "dst_ip": "172.19.0.4", "dst_port": 3306, "src_hostname": "",
+     "src_ip": "203.0.113.9", "src_port": 51234,
+     "timestamp": "2026-10-14T00:00:00.000000"}
+    带凭据时另加 credentials / ftp.commands / p0f 键。
+
+  connection.protocol 实测取值：smbd / mssqld / mysqld / httpd / ftpd /
+    ftpdatalisten（TCP），TLS 的走 tls_accept 但 protocol 仍是服务名。
+  connection.type 实测取值：listen / accept / connect / reject。
+
+  【写作要点 1】一律用 <decoded_as>json</decoded_as> + <field name="...">。
+    绝不能把 <regex> 和 <decoded_as> 写在同一个 rule 里 ——
+    实测会报 "Syntax error on tag 'regex' in rule ..."，analysisd 直接拒绝启动。
+
+  【写作要点 2】JSON 的字段名用点号写嵌套：connection.protocol = 上面 JSON 里的
+    connection -> protocol。这一点必须用 wazuh-logtest 实测确认（安装脚本里有这道门）。
+
+  【写作要点 3】只写"会真的触发"的规则。
+    log_json.py 只实现了 connection 事件 / ftp 命令 / ftp、mssql、mysql 登录凭据 / p0f
+    这几类 handler，**没有 download.offer / download.complete 的 handler**。
+    所以"下载到样本文件"这类规则如果挂在 dionaea.json 上，就是一条永远不触发的死规则
+    （本项目已经吃过"看起来在监控、其实没数据"的亏）。样本下载事件只存在于文本日志
+    dionaea.log 里，本文件因此【不写】下载规则；如实记录在 RUNBOOK。
+
+  规则清单：
+    100300  SMB 连接/认证尝试（smbd accept）
+    100301  MSSQL 连接尝试（mssqld accept）
+    100302  MySQL 连接尝试（mysqld accept）
+    100310  同一来源 60 秒内 6 次以上 Dionaea 连接 -> 扫描/爆破升级
+  ============================================================
+-->
+<group name="secagent,dionaea,honeypot,">
+
+  <!-- ===== SMB（445）=====
+       Dionaea 的 SMB 仿真会做完整的 negotiate/session-setup，所以"能连上"这件事
+       本身比普通端口扫描更有信息量（说明扫描器在真的讲 SMB 协议，不只是 SYN）。 -->
+  <rule id="100300" level="6">
+    <decoded_as>json</decoded_as>
+    <field name="connection.protocol">^smbd$</field>
+    <field name="connection.type">^accept$</field>
+    <description>蜜罐(Dionaea): SMB 连接/认证尝试 来源=$(src_ip):$(src_port)</description>
+    <mitre>
+      <id>T1021.002</id>
+    </mitre>
+    <group>secagent,dionaea,honeypot,smb,</group>
+  </rule>
+
+  <!-- ===== MSSQL（1433）===== -->
+  <rule id="100301" level="6">
+    <decoded_as>json</decoded_as>
+    <field name="connection.protocol">^mssqld$</field>
+    <field name="connection.type">^accept$</field>
+    <description>蜜罐(Dionaea): MSSQL 连接尝试 来源=$(src_ip):$(src_port)</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+    <group>secagent,dionaea,honeypot,mssql,</group>
+  </rule>
+
+  <!-- ===== MySQL（3306）===== -->
+  <rule id="100302" level="6">
+    <decoded_as>json</decoded_as>
+    <field name="connection.protocol">^mysqld$</field>
+    <field name="connection.type">^accept$</field>
+    <description>蜜罐(Dionaea): MySQL 连接尝试 来源=$(src_ip):$(src_port)</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+    <group>secagent,dionaea,honeypot,mysql,</group>
+  </rule>
+
+  <!-- ===== 复合：同一来源短时间内多次连接 -> 扫描/爆破 =====
+       单次连接可能只是背景噪声；同一 IP 在 60 秒内打到 6 次，
+       就值得当"有人在系统性地打这台机器"来看。
+
+       【两个实测踩出来的写法要点，别改回去】
+       1) <same_source_ip /> 在这里【不管用】。
+          Wazuh 的 srcip 字段是给 syslog 类解码器用的；dionaea.json 走的是
+          json 解码器，字段叫 src_ip，不会填进内部 srcip ——
+          于是带 <same_source_ip/> 的复合规则【永远不会触发】。
+          实测：从 srv1 连打 16 次（全都各自产生了 100301/100302 告警），
+          100310 一条都没有。正确写法是 <same_field>src_ip</same_field>
+          （Wazuh 自带规则集也是这么干的：0580-win-security_rules.xml 里
+            rule 60204 用 <same_field>win.eventdata.ipAddress</same_field>）。
+       2) <if_matched_group> 里【不要写尾随逗号】。
+          Wazuh 自带规则集的写法是 <if_matched_group>authentication_failed</if_matched_group>，
+          不带逗号；带上 ',' 不是官方形态。
+       用 <if_matched_group> 而不是绑死某一条 sid，这样 SMB/MSSQL/MySQL 混着打也能聚合。 -->
+  <rule id="100310" level="12" frequency="6" timeframe="60">
+    <if_matched_group>dionaea</if_matched_group>
+    <same_field>src_ip</same_field>
+    <description>蜜罐(Dionaea): 同一来源 60 秒内多次协议连接（扫描/爆破）来源=$(src_ip)</description>
+    <mitre>
+      <id>T1595</id>
+    </mitre>
+    <group>secagent,dionaea,honeypot,scan,</group>
+  </rule>
+
+</group>

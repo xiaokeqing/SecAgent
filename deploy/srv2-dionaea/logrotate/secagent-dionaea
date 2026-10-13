@@ -1,0 +1,32 @@
+# ============================================================
+# srv2：Dionaea 日志轮转与上限
+# 安装位置：/etc/logrotate.d/secagent-dionaea
+# ------------------------------------------------------------
+# 为什么用 copytruncate（不是默认的 rename+create）：
+#   dionaea 启动后一直持有日志文件的 fd，不会在 rename 后重新打开新文件。
+#   如果用默认的 rename+create，dionaea 会继续往改名后的 dionaea.log.1 写，
+#   "轮转"等于没发生，文件还是会无限长。
+#   copytruncate = 先复制成 .1 再把原文件截断为 0 → dionaea 的 fd 继续有效。
+#   代价：复制和截断之间有个极小窗口，理论上可能丢几行（如实记录）。
+#
+# 上限：daily + maxsize 32M + rotate 5
+#   → 单个文件最大 32MB，历史最多 5 份（压缩后）+ 当前文件
+#   → dionaea.log 最坏约 32*6 = 192MB，实测空载增速约 11MB/天。
+#
+# 为什么不 create：copytruncate 模式下文件从不被重建，
+#   权限/属主保持不变（dionaea 以 uid 1000 写），不需要也不会执行 create。
+# ============================================================
+/opt/dionaea/var/log/dionaea/dionaea.log
+/opt/dionaea/var/log/dionaea/dionaea.json
+/opt/dionaea/var/log/dionaea/dionaea-errors.log {
+    daily
+    maxsize 32M
+    rotate 5
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d-%s
+}

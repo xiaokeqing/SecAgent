@@ -43,6 +43,17 @@ PATTERNS=(
   "/var/ossec/etc/ossec.conf"
   "/var/ossec/etc/rules/srv1_local_rules.xml"
   "/opt/wazuh-docker/single-node/config/wazuh_cluster/rules/srv1_local_rules.xml"
+  # ===== 2026-10-14 新增：Dionaea 蜜罐（srv2）的落点 =====
+  # 为什么这几个要进来：它们都是"手改过 /etc 或 /opt"的落点，
+  # 出错时的表现都很隐蔽（规则写错 SIEM 停摆、隔离脚本被改回 -I 1 就又出洞），
+  # 所以必须和其他落点一样进基线。
+  "/usr/local/sbin/srv2-dionaea-*.sh"          # 安装/自检/启停/清理
+  "/usr/local/sbin/srv2-honeypot-egress-probe.sh"  # 隔离实测探针
+  "/usr/local/sbin/cowrie-egress-lock.sh"      # 蜜罐网段 egress 锁定（注释里记着那次洞的教训）
+  "/opt/dionaea/*.yml"                         # docker-compose.yml
+  "/opt/dionaea/etc/dionaea/dionaea.cfg"       # 被 install 脚本改过 default.levels
+  "/opt/dionaea/etc/dionaea/ihandlers-available/log_json.yaml"  # 修过路径的 JSON handler
+  "/opt/wazuh/config/wazuh_cluster/rules/srv2_dionaea_rules.xml"
 )
 
 collect() { # 输出 "sha256  path" 行，按路径排序

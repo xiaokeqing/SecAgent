@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: none
+# SPDX-License-Identifier: CC0-1.0
+#
+# ============================================================
+# sec-agent: Dionaea JSON log handler.
+# This is a patched copy of the image's
+#   /opt/dionaea/template/etc/dionaea/ihandlers-available/log_json.yaml
+# installed to the same path by scripts/srv2-dionaea-deploy.sh.
+#
+# ------------------------------------------------------------
+# WHY IT HAD TO BE PATCHED (upstream ships):
+#       - file://var/lib/dionaea/dionaea.json
+#   dionaea/log_json.py does: urlparse(url).path
+#     urlparse("file://var/lib/dionaea/dionaea.json")
+#       -> netloc = "var", path = "/lib/dionaea/dionaea.json"
+#   so it tries to open /lib/dionaea/dionaea.json, which does not exist.
+#   Observed on srv2 2026-10-14 in dionaea.log:
+#       log_json ...-critical: Unable to open file /log/dionaea/dionaea.json
+#       Error message 'No such file or directory'
+#   => dionaea.json was NEVER created, so a Wazuh localfile on it would
+#      look configured while receiving nothing. An absolute path
+#      (file:/// = empty netloc) is required.
+#
+# ------------------------------------------------------------
+# WHY THIS FILE MUST STAY PURE ASCII:
+#   dionaea decodes these YAML files as ASCII. Non-ASCII bytes here raise
+#       UnicodeDecodeError: 'ascii' codec can't decode byte 0xe6 ...
+#   and the ihandler never starts. Keep it ASCII; put prose in
+#   deploy/srv2-dionaea/README.md instead.
+#
+# ------------------------------------------------------------
+# OUTPUT FORMAT (one JSON object per line, written when a connection
+# is freed, i.e. on close; not on accept):
+#   {"connection": {"protocol": "smbd", "transport": "tcp", "type": "accept"},
+#    "dst_ip": "172.19.0.4", "dst_port": 445, "src_hostname": "",
+#    "src_ip": "203.0.113.9", "src_port": 51234,
+#    "timestamp": "2026-10-14T00:00:00.000000"}
+#   Extra keys appear when relevant: credentials, ftp.commands, p0f.
+#
+#   NOTE: log_json.py implements handlers only for connection events
+#   (tcp/tls/udp listen/accept/connect/reject/free), ftp commands,
+#   ftp/mssql/mysql login credentials and p0f. It has NO handler for
+#   dionaea.download.offer / dionaea.download.complete, so a
+#   "malware sample downloaded" alert CANNOT be built on this JSON feed
+#   (it would be a rule that never fires). The download incidents only
+#   exist in the text log var/log/dionaea/dionaea.log.
+# ============================================================
+- name: log_json
+  config:
+    handlers:
+      - file:///opt/dionaea/var/log/dionaea/dionaea.json

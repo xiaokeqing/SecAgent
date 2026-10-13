@@ -157,7 +157,9 @@ EOF
     #   而蜜罐自己发出的包会先被 DROP 命中 —— 这才是我们想要的顺序。
     # 同时用 `-C` 先判断，避免重复执行时插出一堆重复规则。
     for p in $PORTS; do
-      if iptables -C DOCKER-USER -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+      # 注意 -C 的 stdout 也要吞掉：iptables 在"规则存在"时会把规则原文打到 stdout，
+      # 看起来像报错，容易误导（2026-10-14 观察到）。
+      if iptables -C DOCKER-USER -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1; then
         info "tcp/$p 已在 DOCKER-USER 放行（跳过）"
       else
         iptables -A DOCKER-USER -p tcp --dport "$p" -j ACCEPT 2>/dev/null && info "放行 tcp/$p（DOCKER-USER，追加到链尾）"

@@ -3311,3 +3311,251 @@ APP_TTS_VOICE_ID=<站主在 fish.audio 上创建的音色 id>
 7. **没做的事**：不做自由文本、不做流式/边合成边播、不做多音色选择、不做上传音色 ——
    这些都是刻意的非目标，不是"还没做"。
 
+## 31. ⑧ 蜜罐升级：Dionaea 上线（2026-10-14 落地，srv2）
+
+> 详细操作手册（含 kill switch / 回滚 / 目录速查）另有一份随容器一起装到服务器：
+> `deploy/srv2-dionaea/README.md` → `/opt/dionaea/README.md`。本节是 RUNBOOK 口径。
+
+### 31.1 一句话
+
+srv2 上原来只有 Cowrie（SSH/Telnet）和 `secagent-decoy`（8 个端口的 `nc -l` 空壳）。
+本次加了一个 **Dionaea**，它**真的会讲协议**：SMB / MSSQL / MySQL，
+所以蜜罐能从"端口被敲了"升级到"拿到了协议级行为 + 登录凭据"。
+
+### 31.2 架构：谁在哪、流量怎么走
+
+```
+                       公网
+                        │  tcp/445(★待安全组放行) tcp/1433 tcp/3306
+                        ▼
+      ┌──────────────────────────────────────────────────┐
+      │ 腾讯云安全组（只能在控制台改）                    │
+      │   已放行：21 23 1433 3306 6379 8080 8443 27017 22 2222 │
+      │   ★未放行：445  ← 想让公网扫到 SMB 必须在这里加    │
+      └──────────────────────────────────────────────────┘
+                        │
+      ┌──────────────────────────────────────────────────┐
+      │ srv2   10.0.0.10（公网 43.143.114.79）            │
+      │                                                  │
+      │  ① ufw（INPUT）        allow 445/tcp 等           │
+      │  ② iptables FORWARD → DOCKER-USER  ← 顺序即安全   │
+      │       1) -s 172.19.0.0/16 ESTABLISHED,RELATED ACCEPT
+      │       2) -s 172.19.0.0/16 -d 127.0.0.11 ACCEPT   │
+      │       3) -s 172.19.0.0/16 DROP   ← egress 兜底    │
+      │       4..) --dport {21,23,1433,3306,6379,8080,8443,27017,445} ACCEPT
+      │  ③ DNAT → 172.19.0.x                             │
+      │                                                  │
+      │  ┌──────── cowrie_honeypot (172.19.0.0/16) ─────┐ │
+      │  │ cowrie          172.19.0.2   SSH/Telnet :2222 │ │
+      │  │ secagent-decoy  172.19.0.3   :21 :23 :6379    │ │
+      │  │                              :8080 :8443 :27017│ │
+      │  │ dionaea         172.19.0.4   :445 :1433 :3306  │ │
+      │  └───────────────────────────────────────────────┘ │
+      │     ↑ 这三条 egress 规则把整个网段的出站锁死        │
+      │  Suricata（net=host，只看不拦）                    │
+      │  Wazuh manager/indexer/dashboard（172.18.0.0/16）  │
+      └──────────────────────────────────────────────────┘
+                        │
+   日志落宿主 /opt/dionaea/var/log/dionaea/{dionaea.json,dionaea.log,dionaea-errors.log}
+   以 **只读** 方式挂进 wazuh.manager（override 里一行）→ localfile → 规则 → alerts.json
+```
+
+**Dionaea 落在 Cowrie 同一套隔离网络里**（`networks: external: name: cowrie_honeypot`），
+不新建 bridge、不做 masquerade —— 这是"它不能主动外连"的前提。
+
+### 31.3 端口归属（移交前后对照，2026-10-14 从 srv1 实测）
+
+| 端口 | 移交前谁应答 | 移交后谁应答 | 证据（从 srv1 打过去收到的字节） |
+|---|---|---|---|
+| 445 | 无人监听（超时） | **Dionaea（SMB）** | 仍 TIMEOUT —— ★云安全组未放行，主机侧已放行 |
+| 1433 | decoy `nc`（且常 RST） | **Dionaea（MSSQL）** | `04 01 00 2b 00 00 01 00 …` = TDS prelogin 响应 |
+| 3306 | decoy `nc`（且常 RST） | **Dionaea（MySQL）** | `34 00 00 00 0a 35 2e 37 2e 31 36` = 握手包，版本串 **5.7.16** |
+| 21 | decoy | decoy（不变） | OPEN 但无任何数据（`nc` 空壳特征） |
+| 23 | decoy | decoy（不变） | 同上 |
+| 6379 | decoy | decoy（不变） | 同上 |
+| 8080 | decoy | decoy（不变） | 同上 |
+| 8443 | decoy | decoy（不变） | 同上 |
+| 27017 | decoy | decoy（不变） | 同上 |
+
+移交动作的顺序是"**先缩诱饵的端口映射，再起 Dionaea**"（反了会端口冲突）。
+诱饵脚本 `scripts/srv2-decoy-ports.sh` 的默认端口清单已改成 `6379 8080 8443 27017 21 23`，
+并且放行规则从 `-I DOCKER-USER 1` 改成 **`-A`（只追加到链尾）** —— 见 §31.7。
+
+### 31.4 资源预算与实测水位
+
+| 项目 | 值 |
+|---|---|
+| 镜像 | `dinotools/dionaea:0.11.0`（固定 tag，禁用 latest），digest `sha256:6f06d0a6035c865cb60ef51bd96ff3b1f25ee4bfcd852dad3f551bc2d93464ca`，磁盘 266 MB |
+| mem_limit | **384 MiB**（实测空载 **39–49 MiB**） |
+| cpus | 0.5 核 |
+| pids_limit | 256 |
+| read_only | true（只 `/opt/dionaea/etc`、`/opt/dionaea/var` 可写 + `/tmp` tmpfs 16MB） |
+| no-new-privileges | true |
+| restart | unless-stopped |
+| 日志 | logrotate `daily + maxsize 32M + rotate 5`（**copytruncate**：dionaea 不会重开日志文件） |
+| bistreams | cron 每天 04:17 清 >2 天 或 >1GB |
+| 样本 binaries | **不自动删**，>2GB 告警（那是蜜罐最有价值的产物） |
+
+**`free -m` 加前/加后（如实）**：
+
+```
+加之前  2026-10-14 00:38:55   Mem 3719 total / 2543 used / 881 available
+加之后  2026-10-14 01:1x      Mem 3719 total / 2462 used / 980 available
+```
+
+要老实说清楚：**available 反而变多了**。原因是这两次采样之间 Suricata/Wazuh-indexer
+自己的用量在波动（indexer 1028→1021MiB、manager 410→566MiB），
+**宿主内存的波动比 Dionaea 的开销大**。所以"加了 Dionaea 导致内存紧张"这个结论不成立，
+但它也不是"因为加了 Dionaea 所以内存变宽裕了"。**Dionaea 自身的净开销就是实测的 39–49 MiB**。
+另外"所有容器 mem_limit 之和"从 4252 → 4636 MiB，已经超过物理内存 3719 MiB ——
+这些是**上限不是预留**，但意味着"再往上加第 9 个容器"要先算这笔账。
+
+### 31.5 接进告警链路（Wazuh）
+
+- 采集：`docker-compose.override.yml` 里给 `wazuh.manager` 加
+  `- /opt/dionaea/var:/opt/dionaea/var:ro`；
+  `wazuh_manager.conf` 加 3 条 localfile（`dionaea.json` 用 json 格式，另两个走 syslog）。
+  **为什么必须两边都做**：Wazuh 在容器里、日志在宿主上，不挂载就是"配置正确、永远读不到"。
+- 规则：`deploy/wazuh/srv2_dionaea_rules.xml` → `/opt/wazuh/config/wazuh_cluster/rules/`
+  | sid | level | 说明 |
+  |---|---|---|
+  | 100300 | 6 | SMB 连接/认证尝试（`connection.protocol=smbd` + `type=accept`） |
+  | 100301 | 6 | MSSQL 连接尝试（`mssqld`） |
+  | 100302 | 6 | MySQL 连接尝试（`mysqld`） |
+  | 100310 | 12 | 同一来源 60 秒内 ≥6 次协议连接（扫描/爆破），用 `if_matched_group` + `same_field` |
+- **门禁**：规则更新必须走 `scripts/srv2-dionaea-wire-wazuh.sh`，它做
+  备份 → 写 → `wazuh-analysisd -t` 校验 → 失败自动回滚 → 重启 → `wazuh-logtest` 功能自测。
+  （规则语法错会让 analysisd 起不来 = 整个 SIEM 停摆，这是已记录的事故教训。）
+- 实测告警（`alerts.json`，2026-10-14 01:0x）：
+
+```
+2026-10-13T17:06:13.579+0000  sid=100301 lvl=6  蜜罐(Dionaea): MSSQL 连接尝试 来源=47.96.106.187:36310
+2026-10-13T17:06:13.580+0000  sid=100302 lvl=6  蜜罐(Dionaea): MySQL 连接尝试 来源=47.96.106.187:36296
+2026-10-13T17:06:13.578+0000  sid=100310 lvl=12 蜜罐(Dionaea): 同一来源 60 秒内多次协议连接（扫描/爆破）来源=47.96.106.187
+```
+
+（`47.96.106.187` 是 srv1 的公网 IP —— 也就是"从另一台机器打过来"的受控验证。
+另外还有真实公网扫描器 **77.90.185.21** 自己打进来，累计触发 100310 多条，
+说明这几条规则不是纸面上的。）
+MySQL 侧还真的把登录串记下来了：
+`"credentials": [{"password": "", "username": "secagent_probe"}]`。
+
+### 31.6 怎么临时关（kill switch）
+
+```bash
+# 几秒内摘掉，并确认它真的不在了（不是"看着 stop 了"）
+sudo bash /usr/local/sbin/srv2-dionaea-killswitch.sh off
+sudo bash /usr/local/sbin/srv2-dionaea-killswitch.sh status
+# 拉起（隔离断言不过会自动再停掉）
+sudo bash /usr/local/sbin/srv2-dionaea-killswitch.sh on
+# 彻底关掉开机自启
+sudo systemctl disable --now srv2-dionaea.service
+```
+
+`off` 之后 **1433/3306 上就没有监听者了**（已从诱饵移交给 Dionaea），这是刻意的取舍。
+要让这两个端口重新"有东西应答"，把端口还给诱饵：
+
+```bash
+# 先停 Dionaea，再用加长的诱饵清单重建
+sudo DECOY_PORTS="6379 8080 8443 27017 21 23 1433 3306" \
+     bash /opt/secagent/scripts/srv2-decoy-ports.sh --apply
+```
+
+### 31.7 为什么 Dionaea 不能外连（含 2026-10-13 那个真洞）
+
+蜜罐是"故意让人打进来"的，随时可能被拿下。一旦拿下而它又能主动外连，
+这台机器就成了**跳板**（从我们的 IP 出去扫别人、C2 回连、外传数据），责任在我们。
+所以隔离是设计前提，不是可选项。做法三层叠加：同网段（`172.19.0.0/16`）+
+`DOCKER-USER` 里"回程/DNS 放行 + 其余 DROP" + **实测**（不是看配置）。
+
+**2026-10-13 出过一个真洞**：诱饵脚本用 `iptables -I DOCKER-USER 1 --dport N -j ACCEPT` 放行端口，
+而这些规则**不看来源**且被插到 DROP **之前**；iptables 首条匹配即生效，于是蜜罐主动外连
+那 8 个端口**被放行**。发现方实测"连 1.1.1.1:3306 的 SYN 出现在 eth0、连 :443 被丢"，
+随即由集成方重排（DROP 提到放行之前）并四类验证。
+**影响窗口 ≈ 2026-10-13 10:25 → 2026-10-14 01:0x（约 14.5 小时）**，
+定界依据是"洞出现前那份快照里没有任何 `--dport` 放行"。
+**有没有真实外连成功记录：没查到**（Suricata 里源是蜜罐网段的流 0 条、Wazuh 无相关告警），
+但抓包层面蜜罐出向与宿主出向无法区分，所以只能说"没记录到"，不能说"绝对没发生"。
+完整复盘：`docs/安全事件-20261014-蜜罐网段可出网.md`。
+
+> ⚠️ **纠正一条旧结论**：此前有记录写过"蜜罐网段 **egress DROP intact**"（作为隔离有效的证据）。
+> **那句是错的** —— DROP 规则确实存在，但被前序 ACCEPT 旁路，实际没生效。
+> 今后凡涉及隔离的结论，**只接受"主动外连实测失败"作为证据**，不接受"我配了 DROP 规则"。
+
+**修复后的实测（2026-10-14 01:12，容器内主动外连 + eth0 抓包）**：
+
+```
+蜜罐网段 -> 8.8.8.8 逐个端口：SYN 数
+  port 21=0  23=0  445=0  1433=0  3306=0  6379=0  8080=0  8443=0  27017=0   ← 全被 DROP
+对照组（同一镜像、默认网桥、连 31.13.94.41:443）：SYN=3                    ← 路径本身是通的
+结论：蜜罐网段对外 TCP 全部被 DROP（0 个端口可出网）
+容器内 DNS：github.com -> 20.205.243.166（127.0.0.11 放行，是刻意保留的）
+```
+
+最后两行缺一不可：**没有对照组，"全是 0"可能只是"网络不通"；
+没有 DNS 那一行，就看不出第 2 条规则的位置是对的。**
+
+### 31.8 怎么回滚（备份路径 + 一条命令）
+
+```bash
+sudo bash /usr/local/sbin/srv2-dionaea-deploy.sh --rollback
+```
+
+它读 `/opt/secagent/backup/dionaea-last/restore.sh`（备份在
+`/opt/secagent/backup/dionaea-<时间戳>/`，含 `iptables.save`、`docker-compose.override.yml`、
+`wazuh_manager.conf`、`rules-dir/`、诱饵容器 inspect、`free/df` 基线），做：
+停并移除容器 → 恢复 Wazuh 两处配置 → 恢复备份时的 iptables → 摘掉 unit。
+**注意**：诱饵容器的端口清单不会自动还原（脚本会把备份时的启动命令打印出来照着重建即可）；
+ufw 的 445 放行也不自动撤销（`ufw delete allow 445/tcp`）。
+
+### 31.9 常用命令 / 目录
+
+```bash
+sudo bash /usr/local/sbin/srv2-dionaea-check.sh              # 自检（顺序错/隔离破就 exit 1）
+sudo bash /usr/local/sbin/srv2-honeypot-egress-probe.sh      # 隔离实测探针（数 SYN）
+sudo bash /usr/local/sbin/srv2-dionaea-cleanup.sh [--apply]  # 磁盘上限维护
+sudo tail -f /opt/dionaea/var/log/dionaea/dionaea.json       # 结构化事件（Wazuh 吃的就是它）
+```
+
+仓库落点（`deploy/srv2-dionaea/`、`scripts/srv2-dionaea-*.sh`、`scripts/srv2-honeypot-*-probe.sh`）
+与服务器副本 **sha256 一致**，并已进落点基线
+（`srv1-installed-manifest.sh --capture`，34 个落点，`--check` 为 0 missing / 0 changed / 0 added）。
+
+### 31.10 没做到 / 可疑的（如实列）
+
+1. **445 公网不可达**：主机侧已放行，但**腾讯云安全组没放行**，从 srv1 连 445 仍超时。
+   要让公网扫到 SMB，需要在控制台放行 445/tcp —— **这一步只能站主做**。
+   所以"SMB 认证尝试"这条规则目前的真实来源只有内网/宿主侧。
+2. **"下载到样本文件"规则没做，是故意的**：`log_json.py` 只实现了 connection / ftp 命令 /
+   ftp·mssql·mysql 登录凭据 / p0f 几类 handler，**没有 `download.offer` / `download.complete`
+   的 handler**。挂在 `dionaea.json` 上的下载规则会是一条**永远不触发**的死规则
+   （本项目吃过"看起来在监控、其实没数据"的亏）。样本下载事件只存在于文本日志 `dionaea.log` 里。
+3. **容器 DNS 是放行的**（`-d 127.0.0.11`，上游设计如此、要留反向解析），
+   理论上留了一条"经 DNS 出站"的窄通道。要彻底封就得去掉这条并接受解析失败。
+4. **开机有几秒窗口**：Docker 按 `restart: unless-stopped` 拉起容器，早于
+   `cowrie-egress-lock.service` 应用 egress DROP。`srv2-dionaea.service` 用 `After=` 保证次序 +
+   启动后做隔离实测断言（不过就停容器），但这个窗口是既有结构决定的（Cowrie 今天同样如此）。
+5. **`DOCKER-USER` 端口放行在重启后能否重建，没有做重启演练**：目前靠
+   `/etc/iptables/rules.v4`（`secagent-firewall-restore.service` 在 docker 之前 restore）。
+   但本项目自己的 unit 注释记录过"Docker 会重建 DOCKER-USER 链、跑在它前面的规则会被覆盖"，
+   所以这条持久化路径**需要一次重启演练才能确认**。egress 三件套本身由
+   `cowrie-egress-lock.service`（After=docker）重建，不受影响。
+   建议：下次维护窗口重启后跑一次 `srv2-honeypot-egress-probe.sh`。
+6. **SIP 服务被停用了**（`services-enabled/sip.yaml` 摘掉）：它一启动就报
+   `sqlite3.OperationalError: database is locked`（自己锁自己的 accounts.sqlite），
+   而 5060 本来就不发布；留着它只会把 `dionaea-errors.log`（会进 Wazuh）灌满 traceback。
+   恢复方法：把 `services-available/sip.yaml` 重新软链回 `services-enabled/`。
+7. **文本日志会随流量增长**：`dionaea.log`(info) + `dionaea-errors.log`(warning,error) 已去掉 debug
+   （不去掉的话空载 15 秒就 78KB）。实测 13 分钟约 188KB+56KB ≈ **1.1 MB/小时**。
+   如果哪天觉得 SIEM 被这些低价值事件拖累，可以只留 `dionaea.json`（结构化、告警全靠它）。
+8. **`wazuh_manager.conf` 本身不满足严格 XML**：第 353 行注释里有一条 `-----` 分隔线，
+   XML 规范不允许注释里出现 `--`，Expat 直接报错。**Wazuh 自己接受**，
+   所以这是"检查器比被测系统更严"的误报（本项目第 7 种形态）。
+   现在的门禁改成"剥掉注释再校验"，不再误报；
+   真正的安全网仍是"重启后 analysisd 到底起没起来"。
+9. **装机过程中我自己踩到的两个坑（已修，记在这里避免重犯）**：
+   `wazuh-control status` 的返回码**总是非 0**（clusterd/maild/dbd 本来就不跑），
+   在 `set -o pipefail` 下会把"活着"判成"死了" —— 自检脚本里犯了一次（本 RUNBOOK 别处早已记过这个坑）；
+   以及 `docker exec` 少了 `-i` 时 `wazuh-logtest` 拿不到 stdin，
+   自测会输出两行横幅、看起来像"规则没命中"，实际是"根本没喂进去"。
+

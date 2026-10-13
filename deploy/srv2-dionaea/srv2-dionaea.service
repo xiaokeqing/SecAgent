@@ -1,0 +1,39 @@
+# ============================================================
+# srv2：Dionaea 蜜罐单元
+# 安装位置：/etc/systemd/system/srv2-dionaea.service
+# ------------------------------------------------------------
+# 它解决什么问题（为什么不能只靠 compose 的 restart: unless-stopped）：
+#
+#   Docker 在 daemon 启动时就会按 restart 策略把容器拉起来，
+#   这个时机【早于】 srv2-cowrie-egress-lock.service 应用蜜罐网段 egress DROP。
+#   也就是说存在一个几秒的窗口：容器在跑，但隔离规则还没上。
+#   （这是既有结构决定的，Cowrie 今天也是同样情况，如实记录在 RUNBOOK。）
+#
+#   本单元做两件事：
+#     1) After=srv2-cowrie-egress-lock.service —— 保证"先锁后跑"的次序；
+#     2) ExecStartPost 走 srv2-dionaea-deploy.sh --up，
+#        里面会【实测】容器能不能主动外连（不是看配置），
+#        一旦发现隔离没生效就 fail-closed —— 直接把容器停掉，绝不放着一个能出网的蜜罐。
+#
+# 启停：
+#   systemctl stop  srv2-dionaea   -> 里面会 compose down（kill switch）
+#   systemctl start srv2-dionaea   -> 拉起 + 隔离断言
+# ============================================================
+[Unit]
+Description=SecAgent Dionaea honeypot (FTP/SMB/MSSQL/MySQL/HTTP protocol emulation)
+Documentation=file:///opt/dionaea/README.md
+After=docker.service network-online.target srv2-cowrie-egress-lock.service
+Requires=docker.service
+Wants=network-online.target srv2-cowrie-egress-lock.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/srv2-dionaea-deploy.sh --up
+ExecStop=/usr/local/sbin/srv2-dionaea-killswitch.sh off
+ExecReload=/usr/local/sbin/srv2-dionaea-deploy.sh --up
+TimeoutStartSec=180
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
