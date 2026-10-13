@@ -1,0 +1,5 @@
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+# 每天 09:30 校验"安装落点"（systemd unit / fail2ban / cron.d / logrotate / wazuh 规则）有没有被悄悄改/删/加
+# 失败时发飞书（notify.sh 在 srv2 上用的是 srv2 自己的模板）
+30 9 * * * root tmp=$(mktemp); bash /opt/secagent/scripts/srv1-installed-manifest.sh --check > "$tmp" 2>&1; rc=$?; if [ $rc -ne 0 ]; then bash /opt/secagent/scripts/notify.sh HIGH "srv2 安装落点有差异" "$(tail -n 12 "$tmp")"; fi; rm -f "$tmp"
