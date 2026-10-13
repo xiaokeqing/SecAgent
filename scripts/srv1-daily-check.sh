@@ -83,6 +83,20 @@ if [ -d "$APP/.git" ] && git -C "$APP" rev-parse --verify -q HEAD >/dev/null 2>&
 else
   say "compose 一致性: 跳过（$APP 不是 git 仓库或没有 HEAD）"
 fi
+# 3.6) 已安装落点完整性（教训：只存在于服务器的落地物会悄悄变/丢）
+if [ -f "$APP/scripts/srv1-installed-manifest.sh" ]; then
+  OUT=$(bash "$APP/scripts/srv1-installed-manifest.sh" --check 2>&1); RC=$?
+  if [ $RC -eq 0 ]; then
+    say "落点完整性: OK（$(printf '%s' "$OUT" | grep -o 'OK（.*' | head -n1)）"
+  elif [ $RC -eq 2 ]; then
+    FAIL=1; DETAIL="$DETAIL 落点基线缺失;"
+    say "落点完整性: **没有基线**（先跑 srv1-installed-manifest.sh --capture）"
+  else
+    FAIL=1; DETAIL="$DETAIL 落点有差异;"
+    say "落点完整性: **有差异**"
+    grep -E '\[missing\]|\[changed\]|\[added\]' "$APP/logs/installed-drift.txt" 2>/dev/null | head -n 6 | sed 's/^/      /'
+  fi
+fi
 # 4) 通知通道自检（没配 URL 也算失败——否则出事时没人知道）
 if [ -f "$APP/scripts/notify.sh" ]; then
   LOW=$(bash "$APP/scripts/notify.sh" INFO "每日自检：通知通道可用性检查" "如果你看到这条，说明通道正常（每天一条）" 2>&1); RC=$?
