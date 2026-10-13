@@ -1,0 +1,114 @@
+<!--
+  ============================================================
+  srv1 访问日志（URL 级 Web 攻击）—— manager 侧自定义规则
+  ------------------------------------------------------------
+  装机位置（srv2，manager）：
+    /opt/wazuh/config/wazuh_cluster/rules/srv1_accesslog_rules.xml
+    （容器里是 /var/ossec/etc/rules/，宿主上是 bind mount）
+  落盘方式：scripts/srv2-install-accesslog-rules.sh
+    —— 备份 -> 写 -> wazuh-analysisd -t 校验 -> 失败回滚 -> 重启
+       （§21.5 的坑：规则文件语法错会让 wazuh-analysisd 直接起不来 =
+         "加一条规则把整个 SIEM 弄挂"，所以必须有 -t 这道门）
+
+  【为什么单独一个文件，而不是并进 srv1_local_rules.xml】
+    srv1_local_rules.xml 是 §21 的产物（100200-100232），它当前【只存在于服务器】
+    （未入库）。把本次规则写成独立文件，装机时就不用改那个文件 ——
+    "改一个已经在线上的规则文件"和"新增一个规则文件"的风险完全不同：
+    前者一旦出错是整站 SIEM 停摆，后者最多是本次规则不生效。
+
+  【数据来源】
+    srv1 agent 采集 /opt/secagent/data/access.jsonl：
+      <localfile><log_format>json</log_format>
+        <location>/opt/secagent/data/access.jsonl</location></localfile>
+    → manager 用【内置 json 解码器】解出 path/status/clientIp 等（logtest Phase 2 可见）。
+    ⚠️ 但解码出来的字段【不能】直接用 <field> 匹配（见下面「坑 1」），
+       本文件一律用 <regex type="pcre2"> 打原始行（Phase 1 的 full event 就是整行 JSON）。
+
+  【字段顺序契约】应用侧固定输出：
+    ts, method, path, queryKeys, status, clientIp, ua, ms, reqId
+    改顺序会打断本文件（rules）与两个 fail2ban 过滤器，改前先看 RUNBOOK §24。
+
+  【本文件踩过的四个坑，全部由 analysisd -t / logtest 实测得出，别删注释】
+    坑 1  <field name="status"> → "Field 'status' is static"（status 是 Wazuh 保留的静态字段名）；
+          JSON 解码器解出的自定义键是【动态字段】，而动态字段用 <field> 匹配不可靠
+          （实测 <field name="path" type="pcre2"> 对 /wp-login.php 一条都不命中）。
+          ⇒ 一律 <regex type="pcre2"> 打原始行，并让关键字被引号夹住（"path":"…关键字…"），
+            这样 UA 里出现同样字样也不会误命中。
+    坑 2  frequency/timeframe 必须配 if_matched_sid，不能独立使用：
+          "Invalid use of frequency/context options. Missing if_matched on rule '100242'."
+          ⇒ 拆成"记账规则（level 0）+ 聚合规则（if_matched_sid）"两条。
+    坑 3  【顺序/级别很关键，实测出的完整规则】多条规则同时命中时：
+          · level > 0 的规则里，【level 最高的那条胜出】（与文件顺序、id 大小都无关，
+            实测 5 vs 10 → 10 胜；10 vs 5 → 10 胜）；
+          · **level = 0 的规则是"终止符"**：一旦命中就停止评估、事件被吞掉，
+            后面 level 10/12 的具体规则一条都不会报（实测：level0 的记账规则
+            无论放前面还是后面，都把 /wp-login.php 的 100240 吃掉了）。
+          ⇒ 记账规则【不能是 level 0】。本文件用 level 1：
+            ① 低于 manager 的 <log_alert_level>3</log_alert_level> → 不写 alerts.json、不刷屏；
+            ② 高于 0 → 不是终止符 → 具体规则（level 10/12）仍能胜出。
+          这是本次最容易被"看起来配好了、其实一条都不报"骗过去的地方。
+    坑 4  logtest 不带 -i 时读不到 stdin（输出空白，看起来像"规则不命中"）；
+          调试务必 `docker exec -i wazuh.manager /var/ossec/bin/wazuh-logtest`。
+
+  规则清单：
+    100238 访问日志里的一次 4xx（level 1：只记账，低于告警落盘阈值 3，不出告警）
+    100239 同一 IP 120 秒内 4xx ≥ 40 → 告警（level 8）
+    100240 URL 级扫描命中已知恶意路径（level 10）
+    100241 其中属于路径穿越形态（level 12）
+  ============================================================
+-->
+<group name="secagent,srv1,accesslog,web,">
+
+  <!-- ===== ① 记账规则（level 1，不是 0）=====
+       level 0 会吞掉后面所有具体规则（见头部「坑 3」实测）；
+       level 1 既不会变成终止符，也低于 <log_alert_level>3</log_alert_level>，
+       所以它自己不会写进 alerts.json，只用来给 100239 计数。 -->
+  <rule id="100238" level="1">
+    <decoded_as>json</decoded_as>
+    <regex type="pcre2">"status":4\d\d</regex>
+    <description>srv1: 访问日志中的一次 4xx（用于 100239 聚合计数，本身不落 alerts.json）</description>
+    <group>secagent,accesslog,web,4xx,</group>
+  </rule>
+
+  <!-- ===== ② 单 IP 4xx 突增（聚合告警）=====
+       为什么需要它：扫描器最典型的形态是"大量 404"。
+       · 100240 只覆盖"有名有姓"的路径；
+       · 随机路径/目录爆破只能靠 4xx 的密度看出来。
+       same_field 按 clientIp 分组 → 是"单 IP"突增，不是全站 4xx 噪声。
+       阈值 40/120s 与 fail2ban 的 secagent-webscan-4xx 对齐（一处判据、两处口径一致）。 -->
+  <rule id="100239" level="8" frequency="40" timeframe="120">
+    <if_matched_sid>100238</if_matched_sid>
+    <same_field>clientIp</same_field>
+    <description>srv1: 同一来源 IP 在 120 秒内产生大量 4xx（疑似目录/路径爆破）</description>
+    <group>secagent,accesslog,web,scan,burst,</group>
+  </rule>
+
+  <!-- ===== ③ 已知恶意路径扫描 =====
+       与应用侧 fail2ban 的 secagent-webscan 用同一套路径特征，但职责不同：
+         · fail2ban：本机 L3 兜底 + 立即处置（秒级）
+         · Wazuh   ：留痕、聚合、跨主机关联与告警（飞书/看板）
+       特征清单刻意只放"确定不是正常业务"的路径，不放 /admin、/api 这类 ——
+       误报会淹掉真信号。
+       正则里 "path":"[^"]*…[^"]*" 把关键字锁死在 path 字段的值里
+       （[^"]* 跨不过引号，UA/Referer 里出现同字样不会误命中）。 -->
+  <rule id="100240" level="10">
+    <decoded_as>json</decoded_as>
+    <regex type="pcre2">"path":"[^"]*(?i)(?:/wp-login\.php|/wp-admin|/wp-content/plugins|/xmlrpc\.php|/wp-config\.php|/wp-json/wp/v2/users|/\.env|/\.git/|/\.svn/|/\.aws/|/\.ssh/|/\.docker/|/\.npmrc|/\.DS_Store|/phpmyadmin|/pma/|/myadmin/|/adminer|/sqlbuddy|/webadmin|/actuator|/manager/html|/solr/|/jenkins/|/grafana/|/docker-compose|/vendor/phpunit|/eval-stdin\.php|/(?:shell|c99|r57|webshell|upload)\.php|/etc/passwd|/etc/shadow|/proc/self|\.\./|%2e%2e|backup\.(?:zip|sql|tar\.gz|7z)|config\.(?:json|php|yml|yaml|bak))[^"]*"</regex>
+    <description>srv1: URL 级 Web 扫描/探测命中已知恶意路径</description>
+    <group>secagent,accesslog,web,scan,</group>
+  </rule>
+
+  <!-- ===== ④ 路径穿越（在 ③ 的基础上再升级）=====
+       用 <if_sid> 挂在 100240 上：命中穿越形态时只发这一条（level 更高），
+       不会让同一个请求既出 100240 又出 100241 两条告警。
+       注：真正"裸 ../"的请求在 Tomcat 连接层就被 400 掉了（实测，RUNBOOK §24），
+       所以这里覆盖到的是 —— 经代理/边缘归一化后到达应用的形态，以及
+       /etc/passwd 这类"归一化之后仍看得出是穿越目标"的路径。 -->
+  <rule id="100241" level="12">
+    <if_sid>100240</if_sid>
+    <regex type="pcre2">"path":"[^"]*(?:\.\./|%2e%2e|%252e%252e|/etc/passwd|/etc/shadow|/proc/self|/windows/win\.ini)[^"]*"</regex>
+    <description>srv1: 路径穿越尝试（URL 里出现 ../ 或 etc/passwd 形态）</description>
+    <group>secagent,accesslog,web,traversal,attack,</group>
+  </rule>
+
+</group>

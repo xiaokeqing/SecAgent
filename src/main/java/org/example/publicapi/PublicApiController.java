@@ -646,7 +646,15 @@ public class PublicApiController {
         ));
         // 近 24 小时口径：KPI 的"严重/高危"与趋势图都取这一份 ——
         // 取数窗口会被低危网络告警刷屏，按时间范围聚合才是"这段时间到底怎么样"
-        data.put("stats24h", source.summary24h());
+        Map<String, Object> stats24h = source.summary24h();
+        data.put("stats24h", stats24h);
+        // 把 24h 聚合的机读状态也放进 dataSource：前端 Hero 的第一个数字取的是 stats24h，
+        // 而"链路没起来(warming)"与"后端真的坏了(degraded)"要显示成不同的话。
+        // 这里是【新增字段】，既有 available/degraded 口径不变。
+        if (stats24h.get("state") != null) {
+            data.put("stats24hState", stats24h.get("state"));
+            data.put("stats24hReason", stats24h.get("reason"));
+        }
         return data;
     }
 

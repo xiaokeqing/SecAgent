@@ -1693,3 +1693,288 @@ curl -s http://127.0.0.1:9900/api/public/alerts | python3 -m json.tool | grep -A
 # 排查"数字在抖"时先看 state：如果一直是 ok 而数字还在变，那才是数据本身在变。
 ```
 
+---
+
+## 24. 应用侧访问日志与 Web 攻击检测（2026-10-13 落地）
+
+> 补的是 §21.2 第 1 条那个"明确看不见"的洞：
+> `Spring 不记未匹配路由` → `/wp-login.php`、`/.env`、`/../../etc/passwd`
+> 这些 **URL 级扫描**在应用里"一行都不记"，返回 404 且日志无痕，
+> 于是 srv1 上的 fail2ban / Wazuh 对这类攻击**完全瞎**（不是没配，是没有数据源）。
+> 这一节写清楚：日志记什么、怎么轮转、两个 jail 怎么判、怎么临时关、封禁到底挡得住谁。
+> ⚠️ 本文档在 srv1 上还缺 §21（那个版本只存在于 `/opt/secagent` 的未提交改动里），
+> 本节凡引用 §21.x 的地方，请对着 `srv1:/opt/secagent/RUNBOOK.md` 看。
+
+### 24.1 一行日志里有什么（字段白名单，顺序固定）
+
+落盘：容器内 `data/access.jsonl` = 宿主 `/opt/secagent/data/access.jsonl`（compose 已挂载、§22 已纳入备份）。
+
+```json
+{"ts":"2026-10-13T20:43:44.253+08:00","method":"GET","path":"/wp-login.php","queryKeys":"","status":404,"clientIp":"198.51.100.9","ua":"wazuh-evidence/1.0","ms":3,"reqId":"1a1354a4cfd-c-af36"}
+```
+
+| 字段 | 语义 | 边界 |
+|---|---|---|
+| `ts` | 请求开始时间，ISO-8601 带时区 | **只到毫秒**（纳秒会让 fail2ban 的日期模板解析失败） |
+| `method` | HTTP 方法 | 截断 16 字符 |
+| `path` | **只有 path，没有查询串** | 截断 512 字符，控制字符替换成空格 |
+| `queryKeys` | **只有查询键名**（逗号分隔，≤8 个，每个 ≤32 字符） | **查询值永不落盘** |
+| `status` | 响应状态码（含 2xx/3xx/4xx/5xx 全记） | 2xx/3xx 也记，为了看"扫到了什么真的存在" |
+| `clientIp` | 优先 `CF-Connecting-IP`，否则 `remoteAddr` | 必须是**合法 IP 字面量**，否则回落（见 24.6） |
+| `ua` | User-Agent | 截断 200 字符，控制字符替换 |
+| `ms` | 处理耗时（毫秒） | 异步写，不含写盘时间 |
+| `reqId` | 本次请求关联 id | 目前只在本日志里，未进响应头/未进应用日志（见 24.7） |
+
+**刻意不记**：请求体、查询串原文、Cookie、Authorization、Referer、响应体、原始 header 全集。
+理由：这个文件会长期驻留、被 fail2ban/Wazuh 反复读、出事时可能被人打包带走排障 ——
+里面出现凭据或用户数据就是二次泄露。
+`AccessLogFilterTest` 对上述每一项都放了**哨兵值**断言，谁以后顺手多记一个字段，测试当场变红。
+
+### 24.2 采样与容量
+
+```
+采样      ：全部记（含 2xx/3xx/4xx/5xx），只按 skip-paths 排除 —— 默认跳过 /api/health
+            （容器 healthcheck 每 30 秒一次 = 一天 2880 行纯噪声）。
+轮转      ：活动文件固定叫 access.jsonl（fail2ban/Wazuh 指的就是它，路径不许漂）；
+            跨天 或 单文件超过 app.accesslog.max-file-mb（默认 64MB）→ 改名成
+            access-<yyyyMMdd-HHmmss>.jsonl，再建新的活动文件。
+保留      ：app.accesslog.retain-days（默认 7）天，按 mtime 删除更老的切分文件；
+            活动文件永不删。容量上限 ≈ 7 × 64MB = 448MB（实测远低于此）。
+写入      ：请求线程只入队（有界队列 8192），I/O 在独立写线程 secagent-accesslog-writer 上，
+            每批 flush —— 这样 fail2ban/Wazuh 读到的延迟是秒级，而请求线程不做磁盘 I/O
+            （§23 的教训：请求路径上做 I/O = 整站 502）。
+写不出去时：队列满 → 丢弃该条 + 节流 WARN + 计数；写盘异常 → 计数 + 节流 WARN + 关句柄重开。
+            **绝不阻塞请求线程，也绝不静默**（WARN 每 30 秒最多一条，带累计丢弃数）。
+```
+
+配置项（`.env.example` 有注释；键名不要留空，空串绑 boolean/int 会让应用起不来）：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `APP_ACCESSLOG_ENABLED` | `true` | false 时启动日志明写 `ACCESSLOG DISABLED`（关闭可见，不静默） |
+| `APP_ACCESSLOG_DIR` | `data` | 容器内目录；宿主是 `/opt/secagent/data` |
+| `APP_ACCESSLOG_RETAIN_DAYS` | `7` | 保留天数（0 = 不清理） |
+| `APP_ACCESSLOG_MAX_FILE_MB` | `64` | 单文件上限 |
+| `APP_ACCESSLOG_SKIP_PATHS` | `/api/health` | 逗号分隔；`*` 结尾 = 前缀匹配 |
+
+> 与 `APP_QUOTA_*` 不同：这里**不需要**在 `docker-compose.yml` 里显式透传 ——
+> compose 的 `SPRING_APPLICATION_JSON` 没有覆盖 `app.accesslog.*`，env_file 里的键会正常生效。
+
+### 24.3 fail2ban：两个 jail（srv1）
+
+装机脚本：`scripts/srv1-fail2ban-webscan.sh`（`--plan/--apply/--status/--verify/--rollback`）。
+
+| jail | 判据 | 阈值 | 动作 |
+|---|---|---|---|
+| `secagent-webscan` | 访问日志里 path 命中已知恶意路径（wp-login/.env/.git/phpmyadmin/穿越形态…） | 10 分钟内 2 次 → 封 4h | `iptables-allports[chain=INPUT]` |
+| `secagent-webscan-4xx` | 单 IP 4xx 密度 | 2 分钟内 40 次 → 封 1h | 同上 |
+
+- 来源：`/opt/secagent/data/access.jsonl`（**直接读 JSONL**，不复用 §21 的 app.log 镜像。
+  理由：① 应用日志里根本没有这些请求；② 结构化字段能"只匹配 path、只取 clientIp"，
+  误报面比自由文本小得多；③ 一条日志两处用会让"扫描规则"和"注入规则"互相干扰）。
+- `ignoreip`：回环 + 两台服务器自有公网 IP。**刻意不放私网段**（一次性探针容器的源 IP 在私网里，
+  放进去等于把容器侧验证和攻击一起放过）。
+- **封禁动作必须是 `iptables-*`，不能用 firewalld 系**：§21.5 记过三种"假成功"
+  （rich-rules 端口非法 / `--direct` 在 nft 后端静默无效 / docker 网桥绕过 zone）。
+
+### 24.4 Wazuh：manager 规则（srv2）
+
+装机脚本：`scripts/srv2-install-accesslog-rules.sh`（备份 → 写 → **`analysisd -t` 门禁** → 失败回滚 → 重启）。
+采集侧：`scripts/srv1-wazuh-accesslog-localfile.sh` 给 agent 追加
+`<localfile><log_format>json</log_format><location>/opt/secagent/data/access.jsonl</location>`。
+⚠️ **不能给这个 localfile 加 `out_format`**（§21 对 app.log 是加了的）：加了前缀就不是 JSON，
+内置 json 解码器立刻失效、规则一条都不命中，而且不会有任何报错。
+
+| sid | level | 判据 |
+|---|---|---|
+| 100238 | 1 | 访问日志里的一次 4xx（只记账，低于 `log_alert_level=3`，不写 alerts.json） |
+| 100239 | 8 | 同一 `clientIp` 120 秒内 4xx ≥ 40（`if_matched_sid` 100238 + `same_field clientIp`） |
+| 100240 | 10 | path 命中已知恶意路径 |
+| 100241 | 12 | 其中属于路径穿越形态（`if_sid` 100240） |
+
+### 24.5 怎么验证（都要能重复跑）
+
+```bash
+# ① 应用侧：日志真的在记 URL 级探测（三种源 IP 都是 RFC5737，绝不会误封真实来源）
+sudo bash /opt/secagent/scripts/srv1-fail2ban-webscan.sh --verify   # 失败2->封禁->内核规则->解封 全流程
+#   单独看日志（探针走"直连源站"，正是绕过 CF 的形状）：
+curl -s -o /dev/null -H 'CF-Connecting-IP: 198.51.100.9' -H 'User-Agent: selftest' \
+     http://127.0.0.1:9900/wp-login.php
+tail -1 /opt/secagent/data/access.jsonl
+
+# ② fail2ban 状态（**不要**用"重启后链在不在"判断生效与否，见 24.8 坑 3）
+sudo bash /opt/secagent/scripts/srv1-fail2ban-webscan.sh --status
+sudo fail2ban-client status secagent-webscan
+sudo iptables -S INPUT | grep f2b-            # 只在发生过封禁之后才看得到
+
+# ③ Wazuh：agent 侧 + manager 侧
+sudo bash /opt/secagent/scripts/srv1-wazuh-accesslog-localfile.sh --status
+#   在 srv2 上：
+docker exec wazuh.manager /var/ossec/bin/agent_control -l | grep -E '006|Active'
+sudo bash /tmp/srv2-install-accesslog-rules.sh --check      # analysisd -t + 规则清单
+docker exec wazuh.manager cat /var/ossec/logs/alerts/alerts.json | grep -a 100240 | tail -1
+```
+
+### 24.6 封禁边界（和 §21.6 是同一条，别记错）
+
+srv1 的公网入站是 **cloudflared 隧道**，应用只监听 `127.0.0.1:9900`；
+真实访客到达 srv1 时的源 IP 是 **127.0.0.1**，日志里的 `clientIp` 是 `CF-Connecting-IP`（真实访客）。
+
+- ⇒ 在 srv1 上按 `clientIp` 做 L3 封禁**挡不住该访客经 Cloudflare 的后续流量**（它们从 CF 边缘进来）。
+- 真正有效的场景：① **检测/留痕/进 SIEM**（本节的真实价值）；
+  ② **绕过 Cloudflare 直连源站**的流量（一次性容器/直连探测正是这个形状，已功能性验证）；
+  ③ 将来任何把 9900 暴露出去的场景。
+- 真正的处置点在 **Cloudflare WAF/自定义规则**（需要 Zone 级 API Token，至今没有）或应用侧黑名单。
+- `clientIp` 的可靠性：`CF-Connecting-IP` 在**能直连到应用**的场景下是**可伪造**的
+  （实测：本地 curl 带一个假头，日志就记了那个假 IP，fail2ban 也照封）。
+  当前 9900 只绑回环、外面够不到，所以不可伪造；**一旦把 9900 暴露出去，这个头就不能当证据用**。
+  这也是 `ignoreip` 里必须写自有公网 IP 的原因（伪造自家 IP → 自我 DoS）。
+
+### 24.7 怎么临时关掉（按影响面从小到大）
+
+```bash
+# 1) 只停主机侧封禁（检测/留痕继续，Wazuh 仍会告警）
+sudo fail2ban-client stop secagent-webscan
+sudo fail2ban-client stop secagent-webscan-4xx
+# 恢复：start（或 sudo bash /opt/secagent/scripts/srv1-fail2ban-webscan.sh --apply）
+
+# 2) 停 Wazuh 对访问日志的采集（fail2ban 不受影响；SIEM 上不再出这三条规则）
+sudo bash /opt/secagent/scripts/srv1-wazuh-accesslog-localfile.sh --rollback
+
+# 3) 彻底关掉应用侧访问日志（本节的检测能力全部失效）
+#    在 /opt/secagent/.env 加：APP_ACCESSLOG_ENABLED=false  然后按发布链重建容器
+#    （注意：不能用 docker compose up 手工重建 —— 会丢 digest 引用，见 CLAUDE.md 硬规矩 1）
+
+# 4) 回滚整个 jail 配置
+sudo bash /opt/secagent/scripts/srv1-fail2ban-webscan.sh --rollback
+```
+
+### 24.8 本次实测踩到的坑（都是"看起来成了、其实没成"）
+
+```
+坑 1  fail2ban 过滤器里的 % 是插值字符：正则里写 %2e%2e 会让 fail2ban-client -t 直接报
+      "'%' must be followed by '%' or '(', found: '%2e%2e|...'"。必须写 %%2e%%2e。
+      （--apply 的 -t 门禁当场拦下并自动回滚，坏配置没进生产。）
+
+坑 2  fail2ban 会先用 datepattern 把时间戳【从行里删掉】再把剩下的文本交给 failregex，
+      而它的捕获组覆盖 `{"ts":"<时间>"` 整段 → 任何以 ^\{"ts":" 锚定的正则都是 0 命中。
+      对策：failregex 从 "method" 开始写（带不带时间戳前缀都能命中），并在样本上断言命中数（5/7）。
+      另一个反向坑：ts 若带 9 位纳秒，%f（1-6 位）解析失败 → fail2ban 退化成"用当前时间"，
+      findtime 窗口不再精确。所以应用侧把 ts 截断到了毫秒。
+
+坑 3  【最容易骗过自己的一条】本机的 fail2ban actionstart **不会**在 jail 启动时建内核链：
+      实测 restart 后盯 70 秒，iptables 里一行 f2b- 都没有、日志里也没有 ERROR；
+      链与 INPUT 跳转是在【第一次真正封禁】时懒建出来的。
+      ⇒ 判据必须是"试封一个 RFC5737 地址，断言 链 / INPUT 跳转 / 规则 / 解封 四件事"，
+        不能是"重启后链在不在"。（§21 当时那条 iptables -S | grep f2b- 之所以成立，
+        是因为那之前已经发生过真实封禁。）另外注意：chain 名有 28 字符上限，
+        两个 jail 的名字 intentionally 短。
+
+坑 4  Wazuh 的 `status` 是【静态字段】：<field name="status"> 会让 analysisd -t 报
+      "Field 'status' is static" 并拒绝加载规则。改用 <regex type="pcre2"> 打原始行。
+
+坑 5  frequency/timeframe 必须配 if_matched_sid（"Invalid use of frequency/context options"），
+      所以要拆成"记账规则 + 聚合规则"两条。而记账规则【不能是 level 0】：
+      实测 level 0 是**终止符**，命中即停止评估，后面 level 10/12 的具体规则一条都不报；
+      level > 0 时是"level 最高者胜"（与文件顺序、id 大小无关）。
+      现在记账规则用 level 1：既不是终止符，又低于 log_alert_level=3，不写 alerts.json。
+
+坑 6  `<field name="path" type="pcre2">` 对 JSON 解码出来的动态字段**不按预期匹配**
+      （实测同样一条 /wp-login.php 事件，<field> 版 0 命中，<regex> 版命中）。
+      本文件一律用 <regex type="pcre2">，并用 "path":"[^"]*…[^"]*" 把关键字锁在 path 值里。
+
+坑 7  wazuh-logtest **不带 -i 就读不到 stdin**，输出空白 —— 看起来像"规则不命中"，
+      其实是根本没喂进去。调试一律 `docker exec -i wazuh.manager /var/ossec/bin/wazuh-logtest`。
+
+坑 8  【把 agent 弄挂的一次】给 /var/ossec/etc/ossec.conf 追加配置时，
+      我第一版用了 `install -m 0600 -o root -g root` → 文件从 root:wazuh 0640 变成 root:root 0600，
+      而 wazuh-agentd 是**降权**以 uid 995(wazuh) 读它 → 报
+      "ERROR: (1226): Error reading XML file 'etc/ossec.conf': (line 0)"（detail 为空 = 打不开，
+      不是语法错），systemd 单元 failed，srv1 主机侧上报整条链路停摆。
+      ⇒ 脚本现在先 stat 出原始 mode/user/group 再 install，并在改完后断言
+        `sudo -u wazuh test -r <conf>`。教训：改别人的系统配置文件时，属主/权限是配置的一部分。
+      另：python3 的 expat 认为 §21 那份 ossec.conf 注释里含 `--` 所以"不是合法 XML"，
+      但 wazuh 自己的解析器接受它（同一文件 agentd 能起来）—— 别拿 python expat 当 wazuh 的校验器。
+
+坑 9  排查时踩的自己的坑：`docker exec ... cat alerts.json | python3 - <<'PY'` 里，
+      heredoc 会占掉 stdin，管道内容被丢掉 → 查询结果永远 0 条，看起来像"事件没到"。
+      查 alerts.json 用 `python3 -c`（或先落盘再读）。
+```
+
+### 24.9 实测证据（2026-10-13 20:19–20:47，一次性容器 + 真实日志 + 真实告警）
+
+> 取证方式：同一份 jar 起了一个**一次性容器**（`secagent:accesslog-test`，`--network host`、
+> `SERVER_PORT=9901`、`SERVER_ADDRESS=127.0.0.1`、独立 data 目录），
+> 只把**生产路径的 access.jsonl 以文件挂载**共享进来 ——
+> 于是 fail2ban 与 Wazuh 的装机路径与线上完全一致，而线上容器（ACR digest）**一点没动**。
+> 取证完已 `docker stop secagent-al-test`（镜像保留，重启命令见 §24.10）。
+> 这么做是因为硬规矩 1（部署只走 CI→ACR→digest）；应用侧代码进线上要等站主 push → CI。
+
+```bash
+# ① URL 级探测在应用日志里可见（真实输出，未脱敏；源 IP 是 RFC5737 文档网段）
+{"ts":"2026-10-13T20:43:44.253+08:00","method":"GET","path":"/wp-login.php","queryKeys":"","status":404,"clientIp":"198.51.100.9","ua":"wazuh-evidence/1.0","ms":3,"reqId":"1a1354a4cfd-c-af36"}
+{"ts":"2026-10-13T20:43:44.264+08:00","method":"GET","path":"/.env","queryKeys":"","status":404,"clientIp":"198.51.100.9","ua":"wazuh-evidence/1.0","ms":2,"reqId":"1a1354a4d09-d-80e6"}
+{"ts":"2026-10-13T20:43:44.275+08:00","method":"GET","path":"/etc/passwd","queryKeys":"","status":404,"clientIp":"198.51.100.11","ua":"wazuh-evidence/1.0","ms":2,"reqId":"1a1354a4d14-e-ca03"}
+
+# ② fail2ban 封禁-解封全过程（真探针 → 真日志行 → 真封禁 → 内核规则 → 真解封）
+==> 3/6 等待 fail2ban 按真实日志行触发封禁（maxretry=2）
+  [OK]   fail2ban 已封禁 198.51.100.9（来源=它自己读到的访问日志行）
+  `- Banned IP list:	198.51.100.9
+==> 4/6 内核规则落地（封禁不是只记在 fail2ban 状态里）
+  [OK]   iptables 链 f2b-secagent-webscan 里确实有 198.51.100.9
+      -A f2b-secagent-webscan -s 198.51.100.9/32 -j REJECT --reject-with icmp-port-unreachable
+      -A INPUT -p tcp -j f2b-secagent-webscan
+==> 5/6 解封（unban）
+  [OK]   内核规则已消失
+  # 同刻 fail2ban.log：NOTICE [secagent-webscan] Ban 198.51.100.9 / Unban 198.51.100.9
+  # 4xx jail 同样封了 192.0.2.55（55 条随机路径 404 → 2 分钟阈值 40 触发）
+
+# ③ Wazuh manager 侧真实告警（alerts.json，agent=006 srv1）
+sid=100240 L10 | srv1: URL 级 Web 扫描/探测命中已知恶意路径 | path=/wp-login.php clientIp=198.51.100.9
+sid=100240 L10 | srv1: URL 级 Web 扫描/探测命中已知恶意路径 | path=/.env        clientIp=198.51.100.9
+sid=100241 L12 | srv1: 路径穿越尝试（URL 里出现 ../ 或 etc/passwd 形态）      | path=/etc/passwd clientIp=198.51.100.11
+sid=100239 L8  | srv1: 同一来源 IP 在 120 秒内产生大量 4xx（疑似目录/路径爆破） | clientIp=192.0.2.55（第 41 条 4xx 触发）
+agent 侧：logcollector "Analyzing file: '/opt/secagent/data/access.jsonl'"
+manager 侧：analysisd -t 通过；Total rules enabled 7020 → 7024
+```
+
+### 24.10 没做到 / 疑虑（如实列）
+
+```
+1. 【最重要】应用侧代码【还没进线上】：它不在任何已提交的 commit 里，所以线上容器
+   （当前 digest sha256:6a00c2f…、commit 2c2c8ce）不会写 access.jsonl。
+   本次取证用的是一次性容器。站主 push → CI 构建 → srv1-redeploy 之后才真正"线上可见"。
+   在那之前：jail 与规则都已武装好、但数据源是空的（不会误封，也不会有告警）。
+   一次性容器要重启（取证/演练用）：
+     docker start secagent-al-test && curl -s http://127.0.0.1:9901/api/health
+   它绑 127.0.0.1:9901、用独立 data 目录，只共享 access.jsonl 这一个文件。
+
+2. 路径穿越的"裸形态"看不见：实测 `curl --path-as-is /../../etc/passwd` 与 `/%2e%2e%2f…`
+   **在 Tomcat 连接层就被 400 掉**（不进入 filter 链），所以这类请求在访问日志里【没有行】。
+   能看到的只有"归一化之后仍看得出是穿越目标"的形态（如 /etc/passwd），
+   或经前置代理归一化后到达应用的形态。=> 100241 的价值低于名字暗示，
+   真正的穿越防护要靠前置（CF WAF）与端口不暴露。
+
+3. 查询串里的攻击形态看不见：只落键名不落值，所以 `?q=../../etc/passwd`、`?id=1' OR 1=1`
+   这类"参数级注入"在访问日志与两个 jail 里都是不可见的（这是"不记敏感内容"的代价）。
+   要覆盖它得靠应用侧注入防护（已有 PromptInjectionGuard 那条线）或 WAF。
+
+4. 封禁对公网访客无效（见 24.6）：`secagent-webscan*` 目前是"检测 + 留痕 + 防直连"，
+   不是"公网扫描被封住了"。真正的处置点（CF WAF / 应用侧黑名单）没做 —— 缺 Zone 级 API Token。
+
+5. `clientIp` 依赖 CF-Connecting-IP，可伪造（见 24.6）；当前因端口只绑回环而安全，
+   但"把 9900 暴露出去"或"加其它反代"时这条会立刻变成风险。
+
+6. reqId 目前只有访问日志在用：没有进响应头、也没有进应用日志（MDC），
+   所以它暂时无法把"这一行访问日志"和"那次 ERROR"关联起来。要关联得改应用日志格式
+   （会影响 §21 的 Wazuh out_format），属于下一步，本次刻意没动。
+
+7. 容量与备份：data/ 在 §22 的异地备份范围内，access.jsonl 最大 448MB 会进备份包。
+   本次没改备份脚本；如果备份体积成为问题，应在 srv1-data-backup.sh 里排除 access*.jsonl
+   （它们是日志不是状态）—— 这需要改 §22 的东西，留给站主决定。
+
+8. 只做了 URL 级；"同一 IP 长期低频扫描"（慢速扫描）仍看不见 —— fail2ban 的 findtime 窗口
+   与 Wazuh 的 timeframe 都是有界的。（srv2 的 Suricata 那条线覆盖网络层慢扫描，见 §11。）
+```
+
+

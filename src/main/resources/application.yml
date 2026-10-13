@@ -89,6 +89,7 @@ rag:
   min-score: 0.30   # 相似度阈值：低于该值视为知识库未命中（剔除低分噪声；Milvus 距离度量时设 0 关闭）
   model: "qwen-plus"  # 知识库问答使用的对话模型（qwen-plus 性价比高，可按需改为 qwen-max / qwen-turbo）
 
+
 # 安全告警源配置（本地演示用 Mock，返回模拟安全告警）
 prometheus:
   base-url: http://localhost:9090
@@ -136,6 +137,28 @@ app:
     enabled: true
     requests-per-minute: 60
     login-per-minute: 10
+  # ===== 应用侧访问日志（URL 级扫描/探测的可见性来源，见 RUNBOOK §24）=====
+  # 【为什么必须有】Spring 不记未匹配路由：/wp-login.php、/.env、/../../etc/passwd
+  # 这类请求以前是"返回 404 且一行都不记"，于是主机侧的 fail2ban / Wazuh
+  # 对 URL 级扫描完全瞎（RUNBOOK §21.2 第 1 条）。
+  # 【记什么】字段白名单（顺序固定，fail2ban 正则依赖）：
+  #   ts / method / path / queryKeys / status / clientIp / ua / ms / reqId
+  # 【绝不记】请求体、查询串原文、Cookie、Authorization、Referer、响应体
+  #   —— AccessLogFilterTest 用哨兵值钉住这一条。
+  # 【怎么落盘】请求线程只入队（有界队列，满了就丢并节流打 WARN），
+  #   真正的 I/O 在独立写线程上（§23 教训：请求路径上做 I/O = 整站 502）；
+  #   JSONL 追加写，按天/按大小轮转、按天保留。
+  # 【怎么关】APP_ACCESSLOG_ENABLED=false（启动日志会明写 ACCESSLOG DISABLED，不静默）。
+  #
+  # ⚠️ 这几个键【不要留空】：空字符串绑到 boolean/int 会让应用直接启动失败。
+  accesslog:
+    enabled: ${APP_ACCESSLOG_ENABLED:true}
+    dir: ${APP_ACCESSLOG_DIR:data}                  # 容器内路径；落在已挂载、已备份的 data 目录
+    retain-days: ${APP_ACCESSLOG_RETAIN_DAYS:7}
+    max-file-mb: ${APP_ACCESSLOG_MAX_FILE_MB:64}
+    # 逗号分隔；以 * 结尾 = 前缀匹配，其余精确匹配。
+    # 默认跳过 /api/health：容器 healthcheck 每 30 秒一次 = 一天 2880 行纯噪声。
+    skip-paths: ${APP_ACCESSLOG_SKIP_PATHS:/api/health}
   # 公网只读端点（博客工作台）专用配置。
   # 【刻意与业务限流/配额分开】：否则"为了本地调试把上限调大"会顺手把公网端点一起放宽，
   # 而这件事不会有任何报错。
@@ -165,6 +188,22 @@ app:
       denied-keywords: internal                       # 兜底黑名单（命中路径/来源类型即拒绝）
       top-k: 3
       snippet-chars: 300
+  # ===== 混合检索（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
+  # 这一段的键名【就是 .env.example 里 APP_RAG_* 那一组】—— 一处声明、一处默认值。
+  # 与上面 rag.top-k / rag.min-score 的关系：两者是同一件事（默认值也相同），
+  # 新键 app.rag.top-k / app.rag.min-score 一旦被显式设置就以新键为准；
+  # 老键仍然生效（VectorSearchService 里的占位符是 app.rag.* → rag.* → 字面默认）。
+  # 回退纯稠密：sparse.enabled=false 且 rerank.enabled=false（不需要改代码/重新部署）。
+  rag:
+    top-k: ${APP_RAG_TOP_K:3}                       # 每次检索给模型的片段数
+    min-score: ${APP_RAG_MIN_SCORE:0.30}            # 稠密相似度门槛（"知识库未命中→拒答"的判据，混合检索不改它）
+    sparse:
+      enabled: ${APP_RAG_SPARSE_ENABLED:true}       # BM25 稀疏通道开关；false = 纯稠密（改造前口径）
+    rrf:
+      k: ${APP_RAG_RRF_K:60}                       # RRF 的 k：越小越激进（只看头部名次），越大越平均
+    rerank:
+      enabled: ${APP_RAG_RERANK_ENABLED:true}       # 轻量重排开关；false = 只用 RRF 排序
+
   # 每日模型调用配额，防止成本失控
   quota:
     enabled: true

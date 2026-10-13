@@ -1,0 +1,65 @@
+# ============================================================
+# srv1：URL 级 Web 扫描 / 探测 jail（应用侧访问日志驱动）
+# ------------------------------------------------------------
+# 权威副本。装机路径：/etc/fail2ban/jail.d/secagent-webscan.local
+# 装机脚本：scripts/srv1-fail2ban-webscan.sh（备份 → 写 → 校验 → 失败回滚 → restart）
+#
+# 【为什么需要这一组 jail】
+#   §21 落地时实测过：/wp-login.php、/.env、/../../etc/passwd 这类请求
+#   应用【一行都不记】（Spring 不记未匹配路由），所以主机侧的 fail2ban/Wazuh
+#   对 URL 级扫描完全瞎 —— 这不是"没配"，是"没有数据源"。
+#   应用侧访问日志（deploy/../src/main/java/org/example/accesslog）补上了这个数据源，
+#   这两个 jail 就是它的消费者。见 RUNBOOK §24。
+#
+# 【日志来源】/opt/secagent/data/access.jsonl
+#   = 容器内 data/access.jsonl（compose: ./data:/app/data）。
+#   为什么读 JSONL 而不是 §21 的 app.log 镜像：见 filter.d/secagent-webscan.conf 顶部。
+#
+# 【封禁生效边界 —— 必读，和 §21.6 是同一条】
+#   srv1 的公网入站是 cloudflared 隧道，应用只监听 127.0.0.1:9900。
+#   攻击流量到达 srv1 时的【源 IP 是 127.0.0.1】，日志里的 clientIp 是
+#   CF-Connecting-IP（真实访客）。所以在 srv1 上 L3 封禁【挡不住这个访客后续的流量】
+#   （它们从 Cloudflare 的边缘进来）。
+#   真实价值：① 检测+留痕+进 SIEM；② 对"绕过 Cloudflare 直连源站"立即生效；
+#             ③ 真正的处置点仍然是 Cloudflare WAF/自定义规则。
+#   结论：这两个 jail 是【可见性与兜底】，不是"公网扫描就此被封住了"。
+#
+# 【改完动作一定要 restart，不是 reload】
+#   §21.5 踩过：reload 不会重跑 actionstart，新动作的内核链不存在，
+#   于是每次封禁都"状态里封了、防火墙里没有"（假成功）。
+#   装机脚本统一用 systemctl restart fail2ban，并在生效后断言内核链存在。
+# ============================================================
+
+[secagent-webscan]
+enabled  = true
+filter   = secagent-webscan
+logpath  = /opt/secagent/data/access.jsonl
+# 回环与自有资产不封：
+#   · 127.0.0.1/8 / ::1 —— 容器 healthcheck 与容器内直连应用就是这个源；
+#     封了等于封自己（cloudflared 也在本机）。
+#   · 两台服务器自己的公网 IP —— 我们自己的脚本/心跳会访问自己的站点，
+#     把它们封了就是自我 DoS（§21 在 srv2 上真踩过这个坑）。
+#   刻意【不】放私网段：失败登录/隧道/一次性探针容器的源 IP 都在私网里，
+#   放进去等于把功能性验证与容器侧攻击一起放过。
+ignoreip = 127.0.0.1/8 ::1 47.96.106.187 43.143.114.79
+
+# 命中 2 次已知恶意路径就封（同一个 IP 连着试两个路径已经是扫描，不是误点）。
+maxretry = 2
+findtime = 10m
+bantime  = 4h
+action   = iptables-allports[chain=INPUT]
+
+[secagent-webscan-4xx]
+enabled  = true
+filter   = secagent-webscan-4xx
+logpath  = /opt/secagent/data/access.jsonl
+ignoreip = 127.0.0.1/8 ::1 47.96.106.187 43.143.114.79
+
+# 单次 404 是正常现象（失效链接、博客探测、缺图），
+# 所以阈值必须高到"只有爆破才够得着"：2 分钟内 40 次 4xx。
+# 按真实扫描器（ffuf/gobuster 默认并发）的速率，几十秒就能触顶；
+# 而正常访客即使在页面上点到几个坏链接也远远到不了。
+maxretry = 40
+findtime = 2m
+bantime  = 1h
+action   = iptables-allports[chain=INPUT]
