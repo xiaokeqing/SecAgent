@@ -1450,3 +1450,61 @@ sitemap.xml 含 `https://xiaokeqing.cn/` / 全站无 `localhost` / 全站无 `/a
    - `static/js/app.js:1886` → `['/api/public/latest', '可选端点：最近事件（未上线时主页改用 audit）'],`
    - `layouts/partials/spa-view-about.html:72` → `② 可选端点 <code>/api/public/latest</code> …`
    在这两处被删掉之前，deploy.yml 会**正确地拦住发布**（gh-pages 不更新）。删掉后本机实测 7/7 全过。
+
+---
+
+## 23. 2026-10-13 生产事故复盘（站点 502，约 6 分钟；含 4 个独立缺陷）
+
+### 23.1 时间线（CST）
+```
+11:35   我提交通知中枢（239f36f）→ CI 全绿 → 定时器自动部署
+11:35–  应用崩溃循环：UnsatisfiedDependencyException: ResponseActionService:
+         No default constructor found（RestartCount 冲到 11）
+11:37   healthwatch 记「不健康 1/3」；我停掉 redeploy.timer 并执行回滚 → 回到好版本 c4f3f24（短暂恢复）
+11:50   我把飞书写进 .env（NOTIFY_WEBHOOK_TEMPLATE 含 JSON 大括号）→ 手工部署
+11:52:40 redeploy 失败：`failed to read /opt/secagent/.env: line 74: unexpected character "{"`
+         → 容器被留在 **Created**（没运行）；同一日志里回滚也失败：`srv1-redeploy.sh: line 385: Permission denied`
+11:55   timer 重试却判定「digest 相同 → 无需变更」安静退出 → **站点持续 502，不自愈**
+11:55– 我重启 dockerd 想恢复 iptables 链，结果 dockerd 起不来：
+         `ZONE_CONFLICT: 'docker0' already bound to a zone`（firewalld 自 10-10 22:36 一直开着）
+11:59  停用 firewalld → dockerd 恢复 → 重新部署 → 12:00 恢复 ok/3974a5b，公网 200
+```
+
+### 23.2 四个独立缺陷（每一个单独都足以致命）
+```
+① 启动崩溃（代码）：ResponseActionService / UnblockScheduler 各有两个构造器、都没标 @Autowired
+   → Spring 无法选择构造器。**CI 却是绿的**（单测直接 new，不加载 Spring 上下文）。
+   修：两个类显式 @Autowired；新增门禁 `SpringBeanConstructorTest`（反射扫描所有 Spring 组件，
+       多构造器必须恰好一个 @Autowired）——它当场又抓出第二个类，证明这道门禁有价值。
+② .env 里放 JSON（配置）：env_file 解析不认含 `{` 的值 → 整个部署失败。
+   修：.env 只放简单 URL；JSON 形状与双通道交给本机中继 scripts/notify-relay.py（Python 标准库）。
+③ firewalld 与 docker0 冲突（环境·潜伏 3 天）：firewalld 自 10-10 22:36 就是 active，
+   dockerd 只要一重启就会因 `ZONE_CONFLICT` 起不来 —— **任何一次重启/重启机器都会全站宕机**。
+   修：停用 firewalld（恢复 10-10 之前的已知可用态）；docker 26.1.3 恢复正常。
+   教训：srv1 的防火墙职责交给云安全组 + docker 自身链，别再开 firewalld。
+④ 发布链盲区（流程）：容器"存在但没在运行"时，脚本只看 digest 相同 → 判定"无需变更"→ **永不自愈**；
+   且自动回滚因为脚本自身缺 +x（644）而失败。
+   修：脚本加「必须 .State.Running==true」判定；`chmod +x` 已执行（仓库里也补说明）。
+```
+
+### 23.3 通知链路（事故直接催生的能力）
+```
+· 应用侧：Spring 属性是 app.notify.* → 环境变量必须写 **APP_NOTIFY_***（原 .env.example 只写了
+  NOTIFY_*，等于应用侧通知从未真正开启；启动自检如实打印 DISABLED 才暴露出来）。
+  现已确认真实生效：`notify-webhook{...configured(minSeverity=HIGH,cooldown=300s,nightQuiet=22:00-07:00,
+  sameIpMerge=600s,maxAttempts=3,auditFile=data/notify-audit.jsonl)}`
+· srv1：scripts/notify-relay.py（systemd `secagent-notify-relay`，只监听 127.0.0.1:8899）
+  收应用的通用 {"text":...} → 飞书 + QQ 邮件（smtp.qq.com:465，授权码在 .env，600）。
+  分级路由：含 [严重]/[CRITICAL]/[高危]/[HIGH] → 双发；其余只飞书（邮件另有 600s 冷却）。
+· srv2：独立配了 NOTIFY_WEBHOOK_URL + 飞书模板（关键词 SecAgent-srv2）→ **srv1 全死时它自己发得出去**，
+  实测 notify.sh HIGH ... --force → HTTP 200 / exit 0。
+· 实测：飞书 sent + 邮件 sent（seq=1..4 全部两条通道成功）；非高危只飞书 ✓
+```
+
+### 23.4 这次事故的正面产物
+```
+· 外部心跳（srv2→srv1 dead man switch）**真的在 11:54 抓到了这次故障**并尝试告警
+  （当时 srv2 未配 webhook → notify.sh 如实返回 exit 3 只写日志；现已配好）
+· 启动自检把"通知未配置"从"静默失效"变成"日志里明写"，才让 ②/③ 这两处暴露
+· 容器"存在但没运行"的盲区、脚本缺 +x、env_file 不能放 JSON —— 三条都写进了文档与门禁
+```

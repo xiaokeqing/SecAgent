@@ -12,6 +12,8 @@ RestartSec=5
 User=root
 # 只监听 127.0.0.1，不对外暴露
 Environment=NOTIFY_RELAY_PORT=8899
+# 应用在容器里，127.0.0.1 是容器自己 → 必须绑 docker 网桥网关（172.20.0.1），公网不可达
+Environment=NOTIFY_RELAY_HOST=172.20.0.1
 StandardOutput=journal
 StandardError=journal
 

@@ -39,7 +39,7 @@ import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ENV_PATH = "/opt/secagent/.env"
-LISTEN_HOST = "127.0.0.1"
+LISTEN_HOST = os.environ.get("NOTIFY_RELAY_HOST", "127.0.0.1")  # 容器内访问需绑网桥网关
 LISTEN_PORT = int(os.environ.get("NOTIFY_RELAY_PORT", "8899"))
 MAIL_COOLDOWN = int(os.environ.get("NOTIFY_MAIL_COOLDOWN", "600"))
 STATE = {"mail_last": {}, "count": 0}
