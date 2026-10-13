@@ -90,6 +90,7 @@ if [ -f "$APP/scripts/notify.sh" ]; then
     0) say "通知通道: OK" ;;
     3) FAIL=1; DETAIL="$DETAIL 通知未配置(NOTIFY_WEBHOOK_URL 为空);"; say "通知通道: **未配置**" ;;
     4) say "通知通道: 冷却中（视为可用）" ;;
+    6) say "通知通道: 夜间静默已抑制本条 INFO 自检（视为可用；HIGH 级仍会发出）" ;;
     *) FAIL=1; DETAIL="$DETAIL 通知发送失败(rc=$RC);"; say "通知通道: 发送失败 rc=$RC  $LOW" ;;
   esac
 fi
