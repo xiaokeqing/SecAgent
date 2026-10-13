@@ -295,7 +295,8 @@ public class AccessLogWriter implements AutoCloseable {
     }
 
     /**
-     * 活动文件被外部删除/改名时重开（写线程上，最多每 32 行或 5 秒一次 stat）。
+     * 活动文件被外部删除/改名时重开（写线程上，最多每 {@value #FILE_EXISTENCE_CHECK_EVERY} 行或
+     * {@value #FILE_EXISTENCE_CHECK_INTERVAL_MS} 毫秒一次 stat）。
      *
      * <p>不这么做的话，Linux 上"删掉已打开的日志文件"会变成<b>静默写进已 unlink 的 inode</b>：
      * 文件永远不再出现，检测链路全瞎，而且没有任何异常。

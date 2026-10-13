@@ -2444,6 +2444,7 @@ app.public.mask-ips = true   （改造前口径，一键回退用）
 | `GET /api/public/kb` | 片段/标题里内嵌的 IP（经 PublicOutputGuard） |
 | `POST /api/public/ask` | 回答正文与引用片段里的 IP、`clientIp`（新增字段） |
 | `GET /api/public/geo` | 该端点**不给任何 IP**（设计如此）；只继承 `ipDisclosure` 与资产名过滤 |
+| `GET /api/public/webstats` | 该端点**不给任何 IP**（连掩码都不给，口径①，见 §29）；只继承 `ipDisclosure` 与资产名过滤 |
 
 ### 27.2 怎么一键切回掩码（一条配置，不改代码、不重新部署）
 
