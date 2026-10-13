@@ -2857,10 +2857,60 @@ cd /opt/secagent && sha256sum -c manifest.sha256
    文件数量级再涨一个量级就要改成 `git cat-file --batch` 批量取。
 8. **漂移巡检的覆盖面是有限的（别读成"服务器上什么都盯着"）**：它只比 `/opt/secagent/{scripts,deploy}`
    （`DRIFT_DIRS` 可改），**不覆盖**：`/etc/systemd/system/` 下安装的 unit 副本（装了但仓库里没有、或改了没同步，
-   巡检看不见）、srv2 上的 `/usr/local/sbin/*`（本次就是靠人工比对才发现 `secagent-backup-receive` 比仓库新）、
-   `/etc/fail2ban/` 与 `/etc/wazuh*` 等"安装后才有"的落点、以及 `docker-compose.yml` 之外被发布链生成的
-   `.ci-override.yml`。把覆盖面扩到"安装落点"是**下一步**的事，本轮没做。
+   巡检看不见）、srv2 上的 `/usr/local/sbin/*`（本次就是靠人工比对才发现 `secagent-backup-receive`、
+   `secagent-backup-drill.sh` 比仓库新）、`/etc/fail2ban/` 与 `/etc/wazuh*` 等"安装后才有"的落点、
+   以及 `docker-compose.yml` 之外被发布链生成的 `.ci-override.yml`。
+   把覆盖面扩到"安装落点"是**下一步**的事，本轮没做；srv2 侧已经人工盘过一轮，结果与遗留项见 **28.6**。
 9. **srv1 的 `origin/main` 引用是过期的，别看它判断一致性**：srv1 连不上 GitHub，`origin/main` 永远停在 `2999371`，
-   所以 `git status` 会显示 "ahead of 'origin/main' by 35 commits"。判断 srv1 是否与权威一致，
-   要比对权威 bundle / 快照里的 commit（`git rev-list --left-right --count <权威提交>...HEAD` 应为 `0  0`），
-   不要读 `origin/main`。
+   所以 `git status` 会显示 "ahead of 'origin/main' by N commits"（N = 权威提交相对 `2999371` 的历史长度，
+   会随提交增加）。判断 srv1 是否与权威一致，要比对权威 bundle / 快照里的 commit
+   （`git rev-list --left-right --count <权威提交>...HEAD` 应为 `0  0`），不要读 `origin/main`。
+
+### 28.6 srv2 侧的落地物盘点：又抓到 5 个"只存在于服务器"的（2026-10-13 补）
+
+28.3 的巡检只看 srv1 的 `/opt/secagent/{scripts,deploy}`。收口时顺手对 **srv2** 做了一次只读盘点，
+命令（都是只读，没改 srv2 任何东西）：
+
+```bash
+# srv2（需要 sudo 读 root 的东西）
+ls -la /opt/secagent /opt/secagent/scripts
+find /usr/local/sbin -maxdepth 1 -type f -name 'secagent*' | xargs -r sha256sum
+sudo sha256sum /etc/systemd/system/*secagent* /etc/systemd/system/cowrie-* 2>/dev/null
+sudo grep -rn 'secagent\|cowrie' /etc/systemd/system/ /etc/cron* 2>/dev/null
+```
+
+**核对通过的（srv2 与仓库逐字节相同，无需动作）**：
+`/opt/secagent/scripts/` 下的 7 个（capacity-watch.sh、notify.sh、notify-sink.py、
+srv2-gen-heartbeat-key.sh、srv2-watch-srv1.sh、srv2-authorize-srv1-heartbeat-key.sh、srv2-heartbeat.sh）；
+`secagent-srv1deadman.{service,timer}`、`secagent-capacity-srv2.{service,timer}`；
+`/usr/local/sbin/secagent-block-cli` **能从 `scripts/srv2-deploy-block-cli.sh` 里的 heredoc 原样重现**
+（提取出来的内容 sha256 = `ed5a8d31a51b…`，与 srv2 上部署版逐字节相同）—— 这条说明"安装脚本是源"是成立的。
+
+**本轮补捞进仓库的 5 个（见上一个提交）**：
+`scripts/srv2-backup-drill.sh`（加密版抽测，**必须捞**）、`scripts/srv2-disk-guard.sh`、
+`scripts/srv2-cowrie-egress-lock.sh`、`deploy/srv2-cowrie-egress-lock.service`、`deploy/srv2-firewall-restore.service`。
+
+**判断不入库的（如实列出理由）**：
+
+| 服务器上的东西 | 理由 |
+|---|---|
+| `/usr/local/sbin/secagent-block-guard.sh` | 一次 AR 封禁测试的"到点自动解锁"兜底脚本，没有任何 unit/cron 引用它 → 一次性测试工具，不是资产 |
+| `/etc/systemd/system/secagent-netfilter-restore.service`（srv2） | 与仓库版**只有注释差异**：`[Unit]`/`[Service]`/三条 `ExecStart` 逐行相同，只是装机时把头部说明精简了。没有功能内容是服务器独有的 |
+| `/opt/secagent/srv2-decoy-ports.sh`（srv2） | 是**旧版**（`for p in "$(echo $PORTS \| tr ' ' ',')"` 那个 bug 的版本）；仓库里那份带 2026-10-13 踩坑修正 → 属**发布滞后**，不是落地物丢失。本次不动 srv2，记录在案 |
+| 各 `.bak-<时间戳>`（srv2） | 备份副本，理由同 28.3 |
+| `/opt/secagent/backup/*.save` | ipset/iptables 运行态快照（每天由 config-snapshot 打），可再生 |
+
+**两个 cron 落点**（内容原样抄在这里，避免为两行文件新造一套 `deploy/cron.d-*` 约定）：
+
+```cron
+# srv2 /etc/cron.d/disk-guard（每 15 分钟）
+*/15 * * * * root /usr/local/sbin/disk-guard.sh
+
+# srv2 /etc/cron.d/secagent-config-snapshot（每周日 04:10）
+10 4 * * 0 root /usr/local/bin/config-snapshot.sh >> /var/log/secagent-config-snapshot.log 2>&1
+```
+
+**这次没扫到的地方（如实说，别把这次盘点读成"srv2 已经全部对完了"）**：
+srv2 的 `/etc/fail2ban/**`、`/etc/wazuh*/**`、`/etc/nginx/**`、`/opt/secagent/.env`、
+srv2 侧的 compose（蜜罐/Wazuh 那一套）、以及 `/etc/systemd/system` 下**不含 secagent/cowrie 字样**
+但其实是我们的单元。这些要用同一套"逐个算 sha256 再和仓库比"的办法补一遍 —— 属**下一步**。
