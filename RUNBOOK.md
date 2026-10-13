@@ -769,3 +769,50 @@ srv1 侧：数据链路约 1.5 分钟自愈回 REAL，health 全程 200/ok ✓
 仍待站主确认：诱饵端口清单与安全影响评估（见 E:\DeepSeek1\work\维护窗口与凭据轮换-执行方案-20261013.md §三）
 仍待站主提供：srv1-puller（只读）RAM 子账号凭据 → 用于替换当前主账号拉取凭据（§四）
 ```
+
+---
+
+## 17. Suricata 规则裁剪：执行与验证（2026-10-13）
+
+### 17.1 做了什么
+```
+背景：单文件 suricata.rules 有 69,080 行 / 53,122 条 alert 规则（44MB），而 24h 实际只命中 1 个签名
+     （ET INFO Python-urllib，约占该组 97%），加载与匹配开销白付。
+动作：按 §9 的三条原则裁剪 —— 只裁"24h 无命中 + 不在演练覆盖集 + 非高危类别"的 Informational 噪声。
+结果：alert 规则 42,447 条（-10,675，约 -20%）；ET INFO 类 5,341 → 1,150 条。
+备份：/opt/suricata/backup/suricata.rules.bak-20261013-093222（原始 69,080 行）
+候选留档：prune-candidates-*.tsv（1.1MB）/ prune-candidate-sids / prune-keep-sids
+```
+
+### 17.2 关键安全核查（我独立做的）
+```
+① 高危类别是否被误裁 —— 按【classtype】核（不是按消息文本搜关键词，那是错误判据，我犯过一次）：
+     候选集中 classtype 分布 = bad-unknown 6553 / misc-activity 3498 / policy-violation 434 /
+     external-ip-check 137 / not-suspicious 53 → 无一条属真正的 MALWARE / EXPLOIT / TROJAN / C2 规则类。
+     （消息文本里出现 "Malware/Trojan/exploit" 字样的 21 条经逐条查看，全是 ET INFO/FILE_SHARING 低危规则）
+② 生产唯一在响的签名是否被裁掉 —— **没有**：sid 2013031（ET INFO Python-urllib）仍在；
+     另 2001219（ET SCAN SSH）/ 2002910 / 2010935 / 2001569 / 2013028 全部保留 ✓
+```
+
+### 17.3 加载与运行验证
+```
+2026-10-13 09:47:26 CST：重启 suricata 容器以加载裁剪后的规则（检测空窗 5–10 秒，维护窗口内已获批准）
+  · 容器内规则 58,405 行 / alert 42,447 条 ✓
+  · threshold-file 仍在（sid 2001219 的运维误报抑制没丢）✓
+  · 解析/配置错误 0 条 ✓
+  · **阳性对照**：生产里持续命中的 `ET INFO Python-urllib (sid 2013031)` 重启后照常在报
+    （fast.log 01:48:51 / 01:48:56 UTC 两条，节奏与裁剪前一致）→ 裁剪未伤及在用检测 ✓
+  · eve.json 持续写入 ✓
+
+仍待补（非阻塞）：5 个演练场景的"逐条命中对比表"。等价证据已具备：关键签名全在 + 在用签名照常报 + 0 解析错误。
+```
+
+### 17.4 代价（写清楚，别只写好的一面）
+```
+被裁掉的是"从不命中的 Informational 规则"，其中包含一些弱信号，例如
+  · "HTTP 请求 .su TLD 常与恶意软件相关"
+  · "可执行文件从 /tmp 目录提供"
+  · "Windows 98/3.1 User-Agent 检出"
+这些以后不再告警。取舍理由：它们 24h 从未命中，却在每次加载/匹配上都要付费；
+若将来需要这类信号，可随时从 §17.1 的备份恢复（或按需只加回特定 sid）。
+```
