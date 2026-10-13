@@ -116,7 +116,9 @@ BASE_KIND=""; BASE_DESC=""; BASE_SHA=""; SNAP_AGE_DAYS=""
 try_origin() { # 成功=0，并把 BASE_* 填好
   local t=()
   command -v timeout >/dev/null 2>&1 && t=(timeout "$FETCH_TIMEOUT")
-  "${t[@]}" git -C "$REPO" fetch --quiet --prune "$REMOTE" "$BRANCH" >/dev/null 2>&1 || return 1
+  # 【可移植写法】空数组在 set -u 下直接 "$ {t[@]}" 展开，
+  # 在 bash 4.3 及更老会报 unbound variable；${t[@]+"${t[@]}"} 在任何版本都安全。
+  "${t[@]+"${t[@]}"}" git -C "$REPO" fetch --quiet --prune "$REMOTE" "$BRANCH" >/dev/null 2>&1 || return 1
   git -C "$REPO" rev-parse --verify --quiet "${BASELINE_REF}^{commit}" >/dev/null 2>&1 || return 1
   BASE_KIND=origin
   BASE_SHA=$(git -C "$REPO" rev-parse --short "$BASELINE_REF")

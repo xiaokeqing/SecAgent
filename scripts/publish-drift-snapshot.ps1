@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   把权威仓库的 scripts/ deploy/ 打成「只读快照」推给 srv1 —— 漂移巡检的权威基准。
 
@@ -82,13 +82,15 @@ foreach ($f in $files) {
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $stage 'MANIFEST.sha256'), (($manifest -join "`n") + "`n"), $utf8)
 
-$epoch = [int][double]::Parse((Get-Date -UFormat %s))
+# 【时区坑】不能用 Get-Date -UFormat %s：Windows 上它把"本地墙钟时间"当 UTC 算，
+# 东八区会凭空多出 8 小时，快照会显得"来自未来"，新鲜度判断被白送 8 小时余量。
+$epoch = [long][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $info = @(
   "SNAP_COMMIT=$commit",
   "SNAP_TIME_EPOCH=$epoch",
   "SNAP_HASHMODE=sha256-cr-stripped",
   "SNAP_FILES=$($files.Count)",
-  "SNAP_SOURCE=publish-drift-snapshot.ps1@$env:COMPUTERNAME:$Repo"
+  "SNAP_SOURCE=publish-drift-snapshot.ps1@${env:COMPUTERNAME}:$Repo"
 ) -join "`n"
 [System.IO.File]::WriteAllText((Join-Path $stage 'SNAPSHOT-INFO'), ($info + "`n"), $utf8)
 Say "快照内容已生成：$stage"
@@ -109,7 +111,7 @@ if ($NoInstall) {
 
 # ---------- 5) 推到服务器并安装 ----------
 & scp -o BatchMode=yes -q $tgz "${Server}:$RemoteTmp/"
-if ($LASTEXITCODE -ne 0) { Fail "scp 失败（$Server:$RemoteTmp）" }
+if ($LASTEXITCODE -ne 0) { Fail "scp 失败（${Server}:$RemoteTmp）" }
 Say "已传到 ${Server}:$RemoteTmp/$name"
 
 & ssh -o BatchMode=yes $Server "bash $RemoteScript --install $RemoteTmp/$name"
