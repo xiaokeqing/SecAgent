@@ -161,6 +161,27 @@ services:
       APP_WEBSTATS_BACKFILL_MAX_MB: "${APP_WEBSTATS_BACKFILL_MAX_MB:-64}"
       APP_WEBSTATS_FILE_PROBE_SECONDS: "${APP_WEBSTATS_FILE_PROBE_SECONDS:-10}"
 
+      # ===== 公开端点 POST /api/public/tts（文字转语音，RUNBOOK §30）=====
+      # 【为什么必须显式写在这里】与 APP_QUOTA_*/APP_WEBSTATS_* 同一个教训：
+      #   不在这里透传时，"在 .env 里加一行 APP_TTS_*"会【不生效且不报错】。
+      # 【默认关】APP_TTS_ENABLED=false → 端点如实返回 503 TTS_DISABLED（前端隐藏 🔊）。
+      # 【Key】APP_TTS_API_KEY 【不写默认值】：只从 .env（600 权限）注入；空 = KEY_MISSING。
+      # 【三道闸】只认 phraseId / textHash（拒绝自由文本）、长度 ≤ MAX_CHARS、
+      #   单 IP 与全局每日额度（落盘 data/tts-quota.json，重启不丢）。
+      APP_TTS_ENABLED: "${APP_TTS_ENABLED:-false}"
+      APP_TTS_VOICE_ID: "${APP_TTS_VOICE_ID:-}"
+      APP_TTS_MODEL: "${APP_TTS_MODEL:-s1}"
+      APP_TTS_BASE_URL: "${APP_TTS_BASE_URL:-https://api.fish.audio}"
+      APP_TTS_API_KEY: "${APP_TTS_API_KEY:-}"
+      APP_TTS_MAX_CHARS: "${APP_TTS_MAX_CHARS:-120}"
+      APP_TTS_PER_IP_DAILY: "${APP_TTS_PER_IP_DAILY:-20}"
+      APP_TTS_GLOBAL_DAILY: "${APP_TTS_GLOBAL_DAILY:-500}"
+      APP_TTS_CACHE_DIR: "${APP_TTS_CACHE_DIR:-data/tts-cache}"
+      APP_TTS_MAX_CACHE_MB: "${APP_TTS_MAX_CACHE_MB:-64}"
+      APP_TTS_QUOTA_FILE: "${APP_TTS_QUOTA_FILE:-data/tts-quota.json}"
+      APP_TTS_HISTORY_SIZE: "${APP_TTS_HISTORY_SIZE:-200}"
+      APP_TTS_PHRASES_FILE: "${APP_TTS_PHRASES_FILE:-classpath:tts-phrases.yml}"
+
       # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
       # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
       # 全部可留空（留空即用代码默认值，与改造前行为兼容）。

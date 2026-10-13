@@ -23,9 +23,16 @@ set -uo pipefail
 
 # 【端口清单注意】9200 虽然在"扫描器爱扫"的名单里，但在 srv2 上 **9200 就是真 indexer 的端口**
 # （srv1 的 SSH 隧道就是转发到 srv2 的 9200）。把诱饵端口设成 9200 会与真实服务冲突、
-# 且一旦配置不当就是把索引器暴露到公网 —— 因此本脚本的默认清单【不含 9200】，
-# 用 1433（MSSQL）/ 27017（MongoDB）这两个"扫描器也爱扫、但本机没有真服务"的端口替代。
-PORTS=${DECOY_PORTS:-"3306 6379 8080 8443 1433 27017 21 23"}
+# 且一旦配置不当就是把索引器暴露到公网 —— 因此本脚本的默认清单【不含 9200】。
+#
+# 【2026-10-14 变更：1433 / 3306 已移交给 Dionaea】
+#   本站上线了 Dionaea 蜜罐（deploy/srv2-dionaea/），它真的会仿真 MSSQL/MySQL 协议，
+#   比这里的 `nc -l` 只接受连接有价值得多。所以：
+#     · 1433(MSSQL) / 3306(MySQL) 从本清单移除，容器端口映射交给 Dionaea
+#     · DOCKER-USER / ufw 对这两个端口的放行【保留不动】—— 现在服务的是 Dionaea
+#     · 其余 6 个端口（21/23/6379/8080/8443/27017）继续由诱饵容器承担，行为不变
+#   注意：如果重新用旧清单跑 --apply，会与 Dionaea 抢 1433/3306 导致其中一个起不来。
+PORTS=${DECOY_PORTS:-"6379 8080 8443 27017 21 23"}
 HONEY_NET=cowrie_honeypot
 HONEY_SUBNET=172.19.0.0/16
 CT_NAME=secagent-decoy
@@ -65,10 +72,26 @@ show_state() {
   echo "== 蜜罐网段 egress 现状（应为 DROP）=="
   # 注意匹配方式：规则形如 `-A DOCKER-USER -s 172.19.0.0/16 -j DROP`（DROP 在末尾），
   # 早先写成 "DROP.*子网" 会漏匹配 —— 这里改成"该子网作为源 + 目标动作为 DROP"。
-  if iptables -S DOCKER-USER 2>/dev/null | grep -E -- "-s $HONEY_SUBNET .*-j DROP"; then
+  if iptables -S DOCKER-USER 2>/dev/null | grep -qE -- "-s $HONEY_SUBNET .*-j DROP"; then
     ok "蜜罐网段 egress 已被 DROP（诱饵端口指向它不会成为跳板）"
   else
     warn "未看到针对 $HONEY_SUBNET 的 egress DROP —— 落地前应先补上（否则诱饵容器可被当跳板）"
+  fi
+  # 【2026-10-14 新增】只"有 DROP"还不够，还必须确认 DROP 排在端口放行【之前】。
+  # 实测教训：8 条 `--dport ACCEPT`（不看来源）排在 DROP 前面时，
+  #   蜜罐主动外连这些端口会被放行 —— 2026-10-13 上线诱饵时就踩了这个洞，
+  #   2026-10-14 修正。这里每次 plan 都检查一次，避免以后再被写回去。
+  local dl pl
+  dl=$(iptables -S DOCKER-USER 2>/dev/null | grep -n -- "-s $HONEY_SUBNET -j DROP" | head -1 | cut -d: -f1)
+  pl=$(iptables -S DOCKER-USER 2>/dev/null | grep -n -- '--dport' | head -1 | cut -d: -f1)
+  if [ -n "$dl" ] && [ -n "$pl" ]; then
+    if [ "$dl" -lt "$pl" ]; then
+      ok "顺序正确：网段 DROP 在第 $dl 行，端口放行从第 $pl 行起（蜜罐无法主动外连这些端口）"
+    else
+      warn "顺序【错】：端口放行（第 $pl 行）在网段 DROP（第 $dl 行）之前 = egress 有洞！"
+      info "修法：先 bash scripts/srv2-cowrie-egress-lock.sh 把三件套插回链首，"
+      info "      再确保端口放行只用 -A 追加（本脚本已改成 -A）"
+    fi
   fi
   echo "== 现有容器端口映射 =="
   docker ps --format '      {{.Names}}: {{.Ports}}' | head -n 8
@@ -125,8 +148,20 @@ EOF
         done
         wait' >/dev/null 2>&1 && ok "诱饵容器已启动" || warn "诱饵容器启动失败（可能需要先 docker pull alpine）"
     echo "== DOCKER-USER 放行这些端口（保持其余规则不变） =="
+    # 【2026-10-14 关键修正：绝不能用 `-I DOCKER-USER 1`】
+    # 原来这里写的是 `-I DOCKER-USER 1`，把"按目的端口放行、不看来源"的规则
+    # 插到了 `-s 172.19.0.0/16 -j DROP` 的【前面】。iptables 第一条匹配就停，
+    # 于是蜜罐主动外连这些端口被放行 —— 隔离出现真洞（2026-10-14 已修正并验证）。
+    # 正确做法：只 `-A` 追加到链尾（在 DROP 之后）。
+    #   入向流量的源不是蜜罐网段，压根不匹配那条 DROP，所以放行放在后面照样有效；
+    #   而蜜罐自己发出的包会先被 DROP 命中 —— 这才是我们想要的顺序。
+    # 同时用 `-C` 先判断，避免重复执行时插出一堆重复规则。
     for p in $PORTS; do
-      iptables -I DOCKER-USER 1 -p tcp --dport "$p" -j ACCEPT 2>/dev/null && info "放行 tcp/$p（DOCKER-USER）"
+      if iptables -C DOCKER-USER -p tcp --dport "$p" -j ACCEPT 2>/dev/null; then
+        info "tcp/$p 已在 DOCKER-USER 放行（跳过）"
+      else
+        iptables -A DOCKER-USER -p tcp --dport "$p" -j ACCEPT 2>/dev/null && info "放行 tcp/$p（DOCKER-USER，追加到链尾）"
+      fi
     done
     # 【2026-10-13 取证】srv2 上 ufw 是 active 的，所以除了 DOCKER-USER 还必须过 ufw 这一层。
     if ufw status 2>/dev/null | head -n1 | grep -qi active; then
@@ -139,6 +174,10 @@ EOF
     ;;
   rollback)
     echo "== 回滚 =="
+    # 【2026-10-14 注意】本回滚只撤掉【当前 PORTS 清单】里那些端口的放行与容器。
+    # 1433/3306 已经从清单里移除（移交给了 Dionaea），所以它们在这里【不会被撤】——
+    # 这是刻意的：那两个端口现在由 Dionaea 用，撤了会让蜜罐收不到流量。
+    # 如果确实要彻底收回 1433/3306，请先停 Dionaea 再手动删规则。
     docker rm -f "$CT_NAME" >/dev/null 2>&1 && ok "诱饵容器已移除" || info "诱饵容器不存在"
     for p in $PORTS; do iptables -D DOCKER-USER -p tcp --dport "$p" -j ACCEPT 2>/dev/null && info "已撤 tcp/$p"; done
     LATEST=$(ls -1t "$BACKUP_DIR"/iptables-before-decoy-*.save 2>/dev/null | head -n1 || true)

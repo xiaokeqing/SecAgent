@@ -13,6 +13,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -61,6 +62,9 @@ public class PublicApiController {
     private static final Logger logger = LoggerFactory.getLogger(PublicApiController.class);
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter HOUR_FMT = DateTimeFormatter.ofPattern("HH:mm");
+
+    /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link #tts}） */
+    private static final MediaType TTS_AUDIO = MediaType.parseMediaType("audio/mpeg");
 
     @Autowired
     private PublicAlertSource source;
@@ -194,6 +198,16 @@ public class PublicApiController {
     @Autowired
     private PublicConcurrencyGuard publicConcurrencyGuard;
 
+    /**
+     * 语音合成（{@code POST /api/public/tts}）。
+     *
+     * <p>{@code required = false}：装配不成立时端点必须<b>如实</b>返回
+     * {@code 503 TTS_DISABLED}，而不是让整个公网控制器起不来（公开面是匿名可达的，
+     * "语音坏了"不该把公开页面一起带走）。见 {@link #tts}。
+     */
+    @Autowired(required = false)
+    private TtsService ttsService;
+
     /** 单次公开问答的请求体长度上限（比服务内的字符上限略宽，挡住超大 body） */
     @Value("${app.public-api.ask.max-body-chars:4000}")
     private int maxBodyChars;
@@ -239,6 +253,17 @@ public class PublicApiController {
         try {
             String question = extractQuestion(body);
             Map<String, Object> data = publicAskService.ask(question, ip);
+
+            // 记一条"刚生成过的回答"，并把它的 textHash 一并发给前端 ——
+            // 这是 /api/public/tts 的 textHash 闸【唯一】的文本来源：只有服务端
+            // 自己产出过的回答才能被合成，前端永远不传文本。
+            if (ttsService != null) {
+                Object answer = data.get("answer");
+                String textHash = answer == null ? null : ttsService.recordAnswer(String.valueOf(answer));
+                if (textHash != null) {
+                    data.put("ttsTextHash", textHash);
+                }
+            }
 
             // 一次性返回：公开问答的响应永不被边缘缓存（它是"这一次提问"的结果）
             res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
@@ -323,6 +348,101 @@ public class PublicApiController {
             data.put("note", "知识库检索不可用（向量检索异常）：未返回任何内容，也不以内置样本顶替。");
         }
         return ok(data, res);
+    }
+
+    /**
+     * 语音合成：{@code POST /api/public/tts}（匿名可达，但有闸）。
+     *
+     * <h3>响应形状：成功给<b>音频字节</b>，失败给既有 JSON 信封</h3>
+     * 成功时直接返回 {@code audio/mpeg} 字节（{@code <audio>} / {@code fetch→blob} 都能直接用，
+     * 不必让前端再做 base64 解码，也不必让音频膨胀 33%）；失败一律走与其它公开端点
+     * <b>同一个</b> JSON 信封（{@code code/message}）+ {@code reason} 码。
+     * 理由：语音是这个端点唯一的"数据"，包一层 JSON 只会把二进制塞进 base64；
+     * 而错误必须能被人和页面按 code/reason 处理 —— 两种形状各自做最擅长的事。
+     *
+     * <h3>复用的外壳</h3>
+     * 限流复用 {@link PublicRateLimiter}（每 IP 每分钟，与其它公开端点同一本账）、
+     * CORS/ETag 由既有拦截器与 Filter 按 {@code /api/public/**} 前缀统一处理、
+     * 缓存头与 {@code ok(...)} 同一口径（{@code public, max-age=cacheSeconds}）；
+     * 另加 {@code X-Tts-Cache: HIT|MISS} 让"这次有没有花上游的钱"一眼可见。
+     *
+     * <h3>请求体</h3>
+     * {@code {"phraseId":"welcome"}} 或 {@code {"textHash":"<32 位十六进制>"}}，二者给一个。
+     * <b>不认自由文本</b>（给了 text 字段也没用：一律 400 {@code TEXT_NOT_ALLOWED}）。
+     *
+     * <h3>实测形状（真起应用 + curl 核对过，不是推测）</h3>
+     * <pre>
+     * HTTP/1.1 200
+     * Content-Type: audio/mpeg;charset=UTF-8
+     * Cache-Control: public, max-age=15
+     * X-Tts-Cache: MISS
+     * </pre>
+     * 那个 {@code charset=UTF-8} 是<b>全站</b>行为（{@code server.servlet.encoding.force=true}），
+     * 不是本端点加的：既有端点 {@code /api/public/latest} 与 {@code /api/health} 同样是
+     * {@code application/json;charset=UTF-8}。媒体类型仍是 {@code audio/mpeg}，
+     * 播放器忽略该参数；测试按"媒体类型兼容"断言（{@code audio/mpeg}），
+     * 不假装线上是逐字节相同的那一个字符串。
+     */
+    @PostMapping("/tts")
+    public ResponseEntity<?> tts(@RequestBody(required = false) Map<String, Object> body,
+                                 HttpServletRequest req,
+                                 HttpServletResponse res) {
+        String ip = clientIp(req);
+
+        // ① 频率闸：与其它公开端点共用同一个限流器（同一本账，不另开一个桶）
+        if (!rateLimiter.allow(ip)) {
+            res.setHeader(HttpHeaders.RETRY_AFTER, "60");
+            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
+            res.setHeader("X-RateLimit-Remaining", "0");
+            return ttsError(res, 429, "RATE_LIMITED",
+                    "语音请求过于频繁（每 IP 每分钟 " + rateLimiter.limitPerMinute() + " 次），请稍后再试");
+        }
+
+        if (ttsService == null) {
+            return ttsError(res, 503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
+        }
+
+        try {
+            TtsService.Result result = ttsService.synthesize(
+                    bodyString(body, "phraseId"), bodyString(body, "textHash"), ip);
+            // 与 ok(...) 同一口径：快照 TTL 就是下发出去的 max-age。
+            // 音频内容是内容寻址的（同一个 voiceId+text 永远是同一份字节），
+            // 但仍按公网统一 TTL 走，避免出现"这个端点的缓存语义和别的不一样"。
+            res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
+            res.setHeader("X-Tts-Cache", result.cacheHit() ? "HIT" : "MISS");
+            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
+            return ResponseEntity.ok().contentType(TTS_AUDIO).body(result.audio());
+        } catch (TtsService.TtsException e) {
+            // 归一化的 reason 码：前端按它决定"隐藏 🔊 / 提示额度用完 / 提示稍后再试"。
+            // message 是人话，绝不含 Key、上游原文或 URL 细节。
+            logger.warn("公开 TTS 未完成：reason={} status={}", e.reason(), e.httpStatus());
+            return ttsError(res, e.httpStatus(), e.reason(), e.userMessage());
+        }
+    }
+
+    /**
+     * 语音端点的失败响应：既有 JSON 信封 + {@code reason} 码（零 IP、零上游细节）。
+     *
+     * <p>{@code Cache-Control: no-store}：错误不该被边缘或浏览器缓存住 ——
+     * 否则"额度明天恢复"这件事在访客那里可能要等缓存过期才生效。
+     */
+    private ResponseEntity<Map<String, Object>> ttsError(HttpServletResponse res, int status,
+                                                         String reason, String message) {
+        res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", status);
+        body.put("message", message);
+        body.put("reason", reason);
+        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(body);
+    }
+
+    /** 请求体取字符串字段（非字符串值按其字面量处理；null 表示没给） */
+    private static String bodyString(Map<String, Object> body, String key) {
+        if (body == null) {
+            return null;
+        }
+        Object value = body.get(key);
+        return value == null ? null : String.valueOf(value);
     }
 
     /** 请求体取问题：只认 {@code question} / {@code q} 两个键，其余一律忽略 */

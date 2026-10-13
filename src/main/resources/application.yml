@@ -228,6 +228,37 @@ app:
     ua-max-chars: ${APP_WEBSTATS_UA_MAX_CHARS:60}               # 公网 UA 截断长度（先滤控制字符、再去 IP）
     backfill-max-mb: ${APP_WEBSTATS_BACKFILL_MAX_MB:64}         # 启动回填的字节预算（读满即停，如实披露）
     file-probe-seconds: ${APP_WEBSTATS_FILE_PROBE_SECONDS:10}   # 日志文件状态探测间隔（秒）
+  # ===== 公开端点 POST /api/public/tts（文字转语音；RUNBOOK §30）=====
+  # 【为什么默认关】站主还没给 Fish Audio 的 Key。Key 缺失时端点会如实返回
+  #   503 KEY_MISSING，但更干净的做法是默认 enabled=false：前端看到 TTS_DISABLED
+  #   就隐藏 🔊，而不是显示一个点了必报错的按钮。
+  # 【三道闸】① 只接受 phraseId（服务端短语表 app.tts.phrases.*，见 resources/tts-phrases.yml）
+  #   或 textHash（服务端"最近生成过的回答"的 sha512 前 32 位，进程内 LRU）；
+  #   自由文本一律 400 TEXT_NOT_ALLOWED —— 匿名端点永不接受任意文字。
+  #   ② 长度 ≤ max-chars；③ 单 IP 每日 + 全局每日，落盘 data/tts-quota.json（重启不丢）。
+  # 【缓存】sha256(voiceId+"\n"+text) → data/tts-cache/<hash>.mp3；命中直接返回、
+  #   不再调上游、也不吃每日额度；总量超 max-cache-mb 时按最旧淘汰。
+  # 【Key】只从环境变量 APP_TTS_API_KEY 读，【绝不】写默认值（写了等于把凭据放进仓库）。
+  #   空 = 明确"没配"：端点返回 KEY_MISSING，绝不静默变成可用。
+  # 【上游】走既有 OutboundGuard + 统一超时矩阵（app.outbound.*，connect 3s/read 12s/call 15s），
+  #   依赖键 tts-fish-audio（冷却与其它出站链路互相隔离）。
+  # ⚠️ 与 APP_QUOTA_*/APP_WEBSTATS_* 同一个坑：docker-compose.yml 的 environment 段必须
+  #    显式透传下面这些键，否则"在 .env 里加一行"不生效且不报错。
+  # ⚠️ 这几个键【不要留空】：空字符串绑到 boolean/int 会让应用直接启动失败。
+  tts:
+    enabled: ${APP_TTS_ENABLED:false}
+    voice-id: ${APP_TTS_VOICE_ID:}                              # Fish Audio 音色/模型 id（reference_id）；空 = 用上游默认音色
+    model: ${APP_TTS_MODEL:s1}                                  # 模型档位（请求头 model：s1 / s2-pro）
+    base-url: ${APP_TTS_BASE_URL:https://api.fish.audio}
+    api-key: ${APP_TTS_API_KEY:}                                # 只从环境变量注入；空 = 没配（KEY_MISSING）
+    max-chars: ${APP_TTS_MAX_CHARS:120}                         # 单次文本长度上限（成本闸；硬顶 600，超过夹回）
+    per-ip-daily: ${APP_TTS_PER_IP_DAILY:20}                    # 单 IP 每日合成次数
+    global-daily: ${APP_TTS_GLOBAL_DAILY:500}                   # 全局每日合成次数（换 IP 也绕不过）
+    cache-dir: ${APP_TTS_CACHE_DIR:data/tts-cache}              # 音频缓存目录（内容寻址）
+    max-cache-mb: ${APP_TTS_MAX_CACHE_MB:64}                    # 缓存目录上限；超限按最旧淘汰
+    quota-file: ${APP_TTS_QUOTA_FILE:data/tts-quota.json}       # 每日额度落盘文件（重启不丢）
+    history-size: ${APP_TTS_HISTORY_SIZE:200}                   # "最近生成过的回答"LRU 容量
+    phrases-file: ${APP_TTS_PHRASES_FILE:classpath:tts-phrases.yml}  # 服务端短语表（app.tts.phrases.*）
   # ===== 公开面 IP 显示口径 + "永不公开"清单（站主 2026-10-14 拍板）=====
   # 【唯一开关】mask-ips 只被 PublicIpPolicy 读一次，再由它作用到【所有】公开端点 ——
   #   一处控制、一个口径来源，不会出现"某个端点自己判断掩不掩码"的第三种口径
