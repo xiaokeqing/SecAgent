@@ -45,8 +45,12 @@ get_traffic() { # 输出: rx_day tx_day rx_month tx_month（字节；失败输�
 import json, subprocess, sys
 iface = sys.argv[1]
 def run(args):
+    # 【2026-10-14 修正】srv1 上是 **Python 3.6.8**，没有 subprocess.run(capture_output=/text=)（3.7+ 才有），
+    # 之前用它导致异常被吞、永远返回 UNKNOWN。改用 3.6 兼容的 check_output + universal_newlines。
     try:
-        return json.loads(subprocess.run(args, capture_output=True, text=True, timeout=20).stdout or "{}")
+        out = subprocess.check_output(args, universal_newlines=True,
+                                      stderr=subprocess.DEVNULL, timeout=20)
+        return json.loads(out or "{}")
     except Exception:
         return {}
 # 【2026-10-14 修正】用 `-i <iface>` 限定接口：vnstat 的"默认接口"在多网桥的机器上会挑到
