@@ -47,7 +47,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * 原样进了 {@code title} 与 {@code ruleName}。
  *
  * <p><b>实测现场（修复前，srv1 线上）</b>：{@code data.list[23].title} 与
- * {@code data.list[23].ruleName} 都等于上面那段原文，{@code 口令=passw0rd} 明文可见；
+ * {@code data.list[23].ruleName} 都等于上面那段原文，{@code 口令=示例明文(占位)} 明文可见；
  * 而同一时刻 {@code /api/public/honeypot} 是干净的（{@code 口令=[口令已隐藏]}）。
  * 也就是说：<b>同一个口令在一个端点上被隐去、在另一个端点上原文出网</b>。
  *
