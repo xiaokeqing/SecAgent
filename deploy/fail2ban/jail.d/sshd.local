@@ -1,0 +1,47 @@
+# ============================================================
+# srv1（阿里云应用服务器）sshd jail
+# ------------------------------------------------------------
+# 这份文件是权威副本（入库版本）。
+# 装机路径：/etc/fail2ban/jail.d/sshd.local
+# 由 scripts/srv1-fail2ban-setup.sh 安装。
+#
+# 日志源为什么不用 /var/log/secure：
+#   AL3 上 fail2ban 默认启用 systemd backend（journald），实测
+#     `fail2ban-client status sshd` -> Journal matches: _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+#   journald 比读 /var/log/secure 更可靠（不受 rsyslog 重启/轮转影响），
+#   所以这里【不写 backend】，保持 fail2ban 自动探测的结果。
+#
+# 封禁动作为什么不用默认的 firewallcmd-rich-rules（实测踩坑）：
+#   firewalld 0.9.11 在这台机器上用的是 nftables 后端。实测结论：
+#     · firewallcmd-rich-rules：能建规则（rich rule 会真的落到 public 区），
+#       但它只对【该 zone 的接口（eth0）】生效；
+#       docker 网桥（br-280200ec2ddf）属于 ACCEPT 目标的 docker 区，
+#       从容器进来的连接【完全绕过 rich rule】——实测封了照样能连。
+#     · firewallcmd-allports：走 `firewall-cmd --direct`，
+#       而 nftables 后端下 --direct 是【静默无效】：
+#       fail2ban 日志只写一行 "Ban x.x.x.x"（没有任何 ERROR），
+#       iptables / --get-all-rules / nft 里却什么都没有 —— 典型假成功。
+#   改用 iptables-multiport：规则写进 table ip filter 的 INPUT 链，
+#   INPUT 链对【所有接口】都生效，已用一次性容器实测：
+#   插规则前能连、插规则后 "Operation timed out"、删规则后恢复。
+#   只封 22 端口（multiport + port=ssh），避免 NAT 共享 IP 被误封时全端口断掉。
+# ============================================================
+[sshd]
+enabled  = true
+port     = ssh
+# aggressive：连"用户名不存在"的尝试也计入，能更早发现扫描
+mode     = aggressive
+maxretry = 4
+findtime = 10m
+bantime  = 1h
+# 回环地址不封。
+# 为什么必须显式写：fail2ban 1.0.2 的 jail.conf 里 ignoreip 是【注释掉的】，
+# 默认谁都不白名单 —— 一旦有人从本机触发检测，127.0.0.1 会被真封。
+# （实测 `fail2ban-client get sshd ignoreip` 返回 "No IP address/network is ignored"。）
+ignoreip = 127.0.0.1/8 ::1
+banaction = iptables-multiport
+# 必须显式写 chain：EPEL 版 jail.conf 的 [DEFAULT] 里写的是
+#   chain = <known/chain>
+# 那是给 firewalld/ipset 那套动作用的标记。配合 iptables-* 动作时
+# 行为容易随版本漂移，写死 INPUT 才是可复现的。
+chain = INPUT

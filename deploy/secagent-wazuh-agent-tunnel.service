@@ -1,0 +1,58 @@
+# ============================================================
+# srv1 -> srv2 Wazuh manager（1514 事件通道 / 1515 注册通道）SSH 隧道
+# ------------------------------------------------------------
+# 为什么需要这条隧道：
+#   manager 的 1514/1515 只绑在 srv2 的 127.0.0.1 上（docker-proxy 转发到
+#   wazuh.manager 容器）。srv1 要交事件，就必须有一条只有两端能用的通道。
+#   两个候选方案：
+#     ① 在 srv2 上把 1514/1515 放开到内网 —— 但 srv1（阿里云）和 srv2（腾讯云）
+#        不在一个 VPC 里，"内网"只能是公网地址段，等于把 manager 的
+#        事件入口和注册入口暴露到公网。
+#     ② 走 SSH 隧道：只有 srv2 的 sshd（22）需要可达，1514/1515 仍然只绑回环。
+#   选 ②（更安全的那个），并且用一把【专用密钥】+ permitopen 限制：
+#     command="/bin/false",restrict,port-forwarding,
+#     permitopen="127.0.0.1:1514",permitopen="127.0.0.1:1515"
+#   即使这把私钥在 srv1 上泄露，也拿不到 shell、只能转发这两个端口。
+#
+# 为什么不复用已有的 wazuh-tunnel 容器（它已经有一条到 srv2 的 SSH）：
+#   那个容器是【应用】的依赖（SecAgent 通过它读 Wazuh API 55000/9200）。
+#   给它加 -L 1514/1515 需要重建容器（docker compose up），
+#   而本项目明确要求应用侧只走 CI→ACR→digest 那套重建流程。
+#   独立一条 systemd 隧道 = 故障域隔离：隧道挂了只影响 srv1 的主机侧上报，
+#   不会碰到应用读告警的那条链路。
+#
+# 【重要】这条隧道用的是【本机回环监听】：
+#   127.0.0.1:1514 / 127.0.0.1:1515 —— 不对内网、更不对公网暴露。
+#   注意 srv2 的 fail2ban：这条隧道的 SSH 连接来自 srv1 的公网 IP，
+#   形态上像爆破。srv2 已经把 47.96.106.187 放进 fail2ban ignoreip
+#   （scripts/srv2-fail2ban-whitelist.sh），所以不会自伤；
+#   若哪天那条白名单被删，首先坏的就是这条隧道。
+# ============================================================
+[Unit]
+Description=SecAgent srv1 -> srv2 Wazuh manager (1514/1515) SSH tunnel
+Documentation=https://github.com/xiaokeqing/SecAgent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ssh -NT \
+  -i /root/.ssh/wazuh_agent_srv2_ed25519 \
+  -o BatchMode=yes \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o ConnectTimeout=15 \
+  -L 127.0.0.1:1514:127.0.0.1:1514 \
+  -L 127.0.0.1:1515:127.0.0.1:1515 \
+  root@43.143.114.79
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

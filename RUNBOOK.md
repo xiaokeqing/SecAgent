@@ -1977,4 +1977,228 @@ manager 侧：analysisd -t 通过；Total rules enabled 7020 → 7024
    与 Wazuh 的 timeframe 都是有界的。（srv2 的 Suricata 那条线覆盖网络层慢扫描，见 §11。）
 ```
 
+---
 
+# 【补录 2026-10-13 21:0x】以下 §21 原只存在于 srv1 的 /opt/secagent（从未提交），现捞回仓库；
+# 因 §24/§25 已先入库，本节排在文末，编号仍用 21 以便与 RUNBOOK 交叉引用一致。
+
+## 21. srv1 主机侧检测：fail2ban + wazuh-agent（2026-10-13 落地）
+
+> 背景：外部评审指出「检测全在 srv2，srv1 被打穿没人知道」。
+> 这一节记录 srv1 上现在到底装了什么、看得见哪些事件、怎么验证、怎么临时关掉，
+> 以及本次实测撞出来的坑（含两处「假成功」）。
+
+### 21.1 装了哪两样，各自在哪
+
+| 组件 | 位置 | 作用 | 状态 |
+|---|---|---|---|
+| fail2ban（已有，本次补配置） | srv1 宿主 `/etc/fail2ban/` | sshd 爆破封禁 + 公开端点注入封禁 | active，2 个 jail |
+| secagent-applog-mirror | srv1 宿主 systemd | 把应用容器 stdout 落到 `/var/log/secagent/app.log` | active |
+| wazuh-agent 4.9.2 | srv1 宿主 RPM（`/var/ossec`） | 采集认证/单元/docker/应用日志上报 srv2 | active，manager 侧 ID **006** |
+| secagent-wazuh-agent-tunnel | srv1 宿主 systemd | 把 srv2 的 `127.0.0.1:1514/1515` 映射到 srv1 回环 | active |
+| srv1 自定义规则 | srv2 `/opt/wazuh/config/wazuh_cluster/rules/srv1_local_rules.xml` | 9 条规则（100200-100232） | 已装载（总 7020 条） |
+
+入库（仓库 = srv1 `/opt/secagent`）：
+
+- `scripts/srv1-fail2ban-setup.sh` / `scripts/srv1-fail2ban-verify.sh`
+- `scripts/srv1-applog-mirror.sh`
+- `scripts/srv1-wazuh-tunnel-setup.sh` / `scripts/srv2-authorize-wazuh-agent.sh`
+- `scripts/srv1-wazuh-agent-install.sh`（`--enroll` 走 agent-auth）
+- `scripts/srv2-install-srv1-rules.sh`（含 `analysisd -t` 门禁）
+- `scripts/srv1-wazuh-make-events.sh` / `scripts/srv2-check-srv1-alerts.sh`
+- `deploy/fail2ban/{jail.d,filter.d,sample}/`、`deploy/secagent-applog-mirror.service`
+- `deploy/logrotate/secagent-applog`
+- `deploy/secagent-wazuh-agent-tunnel.service`、`deploy/wazuh/{srv1-ossec.conf,srv1_local_rules.xml}`
+
+### 21.2 反向确认：srv1 上现在**能被检测到**的事件（不是"已安装"）
+
+实测来源与规则（括号里是已在 manager 上真实产生告警的规则号）：
+
+| 事件类型 | 采集来源 | 规则 |
+|---|---|---|
+| SSH 登录成功 / PAM 会话开关 / sudo | `/var/log/secure` | 5715 / 5501,5502 / 5402,5403（内置，已实测出告警） |
+| **ssh 爆破 → 主机侧真封禁（留痕）** | `/var/log/fail2ban.log` | **100210**（封）/ 100211（解）（已实测出告警） |
+| **公开端点命中提示注入特征** | `/var/log/secagent/app.log` | **100220**（已实测出告警） |
+| **应用 ERROR 单条** | 同上 | **100221**（已实测 19 条告警） |
+| **应用 ERROR 突增（120s≥15）** | 同上 | **100222**（已实测出告警） |
+| 任意 systemd 单元失败 | `/var/log/messages` | 40704（内置，已实测：`docker.service`、`secagent-healthwatch.service`、自测单元） |
+| **secagent-\* 单元失败 / 看门狗判不健康** | `/var/log/messages` | **100200**（已实测：看门狗「不健康（第 2/3 次）」） |
+| **容器退出且不被重启** | `/var/log/messages`（dockerd） | **100230**（logtest 已验证；尚无真实触发） |
+| **docker 守护进程重启** | 同上 | **100231**（logtest 已验证） |
+| **应用容器启动完成（=刚重启过）** | app.log | **100232**（logtest 已验证） |
+| 网卡进混杂模式（容器创建痕迹） | `/var/log/messages` | 5104（内置，已实测 8 条） |
+| agent 自身连上/断开 | wazuh-agent | 501 / 506（已实测） |
+
+**明确看不见的（本次实测结论，别自欺）**：
+
+1. **公开端点的 URL 级扫描/注入**（`/wp-login.php`、`/.env`、`/../../etc/passwd`、`?q=../etc/passwd`）
+   —— 实测应用对这些请求**一行都不记**（Spring 不记未匹配路由），返回 404 且日志无痕。
+   所以"用 fail2ban 盯扫描路径"在 srv1 上是**做不到**的，不是没配。
+   要补只能从应用侧补 access log（需走 CI→ACR 重建，见 21.6）。
+2. **`/var/log/messages` 里可控失败登录的"Failed password"** —— 本机 `PasswordAuthentication no`，
+   密码失败这条路不存在；只有 `Invalid user`/`Connection closed by authenticating user` 形态。
+   （fail2ban 的 aggressive 模式吃这两种，所以封禁照常生效，已实测。）
+3. **docker 事件流的完整字段** —— `docker-listener` wodle 在这台机器上**不工作**（见 21.5），
+   改用 dockerd 自己写进 `/var/log/messages` 的日志，字段只有 container/exitStatus/restartCount。
+
+### 21.3 怎么验证（三条命令，都可重复跑）
+
+```bash
+# ① fail2ban：封禁-解封-连通性 全过程（含内核规则落地的功能性验证）
+sudo bash /opt/secagent/scripts/srv1-fail2ban-setup.sh --status
+sudo bash /opt/secagent/scripts/srv1-fail2ban-verify.sh --all
+
+# ② Wazuh：agent 侧状态 + 让 manager 侧真的报警
+sudo bash /opt/secagent/scripts/srv1-wazuh-agent-install.sh --status
+sudo bash /opt/secagent/scripts/srv1-wazuh-make-events.sh --all   # 造可控事件
+sudo bash /opt/secagent/scripts/srv1-wazuh-make-events.sh --cleanup
+
+# ③ 在 srv2 上看告警（直接读 alerts.json，不依赖 indexer）
+sudo bash scripts/srv2-check-srv1-alerts.sh              # 在 srv2 上执行
+```
+
+判据（缺一不可）：
+
+- `fail2ban-client status sshd|secagent-public-api` 都在，且
+  `iptables -S | grep f2b-` 能看到 `f2b-sshd` / `f2b-secagent-public-api` 两条链 + INPUT 跳转；
+- `srv1-fail2ban-verify.sh` 里「封禁后从探针容器连不上、解封后连得上」；
+- manager 侧 `agent_control -l` 里 ID 006 是 **Active**；
+- `alerts.json` 里能看到 100200/100210/100220/100221/100222 里的大多数（21.2 表里标"已实测"的）。
+
+### 21.4 怎么临时关掉（按影响面从小到大）
+
+```bash
+# 只关应用侧检测（保留 sshd 爆破封禁）
+sudo fail2ban-client stop secagent-public-api
+sudo fail2ban-client start secagent-public-api          # 恢复
+
+# 关掉全部 fail2ban 封禁（检测还在，只是不动作）
+sudo fail2ban-client stop
+sudo fail2ban-client start
+
+# 关掉主机侧上报（应用侧 fail2ban 不受影响）
+sudo systemctl stop wazuh-agent
+sudo systemctl start wazuh-agent
+
+# 停掉日志镜像（注意：这会让 app 侧两类检测同时失效）
+sudo systemctl stop secagent-applog-mirror
+
+# 回滚到改造前（配置层面，带备份）
+sudo bash /opt/secagent/scripts/srv1-fail2ban-setup.sh --rollback
+sudo bash /opt/secagent/scripts/srv1-wazuh-agent-install.sh --rollback
+```
+
+### 21.5 实测踩到的坑（都是"看起来成了、实际没成"）
+
+1. **fail2ban 封禁的三种假成功**
+   - `firewallcmd-rich-rules` 用在本 jail（没有 `port` 概念）时，`<port>` 被填成 `1:65535`，
+     firewalld 报 `INVALID_PORT` → 状态里显示已封、防火墙里什么都没有。
+   - `firewallcmd-allports` 走 `firewall-cmd --direct`，而本机 firewalld 0.9.11 是 **nftables 后端**，
+     `--direct` 静默无效：fail2ban 只写一行 `Ban x.x.x.x`（连 ERROR 都没有），内核里空空如也。
+   - firewalld 的 zone rich rule 只对 zone 绑定的接口生效：**docker 网桥在 ACCEPT 目标的 docker 区**，
+     从网桥进来的连接绕过 rich rule（实测封了照样连）。
+   ⇒ 两个 jail 改成 `iptables-multiport` / `iptables-allports`（写进 `table ip filter` 的 INPUT 链，
+   对所有接口生效），并用一次性容器做"封前能连/封后超时/解封恢复"的功能性验证。
+2. **`fail2ban-client reload` 不会重跑 actionstart**：改了封禁动作后 reload，
+   新动作的内核链根本不存在，之后每次封禁都只记状态、不落规则（假成功）。
+   ⇒ 安装脚本一律 `systemctl restart fail2ban`，并在生效后**试封一个 RFC5737 地址**、
+   断言内核规则真的出现又消失。
+3. **systemd unit 里的 `%` 是 specifier**：`printf "... %s ..."` 里的 `%s` 被展开成 `/bin/sh`，
+   日志文件里写进去的是 `(re)connect /bin/sh`，**真正的应用日志一行没落盘**，
+   而 unit 显示 active。⇒ 循环搬进 `scripts/srv1-applog-mirror.sh`，unit 只调脚本。
+4. **`docker logs -f` 在容器非 running 时正常退出**：只用 `Restart=always` 会得到
+   "服务反复 Succeeded"的抖动。⇒ 脚本里套 `while` + 每次重连写标记行（缺口可见）。
+5. **manager 规则的三条语法/语义坑**（改错会让 `wazuh-analysisd` 直接起不来 = 整个 SIEM 停摆）：
+   - 一条规则里不能同时写 `<match>` 和 `<regex>`；
+   - `<regex>` 默认是 osregex 方言，不支持 `(?:)`/`\d`/`|`，必须 `type="pcre2"`；
+   - **`<match>` 对"没有 decoder 命中的事件"不生效**（只比对 decoder 解出的 log 字段），
+     对自定义应用日志必须用 `type="pcre2"` 的 `<regex>`；
+   ⇒ 更新规则一律走 `scripts/srv2-install-srv1-rules.sh`（备份 → 写 → `analysisd -t` → 失败回滚 → 重启）。
+6. **预解码会吃掉"紧跟时间戳的那个词"**：应用日志行首是 ISO 时间戳，紧跟的 `ERROR/WARN/INFO`
+   在预解码阶段被当成日志级别丢掉 —— 实测同一条 ERROR 行，`regex "ERROR"` 不命中、`regex "---\s*\["` 命中，
+   于是"ERROR 突增"无从谈起。⇒ 在该 localfile 上加
+   `<out_format>$(timestamp %Y-%m-%d %H:%M:%S) secagentapp: $(log)</out_format>`，
+   让原始行整体落进正文，级别词重新可见（logtest 已验证：ERROR 行命中 100221、INFO 行不命中）。
+   同理 fail2ban 那行不能写成 `fail2ban\.actions.*Ban`（程序名也被吃掉），要用 `\]\s+Ban\s+<ip>`。
+7. **`docker-listener` wodle 在这台机器上不工作**：agent 日志里
+   `Module docker-listener started.` → 约 1 分钟后 `Module finished.`，
+   单独跑 `/var/ossec/wodles/docker/DockerListener` 也产不出事件，manager 侧 0 条 docker 告警。
+   ⇒ 明确 `<disabled>yes</disabled>`（不留假覆盖），容器事件改由 dockerd 写进 `/var/log/messages`
+   的日志覆盖（`ShouldRestart failed...` 已在里面实测看到，含本次崩溃重启循环的原文）。
+8. **离线 client.keys 不能用 `manage_agents -e` 的输出直接填**：
+   那是 base64 串，塞进 client.keys 会 `Authentication error. Wrong key or corrupt payload`，
+   而且 agent 会**自己重新注册**，ID 一路飘（本次：003→004→005→006），manager 上留一堆僵尸 agent。
+   ⇒ 用 `agent-auth -m 127.0.0.1 -p 1515 -A srv1-host`（隧道已通）；安装脚本默认**不再覆盖**
+   已存在的 client.keys（要覆盖显式 `--force-keys`）。
+
+### 21.6 封禁生效边界（最重要的一条，别记错）
+
+srv1 的公网入站是 **cloudflared 隧道**，应用只监听 `127.0.0.1:9900`。
+也就是说：攻击流量到达 srv1 时的**源 IP 是 127.0.0.1**。
+
+- sshd jail：攻击者直连 22 端口，**封禁真实有效**（已用一次性容器做功能性验证）。
+- `secagent-public-api` jail：它封的是应用日志里记录的真实访客 IP（`CF-Connecting-IP`）。
+  在 srv1 上做 L3 封禁**挡不住这个访客后续的流量**（流量从 Cloudflare 进来）。
+  它的真实价值是：① 检测+留痕（同一行日志进 Wazuh 出 100220 告警）；
+  ② 对"绕过 Cloudflare 直连源站"以及任何将来把 9900 暴露出去的场景立即生效。
+  **真正的处置点在 Cloudflare（WAF/自定义规则）或应用侧黑名单** —— 见 21.7 待办。
+  jail 里 `ignoreip = 127.0.0.1/8 ::1` 是必须的：应用拿不到 `CF-Connecting-IP`/XFF 时
+  `getRemoteAddr()` 就是 127.0.0.1，封了等于封自己。
+
+### 21.7 没做 / 疑虑（如实列）
+
+1. **公开端点的 URL 级滥用挡不住**（21.2 第 1 条）：应用不记 404/扫描路径，
+   主机侧无从检测。建议下一步在应用侧开 Tomcat access log（`server.tomcat.accesslog.*`，
+   走 CI→ACR 重建），拿到"请求行 + 真实 client IP"，那时候这条 jail 才能真正做扫描/注入封禁。
+2. **`secagent-public-api` 的封禁对公网访客无效**（见 21.6），目前只是"检测+留痕+防直连"。
+   没做：把封禁动作接到 Cloudflare（需要 Zone 级 API Token，本次没有可用凭据）。
+3. **manager 端口可达性**：srv2 的 1514/1515 至今只绑 `127.0.0.1`，srv1 靠
+   `secagent-wazuh-agent-tunnel`（专用密钥 + `permitopen 1514/1515`）过来。
+   这条隧道断了，srv1 的主机侧上报就停（fail2ban 不受影响）。
+   没做：隧道断连的**主动告警**（现在只能靠 manager 侧 agent 变 Disconnected 被动发现）。
+4. **agent 断连时的行为**：agent 侧有 `time-reconnect=60`、`auto_restart=yes`，
+   但断连期间的日志**不会补发**（`only-future-events=yes` 只跟新行）。也就是说
+   隧道断 N 分钟 = 这 N 分钟的 srv1 事件永久丢失（fail2ban 仍在本机封禁，只是没上报）。
+5. **agent 名字与文档不一致**：当前 manager 上的 srv1 agent 是 **ID 006、名字 = 主机名
+   `iZbp1eix0bsjl4c6nhktorZ`**（agent-auth 用 `-A srv1-host` 注册的那次是 ID 005，
+   被后来脚本里的旧 `--keys` 覆盖后又自动重注册成 006，005 已删除）。
+   名字不影响功能，但看板上一眼认不出是哪台机器 —— 要改成 `srv1-host` 需要"删 006 → agent-auth 重注册"。
+6. **`rootcheck` / `sca` 明确关掉了**（2 核 2GB 的机器上性价比太低），
+   `syscheck` 只留 `/etc,/usr/bin,/usr/sbin,/bin,/sbin`（不含 docker/data 目录）。
+   这三项属于"为省资源主动放弃"的覆盖面。
+7. **未验证到的**：100230/100231/100232（docker 事件三条）只有 `wazuh-logtest` 的验证，
+   等下一次真实的容器重启/退出才会产生第一条线上告警。
+8. **实测当天的副作用**：为了做验证，`/var/log/secagent/app.log` 里被追加过 6 行合成的
+   "公开提问命中注入特征…（来源=198.51.100.9）"日志（脚本 `--synthetic` 造的，已注明）；
+   `/etc/systemd/system/secagent-detect-selftest.service` 是当时造的故意失败单元，**已删除**。
+9. **本次现场发现的另一个真实事故**（不属于本任务范围，只记录）：
+   12:00 前后应用容器在"坏 digest ↔ 回滚"之间反复重启（dockerd 日志里
+   `restartCount=12`、`secagent-healthwatch.service: Failed`），
+   规则 100200 抓到了看门狗的不健康判定、40704 抓到了单元失败 —— 这正是本节要补的那层可见性。
+
+### 21.8 资源占用实测（2026-10-13 12:15，srv1）
+
+| 组件 | RSS |
+|---|---|
+| `fail2ban-server` | 26.6 MB |
+| wazuh-agent 全部进程（agentd+syscheckd+logcollector+modulesd+execd） | 53.1 MB |
+| 应用日志镜像（`/bin/bash` 循环 + `docker logs -f`） | ~3 MB |
+| **合计新增** | **≈ 83 MB** |
+
+对照同刻整机：总内存 1870 MB、可用 1142 MB、load 0.59/0.34/0.36。
+结论：**不会把 srv1 拖垮**（新增不到可用内存的 8%）。磁盘新增 `/var/log/secagent/` 约 0.3 MB/小时量级，
+由 logrotate 按天保留 7 份（`copytruncate`，fail2ban 与 wazuh 两个读者都不会跟丢 inode）。
+
+
+### 21.9 配置漂移风险（写在这里免得忘）
+
+- `/etc/fail2ban/jail.d/sshd.local` 的权威副本在 `deploy/fail2ban/jail.d/sshd.local`。
+  **但 `scripts/harden-ssh.sh` 里还内联着一份旧版 heredoc**（没有 `ignoreip` / `banaction` / `chain`）。
+  重跑 `harden-ssh.sh` 会把这份旧配置写回去，把本次加固冲掉。
+  下次动那个脚本时，把内联 heredoc 换成从 deploy/ 里 install（本次没改它，避免与并行改动冲突）。
+- `/root/.ssh/wazuh_agent_srv2_ed25519` 与 srv2 上 `authorized_keys` 里
+  `secagent-wazuh-agent-from-srv1` 那一行是**成对**的；只删一边 = 隧道起不来
+  （srv1 侧会一直 `Permission denied (publickey)`）。
+- srv2 上 `/opt/wazuh/config/wazuh_cluster/rules/srv1_local_rules.xml` 是 bind mount 进容器的，
+  改它必须走 `scripts/srv2-install-srv1-rules.sh`（否则语法错会让 analysisd 起不来）。
+- `/opt/secagent/vendor/srv1-client.keys` 是 agent 身份凭证，**不要入库**（`.gitignore` 里应有 vendor/）。

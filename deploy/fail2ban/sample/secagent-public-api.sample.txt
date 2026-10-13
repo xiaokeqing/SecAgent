@@ -1,0 +1,9 @@
+2026-10-13T11:28:36.677+08:00  WARN 1 --- [nio-9900-exec-1] o.example.publicapi.PublicAlertSource    : 公网只读端点：从上游结果中剔除 6 条内置样本告警（fail-closed：不把样本当真实攻击记录展示）
+2026-10-13T11:31:12.991+08:00  WARN 1 --- [nio-9900-exec-9] o.e.integration.wazuh.WazuhService       : 拉取 Wazuh 真实告警失败，回退到内置样本：依赖 wazuh-indexer 并发已满（上限 2），直接 fail-closed
+2026-10-13T11:34:02.526+08:00  INFO 1 --- [nio-9900-exec-2] o.example.publicapi.PublicAskService     : 公开提问命中注入特征 2 条，按设计拒绝生成（来源=203.0.113.77）
+2026-10-13T11:34:03.100+08:00  INFO 1 --- [nio-9900-exec-3] o.example.publicapi.PublicAskService     : 公开提问命中注入特征 1 条，按设计拒绝生成（来源=198.51.100.9）
+2026-10-13T11:34:04.100+08:00  INFO 1 --- [nio-9900-exec-4] o.example.publicapi.PublicAskService     : 公开提问命中注入特征 3 条，按设计拒绝生成（来源=127.0.0.1）
+2026-10-13T11:35:00.000+08:00 ERROR 1 --- [nio-9900-exec-1] o.e.security.GlobalExceptionHandler      : 未处理异常
+org.springframework.web.HttpRequestMethodNotSupportedException: Request method 'GET' is not supported
+	at org.springframework.web.servlet.mvc.method.RequestMappingInfoHandlerMapping.handleNoMatch(RequestMappingInfoHandlerMapping.java:265) ~[spring-webmvc-6.1.1.jar!/:6.1.1]
+2026-10-13T11:36:00.000+08:00  INFO 1 --- [   scheduling-1] o.example.integration.wazuh.WazuhClient  : Wazuh JWT 登录成功（baseUrl=https://wazuh-tunnel:55000）

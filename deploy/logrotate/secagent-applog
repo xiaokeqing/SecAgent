@@ -1,0 +1,21 @@
+# ============================================================
+# /var/log/secagent/app.log 轮转
+# ------------------------------------------------------------
+# 用 copytruncate 而不是 create：
+#   本文件有【两个】读者（fail2ban 和 wazuh-agent），
+#   它们都靠 inode 跟踪文件。copytruncate 保持 inode 不变，
+#   两个读者都不会因为轮转而"跟丢"。
+#   （这也是 fail2ban 官方推荐的轮转方式。）
+# 用量参考：应用日志约 1.6MB/天，7 天 + 压缩完全可接受。
+# ============================================================
+/var/log/secagent/app.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+    su root root
+}

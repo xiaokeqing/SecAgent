@@ -1,0 +1,33 @@
+# ============================================================
+# SecAgent 应用容器日志镜像（srv1 主机侧）
+# ------------------------------------------------------------
+# 职责只有一个：把应用容器的 stdout 变成宿主上一个【路径稳定】的纯文本文件
+#   docker logs -f secagent  ->  /var/log/secagent/app.log
+# 具体循环在 /opt/secagent/scripts/srv1-applog-mirror.sh 里（见那个文件的头注释：
+# 为什么需要镜像、为什么要有 while 循环、以及 systemd 的 % specifier 展开坑）。
+#
+# 谁在用这个文件：
+#   · fail2ban jail secagent-public-api（filter.d/secagent-public-api.conf）
+#   · wazuh-agent 的 localfile（/var/log/secagent/app.log，multi-line-regex）
+# 所以这个服务挂了 = 应用侧的"公开端点滥用"和"ERROR 突增"两类检测同时失效。
+# RUNBOOK §21 里有一条自检命令专门盯它。
+# ============================================================
+[Unit]
+Description=SecAgent 应用日志镜像（docker logs -f secagent -> /var/log/secagent/app.log）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/bin/mkdir -p /var/log/secagent
+ExecStartPre=/bin/sh -c 'test -e /var/log/secagent/app.log || : > /var/log/secagent/app.log'
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-applog-mirror.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

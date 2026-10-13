@@ -1,0 +1,66 @@
+# ============================================================
+# srv1：SecAgent 公开端点滥用 / 注入尝试 jail
+# ------------------------------------------------------------
+# 权威副本。装机路径：/etc/fail2ban/jail.d/secagent-public-api.local
+#
+# 日志来源为什么是"文件镜像"而不是 backend=systemd：
+#   本机 docker 用的是 json-file 日志驱动，应用 stdout 【不进 journald】
+#   （实测 `journalctl -u docker` 里只有 dockerd 自己的话，
+#     没有任何应用日志行）。要让 journald 里有应用日志，
+#   必须改 docker 守护进程的 log-driver 或给容器加 logging 配置 ——
+#   那要重建应用容器，而本项目的应用只允许走 CI→ACR→digest 重建，
+#   所以这里选【把容器日志落到宿主文件】：
+#     deploy/secagent-applog-mirror.service 把 `docker logs -f secagent`
+#     落到 /var/log/secagent/app.log（路径稳定，不随容器 ID 漂移）。
+#   另一个 candidate（fail2ban backend=systemd + journald 过滤）不是"更规范"，
+#   在 json-file 驱动下它【看不到任何应用日志】，是假覆盖。
+#
+# 【封禁生效边界 —— 必读】
+#   srv1 的公网入站是 cloudflared（隧道），应用只监听 127.0.0.1:9900。
+#   也就是说：攻击流量到达 srv1 时的【源 IP 是 127.0.0.1】，
+#   本 jail 封的是应用日志里记录的真实访客 IP（CF-Connecting-IP）。
+#   在 srv1 上做 L3 封禁【挡不住这个访客后续的流量】（流量从 Cloudflare 进来）。
+#   它的真实价值是：① 检测+留痕（同一条日志进 Wazuh 出告警）；
+#   ② 对"绕过 Cloudflare 直连源站"或任何将来把 9900 暴露出去的场景立即生效。
+#   真正的处置点在 Cloudflare（WAF/自定义规则）或应用侧黑名单 ——
+#   已记入 RUNBOOK §21「未做/待办」。
+# ============================================================
+[secagent-public-api]
+enabled  = true
+filter   = secagent-public-api
+logpath  = /var/log/secagent/app.log
+maxretry = 3
+findtime = 10m
+bantime  = 1h
+# 回环不封：应用在拿不到 CF-Connecting-IP/XFF 时 getRemoteAddr() 就是 127.0.0.1，
+# 封了等于封自己（cloudflared 就在本机）。
+ignoreip = 127.0.0.1/8 ::1
+# 【封禁动作的选择：实测踩了两个坑才定下来】
+#   坑 1（假成功）：先用 firewallcmd-rich-rules（跟 sshd jail 原样一致）。
+#     本 jail 没有 port 概念（应用监听 127.0.0.1:9900，端口号对"封来源 IP"无意义），
+#     fail2ban 就把 <port> 填成默认的 1:65535，firewalld 报 INVALID_PORT
+#     （它要的是 1-65535），action 直接失败。表现是：
+#       fail2ban-client status 显示 "Banned IP list: 198.51.100.9"
+#       而 fail2ban.log 里一行 ERROR "Failed to execute ban ... Error banning"
+#       防火墙里什么都没有 —— 状态说封了、实际没封。
+#   坑 2（更隐蔽的假成功）：改 firewallcmd-allports。它的 actionban 走
+#     `firewall-cmd --direct`，而本机 firewalld 0.9.11 用的是 nftables 后端，
+#     --direct 在 nft 后端下【静默无效】：fail2ban 只写 "Ban x.x.x.x"（连 ERROR 都没有），
+#     iptables -S / --get-all-rules / nft list ruleset 里全都没有这条。
+#     这种"没有任何报错的没生效"最危险 —— 只会让人以为已经防住了。
+#   坑 3（覆盖盲区）：firewalld 的 zone rich rule 只对 zone 绑定的接口生效。
+#     本机 eth0 在 public 区，但 docker 网桥（br-280200ec2ddf）在 ACCEPT 目标的 docker 区，
+#     从网桥进来的连接绕过 rich rule（实测：封了照样连得上）。
+#   ⇒ 最终选 iptables-allports：规则写进 table ip filter 的 INPUT 链，
+#     INPUT 链对所有接口都生效（已用一次性容器实测：封前能连、封后超时、解封恢复）。
+#     语义也对：这个来源已经被判定为滥用，没有"只封某个端口"的意义。
+#     chain=INPUT 显式写死，避开 jail.conf [DEFAULT] 里 chain=<known/chain> 的漂移。
+#
+# 【改完动作一定要 restart，不是 reload】
+#   fail2ban-client reload 会重建 jail，但【不会重跑 actionstart】。
+#   于是新动作的内核链根本不存在，之后每次封禁都只是记一条 "Ban x.x.x.x"：
+#   日志里没有 ERROR、fail2ban-client status 也显示已封，
+#   但 iptables 里空空如也 —— 又是一次假成功（本次实测踩到，排查了很久）。
+#   scripts/srv1-fail2ban-setup.sh 因此统一用 systemctl restart fail2ban，
+#   并在生效后断言两个内核链（f2b-sshd / f2b-secagent-public-api）真实存在。
+action   = iptables-allports[chain=INPUT]

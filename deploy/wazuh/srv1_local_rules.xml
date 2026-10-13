@@ -1,0 +1,139 @@
+<!--
+  ============================================================
+  srv1 主机侧 —— manager 侧自定义规则
+  ------------------------------------------------------------
+  装机位置（srv2）：
+    /opt/wazuh/config/wazuh_cluster/rules/srv1_local_rules.xml
+    （容器里是 /var/ossec/etc/rules/，是 bind mount，所以文件落在宿主上）
+  落盘方式：scripts/srv2-install-srv1-rules.sh
+    —— 它做 备份 -> 写 -> wazuh-analysisd -t 校验 -> 失败回滚 -> 重启
+       （踩过的坑：规则文件语法错会让 wazuh-analysisd 直接起不来，
+        也就是"加一条规则把整个 SIEM 弄挂"，所以必须有 -t 这道门）
+
+  为什么要写在 manager 上：
+    Wazuh 的规则匹配发生在 manager（analysisd），agent 只负责采集和转发。
+    所以"给 srv1 加检测规则" = manager 加规则 + srv1 配 localfile。
+
+  【语法坑 1】<match> 对"没有 decoder 匹配的事件"【不生效】：
+    实测（wazuh-logtest）：同一条应用日志行，
+      <match>未处理异常</match>                -> 不命中
+      <regex type="pcre2">未处理异常</regex>   -> 命中
+    原因：<match> 比对的是 decoder 解出来的 log 字段，
+    而没有 decoder 命中时那个字段是空的，只有 full_log。
+    本文件里所有规则因此【一律用 regex type="pcre2"】，不用 match。
+
+  【语法坑 2】regex 默认是 osregex 方言 —— 不支持 (?:...) 分组、\d、| 交替，
+    写 PCRE 会被判语法错。必须显式写成 regex type="pcre2"。
+    本次实测：只写一个 regex，内容是 \.(?:service|timer):\s+Failed，
+    照样报 "Syntax error on tag 'regex' in rule 100200"；
+    加上 type="pcre2" 立刻通过。
+
+  【语法坑 3】别用 ^ 锚定：regex 比对的目标不一定从行首开始
+    （实测 ^\S+\s+ERROR 这种写法不命中）。用不带锚的子串模式更稳。
+
+  【风险】规则文件语法错会让 wazuh-analysisd 拒绝启动 ——
+    也就是"加一条规则"能把整个 SIEM 弄挂（所有 agent 的告警全停）。
+    所以更新规则必须走 scripts/srv2-install-srv1-rules.sh（内含 -t 门禁 + 回滚）。
+
+  规则清单：
+    100200  secagent-* 单元失败 / 看门狗判定不健康
+    100210  fail2ban 封禁动作（主机侧处置留痕）
+    100211  fail2ban 解封动作
+    100220  公开端点命中提示注入特征（应用自己按设计拒绝）
+    100221  应用 ERROR 日志
+    100222  应用 ERROR 突增（120 秒内 15 条）
+    100230  docker 容器异常退出 / 停止 / 重启
+  ============================================================
+-->
+<group name="secagent,srv1,">
+
+  <!-- ===== secagent-* systemd 单元 =====
+       /var/log/messages 里的形态（实测）：
+         systemd[1]: secagent-redeploy.service: Succeeded.
+         systemd[1]: secagent-healthwatch.service: Failed with result 'exit-code'.
+         (看门狗自己的话) 2026-10-13 11:37:23 不健康（第 1/3 次）：无响应
+       覆盖这三种。注意刻意【不】匹配 "Succeeded" ——
+       单元正常结束不是事件，报了只会把真告警淹掉。 -->
+  <rule id="100200" level="10">
+    <regex type="pcre2">secagent-.*\.(?:service|timer):\s+(?:Failed|failed)|不健康（第 \d+/\d+ 次）</regex>
+    <description>srv1: SecAgent 单元异常或看门狗判定不健康</description>
+    <group>secagent,systemd,failure,</group>
+  </rule>
+
+  <!-- ===== fail2ban 动作 =====
+       /var/log/fail2ban.log 形态：
+         2026-10-13 11:51:42,740 fail2ban.actions [295279]: NOTICE  [sshd] Ban 172.20.0.4
+       这条规则的价值：主机侧的封禁不只是"本机记一笔"，
+       它同时进 SIEM —— 有人在扫 srv1 这件事对上层是可见的。 -->
+  <rule id="100210" level="7">
+    <regex type="pcre2">\]\s+Ban\s+\d+\.\d+\.\d+\.\d+</regex>
+    <description>srv1: fail2ban 封禁了一个来源 IP</description>
+    <group>secagent,fail2ban,</group>
+  </rule>
+  <rule id="100211" level="3">
+    <regex type="pcre2">\]\s+Unban\s+\d+\.\d+\.\d+\.\d+</regex>
+    <description>srv1: fail2ban 解封了一个来源 IP</description>
+    <group>secagent,fail2ban,</group>
+  </rule>
+
+  <!-- ===== 公开端点：命中提示注入特征 =====
+       PublicAskService.java:101 打的那一行，是 srv1 应用日志里
+       【唯一】带攻击方 IP 的"公开端点滥用"记录。
+       fail2ban 用同一行做封禁；这里让它在 SIEM 上也有告警。 -->
+  <rule id="100220" level="8">
+    <regex type="pcre2">公开提问命中注入特征</regex>
+    <description>srv1: 公开问答端点命中提示注入特征（应用已按设计拒绝，未生成回答）</description>
+    <group>secagent,public_api,attack,</group>
+  </rule>
+
+  <!-- ===== 应用 ERROR =====
+       Java 栈里的 "ERROR" 会让一堆无关行命中，
+       所以要求后面紧跟 Spring Boot 的 "N --- [" 形态。
+       不加 ^ 锚（实测锚定后会漏）。 -->
+  <rule id="100221" level="4">
+    <regex type="pcre2">ERROR\s+\d+\s+---\s*\[</regex>
+    <description>srv1: 应用 ERROR 日志</description>
+    <group>secagent,app,error,</group>
+  </rule>
+
+  <!-- ERROR 突增：120 秒内 15 条以上。
+       为什么要有这条：单条 ERROR 往往只是上游抖动；
+       突增才是"应用出事了"（实测撞上一次崩溃重启循环，
+       每 30 秒吐一整条堆栈）。 -->
+  <rule id="100222" level="11" frequency="15" timeframe="120">
+    <if_matched_sid>100221</if_matched_sid>
+    <description>srv1: 应用 ERROR 突增（120 秒内 15 条以上）—— 可能正在崩溃重启</description>
+    <group>secagent,app,error,surge,</group>
+  </rule>
+
+  <!-- ===== docker 容器事件 =====
+       【重要实测结论】内置的 docker-listener wodle 在这台机器上【没用】：
+       agent 日志里反复出现
+         wazuh-modulesd:docker-listener: INFO: Module docker-listener started.
+         wazuh-modulesd:docker-listener: INFO: Starting to listening Docker events.
+         wazuh-modulesd:docker-listener: INFO: Module finished.        <-- 约 1 分钟后自己退出
+       单独跑 /var/ossec/wodles/docker/DockerListener 也产不出事件，
+       manager 侧一条 docker 事件告警都没有。
+       所以容器事件的采集改成【dockerd 自己的日志】：
+       AL3 上 rsyslog 的 imjournal 把 dockerd 的日志落进 /var/log/messages
+       （已实测在里面看到容器退出/重启的原文），
+       srv1 的 agent 本来就采 /var/log/messages，不需要额外通道。
+       代价：看到的是 dockerd 视角的事件（容器 ID + 退出码 + restartCount），
+       不是 docker 事件流的完整字段。如实记录在 RUNBOOK §21。 -->
+  <rule id="100230" level="10">
+    <regex type="pcre2">ShouldRestart failed, container will not be restarted</regex>
+    <description>srv1: 容器退出且不会被重启（dockerd 原文含 container/exitStatus/restartCount）</description>
+    <group>secagent,docker,</group>
+  </rule>
+  <rule id="100231" level="7">
+    <regex type="pcre2">Daemon has completed initialization</regex>
+    <description>srv1: docker 守护进程重启完成（其上的容器都随之重启过）</description>
+    <group>secagent,docker,</group>
+  </rule>
+  <rule id="100232" level="5">
+    <regex type="pcre2">Started Main in \d+.*seconds</regex>
+    <description>srv1: 应用容器启动完成（出现即代表刚重启过一次）</description>
+    <group>secagent,docker,app,</group>
+  </rule>
+
+</group>
