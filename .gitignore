@@ -115,3 +115,22 @@ _deploy/
 # 子代理/临时对比目录（不入库）
 .tmp-serverdiff/
 .tmp-*/
+
+# ---------- 漂移巡检的只读快照（服务器本地状态，绝不入库）----------
+# 为什么：它是"权威仓库某一刻的副本"，用来给 srv1 当比对基准（srv1 连不上 GitHub）。
+# 它是【数据】不是【代码】：体积随仓库增长，而且入库会造成循环——
+# 拿仓库里的快照去证明"文件都在仓库里"。落点与维护方式见 scripts/srv1-repo-snapshot.sh。
+.repo-snapshot/
+.repo-snapshot.old-*/
+
+# ---------- srv1 上的部署/运行状态（本地状态，不入库）----------
+# 这些由发布链或巡检脚本自己生成，仓库里没有也不该有：
+#   DEPLOY-FINGERPRINTS.txt / last-known-good.json / releases/ / runtime/
+#    docker-compose.yml.ci-override.yml / daily-check-state.json / state/ / logs/
+last-known-good.json
+DEPLOY-FINGERPRINTS.txt
+docker-compose.yml.ci-override.yml
+/releases/
+/runtime/
+/state/
+daily-check-state.json

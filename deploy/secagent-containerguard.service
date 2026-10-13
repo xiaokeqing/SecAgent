@@ -1,0 +1,48 @@
+# ============================================================
+# SecAgent 容器守卫（systemd service）
+# ------------------------------------------------------------
+# 触发者：deploy/secagent-containerguard.timer（每 25 秒）
+# 做什么：跑 scripts/srv1-container-guard.sh —— 只用【容器名】断言
+#         secagent 容器存在且在运行（docker inspect -f '{{.State.Running}}'）。
+#         连续 2 次失败（≈≤60 秒）→ notify.sh HIGH；恢复 → INFO。
+#         带 600 秒冷却与"部署窗口抑制"（详情见脚本头部注释）。
+#
+# 为什么需要它：
+#   2026-10-14 21:58 误删生产容器导致 25–30 秒停机，而当时的巡检都是
+#   2–3 分钟级、且要连续 3 次（6–9 分钟）才动作 —— 短窗口完全漏掉，
+#   notify.log 里没有任何记录。这个 25 秒级的断言专补这条缝。
+#
+# 安装（root，srv1）：
+#   install -m 644 deploy/secagent-containerguard.service deploy/secagent-containerguard.timer /etc/systemd/system/ \
+#     && install -m 755 scripts/srv1-container-guard.sh /opt/secagent/scripts/srv1-container-guard.sh \
+#     && systemctl daemon-reload && systemctl enable --now secagent-containerguard.timer
+# 查看/手工跑：
+#   systemctl list-timers secagent-containerguard.timer
+#   journalctl -u secagent-containerguard.service -n 50 --no-pager
+#   bash /opt/secagent/scripts/srv1-container-guard.sh --status
+#   bash /opt/secagent/scripts/srv1-container-guard.sh --dry-run
+# 临时关闭：
+#   systemctl disable --now secagent-containerguard.timer
+# ============================================================
+[Unit]
+Description=SecAgent 容器守卫（每 25 秒断言容器存在且 Running，连续 2 次失败告警）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/secagent
+ExecStart=/bin/bash /opt/secagent/scripts/srv1-container-guard.sh
+# 一轮只做 docker inspect + 可能一次 curl；25 秒周期，必须很快返回
+TimeoutStartSec=60
+Nice=10
+MemoryMax=100M
+CPUQuota=20%
+# 与 secagent-redeploy.service / secagent-healthwatch.service 同样的坑：
+# ProtectHome=yes 会挡住 /root，docker CLI 需要显式指定凭据目录。
+Environment=DOCKER_CONFIG=/etc/secagent/docker
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes

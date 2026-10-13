@@ -76,7 +76,29 @@ if [ -x "$APP/scripts/notify.sh" ]; then
   esac
 fi
 
-# 5) 结果落盘
+# 5) 仓库↔服务器 漂移巡检（防"落地物只存在服务器"）
+#    为什么进自检：这类损失不会被任何"健康检查"发现 —— 服务器一切正常，
+#    只是"这台机器就是唯一副本"（曾经差点丢掉 RUNBOOK §21 与 20 个落地文件）。
+#    有【未登记】差异即失败，清单写 /opt/secagent/logs/drift-report.txt。
+#    临时关闭：DRIFT_CHECK_DISABLED=1（或把本段注释掉）。
+if [ "${DRIFT_CHECK_DISABLED:-0}" = "1" ]; then
+  say "漂移巡检: 已关闭（DRIFT_CHECK_DISABLED=1）"
+elif [ -x "$APP/scripts/srv1-drift-check.sh" ]; then
+  DOUT=$(bash "$APP/scripts/srv1-drift-check.sh" 2>&1); DRC=$?
+  DLINE=$(printf '%s\n' "$DOUT" | grep -m1 '^drift:')
+  if [ "$DRC" -eq 0 ]; then
+    say "漂移巡检: OK  $DLINE"
+  else
+    FAIL=1; DETAIL="$DETAIL 漂移巡检(rc=$DRC);"
+    say "漂移巡检: **失败**  $DLINE"
+    printf '%s\n' "$DOUT" | grep -E '^  \[(diff|missing_in_repo|missing_on_server)\]' | head -n 20 | sed 's/^/    /' | tee -a "$LOG"
+    say "  完整清单：$APP/logs/drift-report.txt（处理办法见表尾）"
+  fi
+else
+  FAIL=1; DETAIL="$DETAIL srv1-drift-check.sh 缺失;"; say "srv1-drift-check.sh 不存在"
+fi
+
+# 6) 结果落盘
 python3 - "$STATE" "$FAIL" "$DETAIL" <<'PY'
 import json, sys, time
 state, fail, detail = sys.argv[1], sys.argv[2], sys.argv[3]
