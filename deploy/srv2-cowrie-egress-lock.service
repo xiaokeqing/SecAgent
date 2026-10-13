@@ -1,0 +1,17 @@
+[Unit]
+Description=Lock down Cowrie honeypot egress (prevent pivot)
+# 必须等 docker 起来 —— Docker 会自己重建 DOCKER-USER 链，
+# 跑在它前面的话规则会被覆盖掉（表现就是"加了但没生效"）
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cowrie-egress-lock.sh
+# 容器重启后子网可能变化，所以每次启动都重新应用一遍
+ExecReload=/usr/local/sbin/cowrie-egress-lock.sh
+
+[Install]
+WantedBy=multi-user.target

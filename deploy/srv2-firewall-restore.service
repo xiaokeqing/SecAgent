@@ -1,0 +1,14 @@
+[Unit]
+Description=恢复 SecAgent 的 ipset/iptables 规则（封禁规则重启不丢）
+# 必须在 docker 之前或至少不依赖它；网络就绪后即可恢复
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# -exist：幂等，已存在的集合/规则不报错；绝不 flush 现有规则
+ExecStart=/bin/sh -c 'test -f /etc/ipset.conf && /sbin/ipset restore -exist < /etc/ipset.conf; test -f /etc/iptables/rules.v4 && /sbin/iptables-restore -n < /etc/iptables/rules.v4; test -f /etc/iptables/rules.v6 && /sbin/ip6tables-restore -n < /etc/iptables/rules.v6; true'
+
+[Install]
+WantedBy=multi-user.target
