@@ -44,6 +44,9 @@ LISTEN_PORT = int(os.environ.get("NOTIFY_RELAY_PORT", "8899"))
 MAIL_COOLDOWN = int(os.environ.get("NOTIFY_MAIL_COOLDOWN", "600"))
 STATE = {"mail_last": {}, "count": 0}
 HIGH_MARKERS = ("[严重]", "[CRITICAL]", "[紧急]", "[高危]", "[HIGH]")
+# 邮件通道开关：站主 2026-10-13 明确「只要飞书，邮件一会有一下太麻烦」→ 默认关闭。
+# 想重新启用：.env 写 NOTIFY_EMAIL_ENABLED=1，并补 NOTIFY_EMAIL_USER / NOTIFY_EMAIL_AUTHCODE / NOTIFY_EMAIL_TO。
+EMAIL_ENABLED = (os.environ.get("NOTIFY_EMAIL_ENABLED", "0") == "1")
 
 
 def log(msg):
@@ -107,6 +110,8 @@ def send_feishu(cfg, text):
 
 
 def send_mail(cfg, text):
+    if not EMAIL_ENABLED:
+        return "skipped", "邮件通道已关闭（NOTIFY_EMAIL_ENABLED != 1）"
     user = cfg.get("NOTIFY_EMAIL_USER") or ""
     code = cfg.get("NOTIFY_EMAIL_AUTHCODE") or ""
     to = cfg.get("NOTIFY_EMAIL_TO") or user
