@@ -835,3 +835,36 @@ srv1 侧：数据链路约 1.5 分钟自愈回 REAL，health 全程 200/ok ✓
 这些以后不再告警。取舍理由：它们 24h 从未命中，却在每次加载/匹配上都要付费；
 若将来需要这类信号，可随时从 §17.1 的备份恢复（或按需只加回特定 sid）。
 ```
+
+---
+
+## 18. ⑦ 凭据轮换收口（2026-10-13，站主确认"就用这个读写的"）
+
+### 18.1 最终状态
+```
+srv1 拉取凭据（两个 ACR 域名 + 服务专用凭据目录 /etc/secagent/docker/config.json）：
+  用户名 = aliyun4512567175（账号名）
+  密码   = ACR 控制台设的【Registry 专用固定密码】（与账号登录密码、AccessKey 都不是一回事；可单独吊销）
+验证（2026-10-13 实测）：
+  · 正向：docker pull stable 成功（revision 0ae03a6）
+  · 部署链：systemctl start secagent-redeploy → success，health=ok，digest 指针解析正常
+  · 负向：**推送成功** → 该密码是【读写】档，不是只读
+回滚点：/etc/secagent/backup/docker-config-20261013-102101.json
+```
+
+### 18.2 如实记录残余风险（站主已知悉并接受）
+```
+· 该凭据具备 push 权限 → 若 srv1 被完全拿下，攻击者可向本仓库推送镜像（供应链风险；
+  当前缓解手段是部署链的 label==commit 硬门禁 + 看门狗自动回滚，但那挡的是"跑错版本"，不挡"恶意镜像"）。
+· 想彻底消除：ACR 控制台「设置固定密码」里的【只读】档，或 RAM 子账号（登录名
+  srv1-puller@1770913866205593.onaliyun.com + 它自己的固定密码 + 只给 cr:GetAuthorizationToken/PullRepository）。
+  2026-10-13 试过该 RAM 全名 + 站主给的密码 → 登录被拒（说明那个密码属主账号），故暂未采用。
+· 另：负向测试往 ACR 推了一个测试 tag `verify-pull-only-20261013-102101`，需站主在控制台删除。
+```
+
+### 18.3 脚本加固（同批）
+```
+scripts/srv1-switch-acr-credential.sh：原来只在"拉取失败"时回滚；现在"推送竟然成功"也会
+把服务凭据自动回滚（避免把读写凭据留在服务目录里）。教训：负向测试必须用**同名 tag**做
+tag+push，否则 push 一个本地不存在的 tag 会因"tag 不存在"失败 —— 那是假失败，不是权限判定。
+```
