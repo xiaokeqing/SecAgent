@@ -146,7 +146,7 @@ public class PublicApiController {
 
     private Object scrubDeep(Object v) {
         if (v instanceof String s) {
-            return assets().scrub(s);
+            return scrubText(s);
         }
         if (v instanceof Map<?, ?> m) {
             Map<String, Object> out = new LinkedHashMap<>();
@@ -161,6 +161,39 @@ public class PublicApiController {
             return out;
         }
         return v;
+    }
+
+    /**
+     * 单个字符串的出关口径：<b>先资产名 scrub、再凭据脱敏</b>。
+     *
+     * <p>顺序不能反：出口是"先去掉内部资产名，再把口令字段隐去"。
+     *
+     * <p><b>为什么必须在这里补一道（2026-10-14 红线违反的修复）</b>：本方法原先只有
+     * {@code assets().scrub(s)}，<b>从不做凭据脱敏</b>。{@code /honeypot} 是显式调
+     * {@link CredentialStructure#hidePasswords(String)} 才干净的，而告警链路
+     * （{@code buildAlerts()} → {@code publicAggregate()} / {@code publicAlert()}）
+     * 一处都没调 —— 于是蜜罐规则原文里的 {@code 口令=<明文>} 随 {@code title} /
+     * {@code ruleName} 直出公网（{@code /api/public/alerts} 与
+     * {@code /api/public/alerts/{aggId}}）。泄漏的是攻击者猜的口令，但违反本站红线
+     * "蜜罐完整口令永不上公网"。
+     *
+     * <p><b>为什么修在 {@code scrubDeep()} 而不是补在 {@code buildAlerts()} 里</b>：
+     * {@code scrubDeep()} 是公开面<b>唯一的出海闸门</b>（见 {@link #ship}）。补在闸门上，
+     * 今天所有端点一并覆盖，<b>以后新加的公开端点默认就是安全的</b>；补在某一个
+     * {@code buildXxx()} 里则只修了那一条路径 —— 那正是这次出事的失败模式
+     * （{@code /honeypot} 记得调、{@code /alerts} 忘了调）。这与 {@link #ship} 那
+     * "过整棵树而不是逐字段手工过滤"的理由是同一条。
+     *
+     * <p>对 {@code /honeypot} 是双重保险：它本来就已把口令换成
+     * {@link CredentialStructure#PASSWORD_HIDDEN}，而 {@code hidePasswords} 幂等
+     * （占位符里没有 {@code 口令=…} 形状），所以<b>输出不变</b>。
+     * {@code PublicHoneypotScrubPipelineTest} 钉住这一点。
+     */
+    private String scrubText(String s) {
+        if (s == null || s.isEmpty()) {
+            return s;
+        }
+        return CredentialStructure.hidePasswords(assets().scrub(s));
     }
 
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
