@@ -1,0 +1,46 @@
+# ============================================================
+# srv2：SecAgent 封禁状态恢复（ipset + iptables）
+# ------------------------------------------------------------
+# 为什么需要它：
+#   srv2 上有 ipset 集合 secagent_block 与一条引用它的 DROP 规则
+#   （-A INPUT -m set --match-set secagent_block src -j DROP）。
+#   2026-10-13 第一次重启实测发现：**没有恢复单元 → 重启后规则消失**，
+#   而 SecAgent 侧仍记着"已封禁" → 出现"报告已封禁、实际不拦截"的状态与现实不一致。
+#
+# 两次踩坑（都记在这里，不要再犯）：
+#   坑1：在 unit 里写死 `ipset create secagent_block hash:ip`，而重启前的集合是 hash:net
+#        → 类型冲突 → 整条 ExecStart 失败 → 规则没恢复。
+#   坑2：重启后【应用自己】会把集合建成 hash:ip（与快照里的 hash:net 不同）
+#        → 结论：**集合的创建权归应用**，本单元只负责①确保存在②恢复条目③确保 DROP 规则。
+#
+# 安装（root，srv2）：
+#   install -m 644 deploy/srv2-netfilter-restore.service /etc/systemd/system/secagent-netfilter-restore.service
+#   mkdir -p /etc/secagent/netfilter
+#   ipset save secagent_block | grep '^add ' > /etc/secagent/netfilter/ipset.add   # 条目快照
+#   systemctl daemon-reload && systemctl enable secagent-netfilter-restore.service
+# 验证（不需要重启也能验证）：
+#   systemctl start secagent-netfilter-restore.service && systemctl show ... -p Result
+# 完整验证（重启实测，已完成两次）：
+#   ipset add secagent_block 203.0.113.9 -exist   # 放测试条目
+#   ipset save secagent_block | grep '^add ' > /etc/secagent/netfilter/ipset.add
+#   reboot ；回来后再看：集合存在、条目仍在、DROP 规则 1 条、fail2ban active、容器全起
+#   ipset del secagent_block 203.0.113.9           # 清理
+# ============================================================
+[Unit]
+Description=SecAgent 封禁状态恢复（集合存在性 + 封禁条目 + 引用它的 DROP 规则）
+Documentation=file:/opt/secagent/RUNBOOK.md
+After=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# ① 确保集合存在（按应用约定 hash:ip；-exist 让已存在时不报错）
+ExecStart=/bin/sh -c '/sbin/ipset create secagent_block hash:ip -exist'
+# ② 恢复封禁条目（快照可能为空，用 -s 判断避免空文件报错）
+ExecStart=/bin/sh -c 'if [ -s /etc/secagent/netfilter/ipset.add ]; then /sbin/ipset restore -exist -f /etc/secagent/netfilter/ipset.add; fi'
+# ③ 确保 DROP 规则存在（幂等：先用 -C 检查，缺失才插）
+ExecStart=/bin/sh -c '/sbin/iptables -C INPUT -m set --match-set secagent_block src -j DROP 2>/dev/null || /sbin/iptables -I INPUT -m set --match-set secagent_block src -j DROP'
+
+[Install]
+WantedBy=multi-user.target

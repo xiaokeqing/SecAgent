@@ -694,3 +694,49 @@ U2（回收开发期额度）的完整执行方法：
 公开端点：verify-public-endpoint.sh --full 13/13 通过
 博客：本地 HEAD 7c1346b（八轮改版），相对 origin/main 13 文件 +925/−309，**未发布**（等站主确认）
 ```
+
+---
+
+## 16. srv2 封禁状态的重启持久化（2026-10-13 实测，两次重启验证）
+
+### 16.1 为什么做
+```
+srv2 上 ipset 集合 secagent_block + 一条引用它的 DROP 规则负责"真的拦"。
+2026-10-13 首次重启实测发现：**没有任何 iptables/ipset 恢复单元** →
+重启后规则消失（iptables 124→116 条、引用 secagent_block 的规则 0 条），
+而 SecAgent 侧仍记着"已封禁" —— 典型的"报告已封禁、实际不拦截"。
+（对比：fail2ban 是 enabled/active，它自己会恢复；我们那套不会。）
+```
+
+### 16.2 两次踩坑（已固化进 unit，别再犯）
+```
+坑1：在 unit 里写死 `ipset create secagent_block hash:ip`，而重启前的集合类型是 hash:net
+     → 类型冲突 → 整条 ExecStart 失败（unit 显示 failed）→ 规则没恢复。
+坑2：重启后【应用自己】把集合建成了 hash:ip（与旧快照的 hash:net 不一致）。
+结论：**集合的创建权归应用**；恢复单元只做三件事：确保存在（hash:ip + -exist）、恢复条目、确保 DROP 规则（幂等）。
+快照只存【条目】(add 行)，不存 create 行。
+```
+
+### 16.3 结果（第二次重启的对照证据）
+```
+重启前：集合内 1 个测试条目（203.0.113.9）+ 1 条 DROP 规则
+重启后：恢复单元 enabled + Result=success ｜ 集合存在(hash:ip) ｜ 条目数=1 ｜ 测试 IP 仍在 ✓
+        DROP 规则 1 条 ✓ ｜ fail2ban active ✓ ｜ 五个容器全起（manager/indexer/suricata/cowrie/dashboard）✓
+srv1 侧：数据链路约 1.5 分钟自愈回 REAL，health 全程 200/ok ✓
+        期间首个采样是 REAL/degraded=true —— 正是 §4.5 那条"REAL 但查询失败必须如实 degraded"在生效
+安装与验证命令见 deploy/srv2-netfilter-restore.service 顶部注释
+```
+
+### 16.4 顺带关掉的项：srv1 docker bridge
+```
+核实：容器跑在 secagent_default（bridge，非 host/none）；iptables -t nat POSTROUTING 有
+      172.17/172.18/172.19/172.20 的 MASQUERADE 链；容器内可解析 wazuh-tunnel（172.20.0.3）且能出网。
+结论：**"bridge 坏掉"这条已不成立**，不需要动它（早前那次绕开做法已被正确配置取代）。
+```
+
+### 16.5 维护窗口余项
+```
+仍待做：Suricata 规则裁剪（门禁 = 裁剪前后各跑一次演练，告警无遗漏才算通过）
+仍待站主确认：诱饵端口清单与安全影响评估（见 E:\DeepSeek1\work\维护窗口与凭据轮换-执行方案-20261013.md §三）
+仍待站主提供：srv1-puller（只读）RAM 子账号凭据 → 用于替换当前主账号拉取凭据（§四）
+```
