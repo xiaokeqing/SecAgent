@@ -65,6 +65,15 @@ public class QueryMetricsTools {
             String timeRange) {
         logger.info("开始查询活动安全告警, Mock模式: {}, timeRange: {}", mockEnabled, timeRange);
 
+        // 【公开身份：工具层直接拒绝（F2 收紧，2026-10-13）】
+        // 活动告警是内部真实事件数据（告警名/描述/活跃时间），公开面一律不读；
+        // 编排层已把公开身份挡在取证分支外，这里再挡一层并留痕。
+        if (org.example.security.EvalIdentity.isPublicRequest()) {
+            logger.warn("公开身份请求被拒绝：queryPrometheusAlerts（公开面不读取内部告警数据）");
+            return buildErrorResponse("公开身份不得读取内部告警数据：公开面只基于公开知识库回答，不读取内部事件数据。",
+                    "public-identity-no-internal-data");
+        }
+
         try {
             List<SimplifiedAlert> simplifiedAlerts;
 

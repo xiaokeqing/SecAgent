@@ -3,6 +3,7 @@ package org.example.security;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -56,6 +57,21 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Map<String, Object>> handleNoResource(NoResourceFoundException e) {
         logger.debug("路径不存在: {} {}", e.getHttpMethod(), e.getResourcePath());
         return build(HttpStatus.NOT_FOUND, "接口或资源不存在");
+    }
+
+    /**
+     * 请求体不是合法 JSON（或类型不匹配）。
+     *
+     * <p>典型场景：调用方拼错了 JSON（例如把 {@code {"question":"…"}} 写成裸文本）。
+     * 这是**客户端错误**，应由调用方修正，因此返回 400 而不是 500。
+     * <p>此前它会落到 {@code Exception} 兜底分支：既回了 500，又在日志里打一整段
+     * {@code HttpMessageNotReadableException} 堆栈 —— 把"调用方发错了"记成了"服务器内部错误"，
+     * 排查时容易被误导（2026-10-13 实测：一条这样的日志就是这么来的）。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Map<String, Object>> handleUnreadableBody(HttpMessageNotReadableException e) {
+        logger.warn("请求体不是合法 JSON：{}", String.valueOf(e.getMostSpecificCause().getMessage()));
+        return build(HttpStatus.BAD_REQUEST, "请求体格式错误：需要合法 JSON");
     }
 
     /** 兜底：不向客户端泄露内部堆栈 */

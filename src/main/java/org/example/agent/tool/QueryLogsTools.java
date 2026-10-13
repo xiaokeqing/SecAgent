@@ -56,6 +56,16 @@ public class QueryLogsTools {
     public String getAvailableLogTopics() {
         logger.info("获取可用的安全日志主题列表");
 
+        // 【公开身份：工具层直接拒绝（F2 收紧，2026-10-13）】
+        // 公开端点上"模型自觉不调"不算保证：编排层已经把公开身份挡在取证分支之外，
+        // 这里再挡一层 —— 只要这条链路被别处误接，公开请求也读不到任何内部日志面信息。
+        // 拒绝时写日志留痕（谁在什么时候试图读内部日志），不返回任何内部内容。
+        if (org.example.security.EvalIdentity.isPublicRequest()) {
+            logger.warn("公开身份请求被拒绝：getAvailableLogTopics（公开面不暴露内部日志主题）");
+            return "{\"success\":false,\"error\":\"public-identity-no-internal-data\","
+                    + "\"message\":\"公开身份不得读取内部日志主题：公开面只基于公开知识库回答。\"}";
+        }
+
         try {
             List<LogTopicInfo> topics = new ArrayList<>();
 
@@ -155,6 +165,15 @@ public class QueryLogsTools {
             @ToolParam(description = "日志主题: auth-logs, web-access-logs, system-events, firewall-logs") String logTopic,
             @ToolParam(description = "查询关键字，如 Failed password、union select、webshell；为空时返回该主题核心日志") String query,
             @ToolParam(description = "返回日志条数，默认20，最大100") Integer limit) {
+
+        // 【公开身份：工具层直接拒绝（F2 收紧，2026-10-13）】见 getAvailableLogTopics 处的说明。
+        // 公开问答曾经实测把内部真实日志原文带回公开回答（含内部资产名/接口路径），
+        // 所以这条"读内部数据"的入口在公开身份下一律拒绝，且不落任何日志内容。
+        if (org.example.security.EvalIdentity.isPublicRequest()) {
+            logger.warn("公开身份请求被拒绝：queryLogs（logTopic={}，公开面不读取内部日志）", logTopic);
+            return "{\"success\":false,\"error\":\"public-identity-no-internal-data\","
+                    + "\"message\":\"公开身份不得读取内部安全日志：公开面只基于公开知识库回答，不读取内部事件数据。\"}";
+        }
 
         int actualLimit = (limit == null || limit <= 0) ? 20 : Math.min(limit, 100);
         String safeQuery = query == null ? "" : query;

@@ -137,6 +137,70 @@ public class PublicKbService {
 
     // ==================== 输出加工 ====================
 
+    /**
+     * 把命中的公开片段渲染成可读的 markdown（标题 + 片段 + 可信度）。
+     *
+     * <h3>为什么必须有这一步（F5 方案 B，2026-10-13）</h3>
+     * 实测：概念题（如"OWASP A07 是什么"）返回 {@code state=input-insufficient}
+     * 「依据不足，不做定性」，<b>但检索其实命中了 3 条引用</b> —— 引用只躺在 {@code citations}
+     * 字段里，页面正文一句"依据不足"就把访客劝退了，体验上等于"AI 什么也不答"。
+     * 现在把命中的片段直出到正文里，并明说口径（只基于公开知识库、不读取内部事件数据）。
+     *
+     * <h3>为什么做成静态方法、放在这里</h3>
+     * 正文里的引用与 {@code citations} 字段是同一份数据的两种呈现：渲染只应有一处定义，
+     * 各写一份迟早会出现"字段里有、正文里没有"或两处说法不一致。
+     * 渲染出的文本仍要由调用方过一遍 {@link PublicOutputGuard}（防御纵深），
+     * 这里只负责格式，不做安全判定。
+     *
+     * @param citations {@link #search(String)} 的返回值；为空时返回空串（调用方不必特判）
+     */
+    public static String renderCitationBlock(List<Map<String, Object>> citations) {
+        if (citations == null || citations.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("### 命中的公开知识库片段（未经 AI 加工，供你自行判断）\n\n");
+        sb.append("> 公开演示只基于公开知识库回答：以下片段来自内置安全知识库（security-docs）")
+          .append("与人工审核通过的白名单文档。内部日志、告警原文、资产清单与真实攻击记录")
+          .append("一律不接入，也不会出现在本回答里。\n\n");
+        int i = 1;
+        for (Map<String, Object> c : citations) {
+            if (c == null) {
+                continue;
+            }
+            String title = asText(c.get("title"), "（未命名片段）");
+            String snippet = asText(c.get("snippet"), "");
+            String trust = asText(c.get("trustLevelLabel"), "可信度未标注");
+            String sourceType = asText(c.get("sourceTypeLabel"), "");
+            Object score = c.get("score");
+
+            sb.append(i++).append(". **").append(title).append("**")
+              .append("（可信度：").append(trust);
+            if (!sourceType.isBlank()) {
+                sb.append("，来源性质：").append(sourceType);
+            }
+            if (score != null) {
+                sb.append("，相关度：").append(score);
+            }
+            sb.append("）\n");
+            if (!snippet.isBlank()) {
+                for (String line : snippet.split("\n")) {
+                    sb.append("   > ").append(line).append("\n");
+                }
+            }
+            sb.append("\n");
+        }
+        return sb.toString().trim();
+    }
+
+    private static String asText(Object v, String fallback) {
+        if (v == null) {
+            return fallback;
+        }
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? fallback : s;
+    }
+
     /** 标题：元数据 title 优先（是文档内部的小节名），缺失时退化成文件名去掉扩展名 */
     private static String cleanTitle(String title, String fileName) {
         if (title != null && !title.isBlank() && !"null".equalsIgnoreCase(title)) {

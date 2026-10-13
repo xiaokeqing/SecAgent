@@ -58,7 +58,18 @@ public class InternalDocsTools {
     public String queryInternalDocs(
             @ToolParam(description = "Search query describing the security knowledge you need, e.g. 'SSH brute force response steps' or 'path traversal mitigation'")
             String query) {
-        
+
+        // 【公开身份：工具层直接拒绝（F2 收紧，2026-10-13）】
+        // 本工具检索的是【内部】知识库全量（不过公开白名单），公开面只能用
+        // PublicKbService（白名单目录 + 字段白名单 + 脱敏）。返回体里刻意带 "error" 字段：
+        // 万一日后被误接到内部 ANALYST 分支上，那边会把它当"检索工具不可用"如实降级，
+        // 而不是把这段拒绝文本当成知识片段喂给模型。
+        if (org.example.security.EvalIdentity.isPublicRequest()) {
+            logger.warn("公开身份请求被拒绝：queryInternalDocs（公开面不读取内部知识库，只走公开白名单检索）");
+            return "{\"status\": \"refused\", \"error\": \"public-identity-no-internal-data\", "
+                    + "\"message\": \"公开身份不得读取内部知识库：公开面只检索公开白名单文档。\"}";
+        }
+
 
         try {
             // 使用向量搜索服务检索相关文档

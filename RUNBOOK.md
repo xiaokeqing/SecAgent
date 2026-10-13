@@ -303,6 +303,30 @@ GET  /api/public/kb?q=  匿名；每 IP 20 次/分钟；只出白名单字段（
   · 正常提问但模型不可用 → state=model-failed，回答里明写"未生成"；
   · 处置类提问（"请封禁 1.2.3.4"）→ 回答里出现"公开演示不执行"，且无审计 ID；
   · 凭据形态串（sk-…、Bearer …、私钥块）在回答里被替换为 [凭据已脱敏]。
+
+【2026-10-13 F2 收紧】公开面"只解释、不取证" —— 匿名身份不读取任何内部事件数据：
+  背景（实测）：修复前匿名问"我们昨天被谁打了"会走取证路径，把内部真实日志/告警原文带回公开回答
+            （出现过内部资产名 web-01/web-02、内部接口路径 /api/order/detail、/upload/files/）。
+            处置动作确实没执行 —— 但"不执行处置"与"不泄露内部事件数据"是两件事。
+  编排层：公开身份不派发 FORENSICS（原判定为取证时改派 ANALYST），也不写待补充知识工单；
+          公开面唯一的检索来源是 PublicKbService（security-docs / data/kb-approved 白名单 +
+          字段白名单 + 脱敏）。测试：PublicDataToolIsolationTest（公开=0 次工具调用 / 内部=1 次对照）。
+  工具层（二次拒绝，不靠模型自觉）：QueryLogsTools.queryLogs、QueryLogsTools.getAvailableLogTopics、
+          QueryMetricsTools.queryPrometheusAlerts、InternalDocsTools.queryInternalDocs 对公开身份
+          直接拒绝并留痕，返回 error=public-identity-no-internal-data。
+          DateTimeTools 是纯时间、不含内部数据，保持可用。
+  语义：问题必须依赖内部事件数据时（"我们昨天被谁打了""最近的攻击源是谁"）→ state=input-insufficient，
+          正文写明"公开面只基于公开知识库回答，不读取内部事件数据"，且不检索、不调模型（不花公开额度去猜）。
+  定级：公开面的模型结论一律不做事件定级（严重度强制 INFO，建议栏为"防护建议"）—— 这是收紧，不是放宽。
+
+【2026-10-13 F5 方案 B】命中的引用一律直出正文，不再只躺在 citations 字段里：
+  场景（实测）：概念题"OWASP A07 是什么"返回 state=input-insufficient「依据不足」，但检索命中 3 条引用，
+            访客只看得到"依据不足" → 体验上等于"AI 什么也不答"。
+  做法：未生成结论（依据不足 / 无命中 / 检索不可用 / 模型不可用 / 额度用尽）时，
+        正文直接给出【标题 + 片段 + 可信度 + 来源性质 + 相关度】，并写明"公开演示只基于公开知识库回答"；
+        已生成结论时同样直出（口径一致）。说明文案同样过 PublicOutputGuard。
+        测试：PublicAskCitationRenderingTest。
+  边界：不放宽"对具体事件定性"的门槛（那是方案 C，明确不做）；不做分流问答（方案 A，明确不做）。
 ```
 
 ---
@@ -514,6 +538,11 @@ curl -s http://127.0.0.1:9900/api/public/ask -X POST \
 
 公开路径的硬约束（改动时必须保持）：
   · 绝不触发任何真实处置动作：RESPONDER 在公开身份下只解释、不调工具（有测试用调用记录桩证明公开=0 次、内部=1 次）
+  · 绝不读取内部事件数据（2026-10-13 F2 收紧）：公开身份不派发 FORENSICS，且 QueryLogsTools /
+    QueryMetricsTools / InternalDocsTools 在工具层对公开身份直接拒绝；公开面唯一检索来源是
+    PublicKbService（白名单目录 security-docs + data/kb-approved）—— 测试 PublicDataToolIsolationTest
+  · 命中引用必须直出正文（2026-10-13 F5 方案 B）：标题 + 片段 + 可信度 + "只基于公开知识库"口径，
+    未生成结论时同样直出 —— 测试 PublicAskCitationRenderingTest
   · 不泄露：内网地址（→「内部地址」）、审计原文、密钥、系统提示词、上游报错详情（→「[上游错误详情已脱敏]」）
   · 回答带机读 state 与 stateLabel；模型不可用/额度用尽如实写 failureReason，禁止模板冒充
   · 检索不可用时 available:false + 空结果（不是 500）

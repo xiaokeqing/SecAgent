@@ -141,7 +141,7 @@ public class PublicAskService {
         // —— 而"把额度耗尽伪装成环境故障"正是项目明令禁止的静默降级。
         if (modelQuotaService != null && quota.get("available") == Boolean.TRUE
                 && !modelQuotaService.hasRemaining(ModelQuotaService.Identity.PUBLIC)) {
-            data.put("answer", quotaExhaustedText());
+            data.put("answer", withCitations(quotaExhaustedText(), citations, data));
             data.put("state", "model-failed");
             data.put("stateLabel", PublicOutputGuard.stateLabel("model-failed"));
             data.put("generated", false);
@@ -191,7 +191,7 @@ public class PublicAskService {
         }
 
         if (answer == null || answer.isBlank()) {
-            data.put("answer", notGeneratedText(state));
+            data.put("answer", withCitations(notGeneratedText(state), citations, data));
             data.put("state", state);
             data.put("stateLabel", PublicOutputGuard.stateLabel(state));
             data.put("generated", false);
@@ -199,7 +199,7 @@ public class PublicAskService {
             return data;
         }
 
-        data.put("answer", sanitized.text());
+        data.put("answer", withCitations(sanitized.text(), citations, data));
         data.put("state", state);
         data.put("stateLabel", PublicOutputGuard.stateLabel(state));
         data.put("generated", "model".equals(state));
@@ -253,6 +253,60 @@ public class PublicAskService {
                 + "用完就停，明天自动重置。站主自己的使用额度与评测额度<b>不受此影响</b>"
                 + "（三本账互相隔离，就是为了避免「公开页面被刷爆导致站主用不了系统」）。\n\n"
                 + "本次<b>没有</b>用模板拼装一份「看起来像结论」的文本 —— 没有生成就是没有生成。";
+    }
+
+    /**
+     * 把命中的公开知识库片段<b>直接展示进正文</b>（F5 方案 B，2026-10-13）。
+     *
+     * <h3>它解决的问题</h3>
+     * 实测：概念题（如"OWASP A07 是什么"）返回 {@code state=input-insufficient}
+     * 「依据不足，不做定性」，可检索其实命中了 3 条引用 —— 引用只躺在 {@code citations}
+     * 字段里，访客在页面上看到的是一句"依据不足"，体验上等于"AI 什么也不答"。
+     * 现在：命中多少就直出多少（标题 + 片段 + 可信度），并明说口径。
+     *
+     * <h3>为什么对"已生成结论"的回答也直出</h3>
+     * 口径要一致：同一份 {@code citations} 不能"生成时只在字段里、未生成时才进正文"，
+     * 那会让"正文里的引用"变成一个只在失败情况下才出现的怪东西。
+     *
+     * <h3>安全边界</h3>
+     * <ul>
+     *   <li>只渲染 {@link PublicKbService#search(String)} 的产物（已过公开白名单 + 字段白名单 + 脱敏）；</li>
+     *   <li>拼好的正文<b>再过一遍</b> {@link PublicOutputGuard} —— 拒绝/说明文案同样要过护栏，
+     *       这是昨晚刚定下的规矩（F3），"这是固定文案"不是免检理由；</li>
+     *   <li>没有命中就什么都不加：不拿别的数据顶替，也不放一句"参考了知识库"的空话。</li>
+     * </ul>
+     *
+     * @param text      原始正文（未脱敏或已脱敏都行 —— 本方法最后统一脱敏一次）
+     * @param citations 前置检索结果
+     * @param data      响应体（用于如实记录"正文里带了引用"与脱敏命中类别）
+     * @return 可以出海的正文（调用方直接用它，不要再拼原文）
+     */
+    private String withCitations(String text, List<Map<String, Object>> citations, Map<String, Object> data) {
+        String body = text == null ? "" : text;
+        if (citations == null || citations.isEmpty()) {
+            return body;
+        }
+        String composed = body + "\n\n---\n\n" + PublicKbService.renderCitationBlock(citations);
+        PublicOutputGuard.Sanitized out = outputGuard.sanitize(composed);
+        if (data != null) {
+            data.put("citationsInAnswer", true);
+            data.put("citationsNote", "本次命中的公开片段已直接展示在 answer 正文里（不只放在 citations 字段）："
+                    + "标题 + 片段 + 可信度，并注明「公开演示只基于公开知识库回答」。");
+            Object prev = data.get("outputFindings");
+            List<String> merged = new ArrayList<>();
+            if (prev instanceof List<?> l) {
+                for (Object o : l) {
+                    merged.add(String.valueOf(o));
+                }
+            }
+            for (String f : out.findings()) {
+                if (!merged.contains(f)) {
+                    merged.add(f);
+                }
+            }
+            data.put("outputFindings", merged);
+        }
+        return out.text();
     }
 
     /** "未生成"时的正文：说明原因，不含任何看似结论的内容 */
