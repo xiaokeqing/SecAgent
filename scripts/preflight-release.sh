@@ -2,12 +2,12 @@
 # ============================================================
 # 发布前体检（preflight）—— 在 srv1 上运行，只读，不改任何东西
 # ------------------------------------------------------------
-# 背景：开发期为推进 P4，把三个额度池临时放开成 300/200/300（生产值应为 50/60/30）。
+# 背景：开发期为推进 P4，把三个额度池临时放开成 300/200/300（生产值 50/60/60，公开池见 T25）。
 #       这种"临时值"最容易在发布时被忘掉 —— 本脚本把它变成一条必须通过的检查。
 #
 # 检查项（对应夜间清单 U1..U6）：
 #   1) 生产额度是否已回收（容器内环境变量 + /opt/secagent/.env + 公开端点回显）
-#   2) 代码侧模板是否是生产值（.env.example：50/60/30，且不含 sk- 前缀占位值）
+#   2) 代码侧模板是否是生产值（.env.example：50/60/60，且不含 sk- 前缀占位值）
 #   3) 线上指纹是否一致（health：status=ok / fingerprintMismatch=false）
 #   4) 发布指针与线上是否一致（ACR stable revision == 线上 commit）
 #   5) 自动发布/健康看门狗两个 timer 是否在工作
@@ -30,7 +30,7 @@ bad()  { printf '  \033[1;31m[阻塞]\033[0m %s\n' "$*"; FAIL=1; }
 soft() { printf '  \033[1;33m[提示]\033[0m %s\n' "$*"; }
 head_() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 
-head_ "1. 生产额度是否已回收（生产值 用户50 / 评测60 / 公开30）"
+head_ "1. 生产额度是否已回收（生产值 用户50 / 评测60 / 公开60）"
 ENV_LINES=$(docker exec secagent printenv 2>/dev/null | grep -E '^(APP_QUOTA|DAILY_QUOTA)' || true)
 if [ -z "$ENV_LINES" ]; then
   soft "容器里没有 APP_QUOTA_* 环境变量（使用代码默认值）"
@@ -43,10 +43,10 @@ for kv in "APP_QUOTA_DAILY_LIMIT=300" "APP_QUOTA_EVAL_DAILY_LIMIT=200" "APP_QUOT
 done
 if [ "$DEV_HIT" = "1" ]; then
   if [ "$ALLOW_DEV" = "1" ]; then
-    soft "检测到开发期临时额度（300/200/300）—— 按 --allow-dev 放行，但【发布前必须改回 50/60/30】"
-    soft "改法：/opt/secagent/.env 里三行改为 50/60/30 并重建容器（走 srv1-redeploy.sh，别用 compose up）"
+    soft "检测到开发期临时额度（300/200/300）—— 按 --allow-dev 放行，但【发布前必须改回 50/60/60】"
+    soft "改法：/opt/secagent/.env 里三行改为 50/60/60 并重建容器（走 srv1-redeploy.sh，别用 compose up）"
   else
-    bad "仍是开发期临时额度（300/200/300）—— 发布前必须回收为 50/60/30"
+    bad "仍是开发期临时额度（300/200/300）—— 发布前必须回收为 50/60/60"
   fi
 else
   ok "容器内额度变量不是开发期临时值"
@@ -62,8 +62,10 @@ fi
 QLIMIT=$(curl -s -m 20 -X POST http://127.0.0.1:9900/api/public/ask -H 'Content-Type: application/json' \
   -d '{"question":"发布前额度体检"}' 2>/dev/null | python3 -c 'import json,sys;print((json.load(sys.stdin).get("data") or {}).get("quota",{}).get("limit",""))' 2>/dev/null || echo "")
 if [ -n "$QLIMIT" ]; then
-  if [ "$QLIMIT" = "30" ]; then ok "公开端点回显上限 = 30（生产值）"
-  else soft "公开端点回显上限 = $QLIMIT（生产值应为 30）"; [ "$ALLOW_DEV" = "1" ] || FAIL=1; fi
+  # T25：公开池生产值 30 → 60（站主 2026-10-15 批准）。这里必须一起改，
+  # 否则改完额度后本体检会永久报 [阻塞]（QLIMIT=60 ≠ 30 ⇒ FAIL=1），把发布门禁卡死。
+  if [ "$QLIMIT" = "60" ]; then ok "公开端点回显上限 = 60（生产值）"
+  else soft "公开端点回显上限 = $QLIMIT（生产值应为 60）"; [ "$ALLOW_DEV" = "1" ] || FAIL=1; fi
 else
   soft "拿不到公开端点的额度回显（可能未登录/限流/接口未起）"
 fi
@@ -71,7 +73,7 @@ fi
 head_ "2. 代码侧模板是否是生产值"
 TPL="$APP_DIR/.env.example"
 if [ -f "$TPL" ]; then
-  if grep -qE '^APP_QUOTA_(DAILY|EVAL_DAILY|PUBLIC_DAILY)_LIMIT=(50|60|30)$' "$TPL"; then ok ".env.example 额度为生产值"; else bad ".env.example 额度不是 50/60/30"; fi
+  if grep -qE '^APP_QUOTA_(DAILY|EVAL_DAILY|PUBLIC_DAILY)_LIMIT=(50|60)$' "$TPL"; then ok ".env.example 额度为生产值（50/60/60）"; else bad ".env.example 额度不是 50/60/60"; fi
   if grep -qE '^\s*[A-Z_]*=\s*sk-' "$TPL"; then bad ".env.example 出现 sk- 前缀值（会被 CI 的 gitleaks 拦下）"; else ok ".env.example 无 sk- 前缀占位值"; fi
 else
   soft "找不到 $TPL（跳过模板检查）"

@@ -20,7 +20,16 @@ spring:
       api-key: ${DASHSCOPE_API_KEY:sk-placeholder}  # 无真实密钥时用占位保证可启动；生产请用环境变量注入真实 Key
       chat:
         options:
+          # 【已弃用】仅兼容保留，不再被使用（见 DashScopeConfig.legacyTimeout 的注释）
           timeout: 180000  # 超时时间180秒（3分钟）
+          # T25：下面三项才是真正建 OkHttpClient 用的值（DashScopeConfig:27/31/35）；
+          #   不写就回落 app.outbound.*（3s / 12s / 15s）。必须显式写在这里，原因有二：
+          #   ① read=12s / call=15s 会在 app.llm.timeout-ms=20s 之前先把调用掐断
+          #      ⇒ 20s 预算是名义上的，长答案照样失败（错误类型从"截断"变成"超时"）✗
+          #   ② 只在这里精准放宽，避免顺手放大 Wazuh / SSH / 通知共用的 app.outbound.* 统一矩阵
+          connect-timeout: 3000
+          read-timeout: 20000
+          call-timeout: 20000
       retry:
         max-attempts: 3
         backoff:
@@ -127,9 +136,14 @@ app:
     # 否则换个供应商就把额度绕过了。
     fallback-provider: ${APP_LLM_FALLBACK_PROVIDER:}
     temperature: 0.0     # 研判场景要稳定（两家供应商共用）
-    max-tokens: 800
+    # T25：800 是【硬天花板】—— 答案一展开就被截断 → JSON schema 校验失败 → 重试仍失败
+    #      → 上层如实报 model-failed。表现像"模型不可用"，成因其实是"答案太长" ✗
+    #      2000 只是输出上限（不是每次都用到），费用按真实输出 token 计。
+    #      必须与下面的 timeout-ms 同批放宽，否则只是把"截断"换成"超时" ✗
+    max-tokens: 2000
     # 以下三项只作用于 DashScope 实现（沿用原值，含错误提示参数期望的 timeout-ms）
-    timeout-ms: 15000
+    # T25：15000 → 20000（与 max-tokens 同批）。必须 < 入口预算（公开 25s / 内部 /api/chat 25s）。
+    timeout-ms: 20000
     cooldown-ms: 60000
     rag-timeout-ms: 15000
     embedding-timeout-ms: 8000
@@ -296,10 +310,15 @@ app:
     # 这两个端点【会花钱】（问答调对话模型、检索调 embedding），所以它们有自己的一套限流，
     # 刻意不复用上面那 20 次/分钟：否则"为了页面刷新率把 20 改成 60"会顺手把花钱的端点也放宽 3 倍。
     ask:
-      requests-per-minute: 6      # 每 IP 每分钟；这是频率上限，成本上限是下面 quota.public-daily-limit
-      max-question-chars: 600     # 公开演示只接受一句话提问，不接受整段日志
+      requests-per-minute: 6      # 每 IP 每分钟；这是频率上限，成本上限是下面 quota.public-daily-limit（T25 不动）
+      # T25：600 → 1200。口径从"只接受一句话"放宽到"一段日志摘要 + 一句问题"；
+      #       注入面因此变大，但护栏一条不放宽（max-body-chars 仍 4000 + 注入命中即拒不调模型）。
+      max-question-chars: 1200
       max-body-chars: 4000        # 请求体上限（挡住超大 body，防止用 body 撑内存）
-      deadline-ms: 20000          # 总预算；比 /api/chat 略短：匿名请求不该长时间占编排线程
+      # T25：20000 → 25000，与 /api/chat 的 app.chat.deadline-ms 对齐（改前刻意比它短）。
+      #       只有 app.llm.timeout-ms 也提到 20000 时才有意义 ——
+      #       否则放大入口预算只是让慢请求多占编排线程，能力并没有变宽。
+      deadline-ms: 25000
     kb:
       requests-per-minute: 20     # 检索比问答便宜（只调 embedding），给到与只读端点同量级
     # 公开知识库检索的【可见性口径】：不是"标记为内部的才隐藏"，而是"命中白名单才放行"。
@@ -384,9 +403,12 @@ app:
     eval-store-file: data/model-quota-eval.json
     # ===== 匿名公开演示独立额度（P4，/api/public/ask 专用）=====
     # 为什么必须单独一本账：公开端点匿名可达，被刷爆是常态；共用用户额度会让站主自己用不了系统。
-    # 默认 30：够几十个访客各试一句，又不足以被当成免费模型接口刷。
+    # T25：30 → 60（站主 2026-10-15 已批准 ✓）。30/日实际只支撑约 10~15 次问答
+    #      （一次提问最多 2 次模型调用 + 失败重试），匿名访客很容易打满。
+    #      ★ 线上真正生效的是 docker-compose.yml 的 SPRING_APPLICATION_JSON
+    #        （优先级高于本文件），这里改的是"没被覆盖时"的默认值 —— 两处必须同批改 ✗
     # ★ 开发期临时放大到 300（见 RUNBOOK「开发期额度覆盖 / 发布前回收清单」）。
-    public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:30}
+    public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:60}
     public-store-file: data/model-quota-public.json
 
   # ===== 评测身份（独立凭据 + 流量打标 + RESPONDER 模拟）=====
