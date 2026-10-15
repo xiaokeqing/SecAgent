@@ -56,4 +56,25 @@ public interface LlmProvider {
      * @return 模型输出原文；调用方必须自己校验格式
      */
     String generate(String systemPrompt, String userPrompt) throws Exception;
+
+    /**
+     * 纯文本生成（<b>带采样参数</b>）—— T25 §12：人格链路与决策链路的采样必须分开。
+     *
+     * <h3>为什么做成 {@code default} 方法</h3>
+     * 与 {@link #generatedBy()} 同一手法：<b>只新增、不改动</b>既有实现与调用契约。
+     * 默认实现忽略采样参数、直接走 {@link #generate(String, String)} ⇒
+     * 所有既有实现与调用点在改造后行为<b>逐字一致</b>；只有真正支持采样的实现才覆写它。
+     *
+     * <h3>为什么要分开</h3>
+     * PLANNER 的产物要被 JSON schema 校验，温度升高直接抬高解析失败率，而失败在用户侧表现为
+     * {@code model-failed}（看起来像"模型不可用"）；人格回答则恰恰需要更高的温度来降低复读。
+     * 两件事共用一个 {@code app.llm.temperature} 时只能二选一，所以按链路分键。
+     *
+     * @param temperature 采样温度（决策链路 0.0；人格链路 0.7~0.9）
+     * @param topP        核采样阈值（决策链路 0.1；人格链路 0.8）
+     */
+    default String generate(String systemPrompt, String userPrompt, double temperature, double topP)
+            throws Exception {
+        return generate(systemPrompt, userPrompt);
+    }
 }

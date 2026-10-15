@@ -135,7 +135,22 @@ app:
     # 注意：它只影响"这家坏了"的情形；配额用尽（评测/公开/用户三本账）【不触发】回退 ——
     # 否则换个供应商就把额度绕过了。
     fallback-provider: ${APP_LLM_FALLBACK_PROVIDER:}
-    temperature: 0.0     # 研判场景要稳定（两家供应商共用）
+    # 【决策链路默认】PLANNER/工具选择/内部研判的产物都要过 JSON schema 校验 ⇒ 必须 0.0；
+    # 人格链路的采样见下面的 app.llm.persona.*（T25 §12）。两处刻意分开，
+    # 防止下一次维护"顺手一起调"把解析失败率抬上去（那正是 T25 正文要修的"假故障"）。
+    temperature: 0.0
+    # ===== T25 §12：采样参数按【链路】分键（人格 vs 决策）=====
+    # 上游依据 Code-Amadeus/Amadeus#227：人格回复写死 temperature=0.0 + 历史全量回灌
+    # ⇒ 口头禅自我强化成复读。取值矩阵（写死，不留解释空间）：
+    #   PLANNER / 调度 / 工具选择 → temperature 0.0（上面这行）· top_p 0.1（下面 app.llm.top-p）
+    #   ANALYST / 人格回答        → temperature 0.8 · top_p 0.8（这里）
+    # 温度是【采样分布】，不是预算：不改 max_tokens、不改调用次数、不改超时。
+    persona:
+      temperature: ${APP_LLM_PERSONA_TEMPERATURE:0.8}
+      top-p: ${APP_LLM_PERSONA_TOP_P:0.8}
+    # DashScope 侧原先把 topP 硬编码成 0.1（DashScopeLlmProvider:163），这里显式化成配置；
+    # DeepSeek 侧的决策链路【不发】该字段（保持改造前逐字形状：等价服务端默认 1.0）。
+    top-p: ${APP_LLM_TOP_P:0.1}
     # T25：800 是【硬天花板】—— 答案一展开就被截断 → JSON schema 校验失败 → 重试仍失败
     #      → 上层如实报 model-failed。表现像"模型不可用"，成因其实是"答案太长" ✗
     #      2000 只是输出上限（不是每次都用到），费用按真实输出 token 计。
@@ -164,6 +179,23 @@ app:
       connect-timeout-ms: ${APP_LLM_DEEPSEEK_CONNECT_TIMEOUT_MS:${app.outbound.connect-timeout-ms:3000}}
       read-timeout-ms: ${APP_LLM_DEEPSEEK_READ_TIMEOUT_MS:${app.outbound.read-timeout-ms:12000}}
       call-timeout-ms: ${APP_LLM_DEEPSEEK_CALL_TIMEOUT_MS:${app.outbound.call-timeout-ms:15000}}
+  # ===== T14 情绪决策（白名单 = 站点素材真值，随 jar 一起发布）=====
+  # 为什么必须落成资源而不是写死在 Java 里：38 个剪辑名 / 12 句台词 id / 8 类情绪会随素材变化，
+  # 写死在代码里 = 下一次素材改动必然漂，而且是【静默】漂（模型选了不存在的剪辑名，前端查不到就
+  # 什么都不做 —— 不报错、只是演错）。白名单读的是 static/kurisu/{statemachine,bank,manifest}.json 的派生件。
+  # 可用 APP_DECISION_WHITELIST 热覆盖成主机上的另一份名单（改后仍需重建容器才生效）。
+  decision:
+    whitelist: ${APP_DECISION_WHITELIST:classpath:kurisu/decision-whitelist.json}
+    # 情绪黏滞窗口（秒）：超过它就回落 normal。官方面板只给了"连续多条 → tsundere"的【现象】，
+    # 没给时间参数 ⇒ 这是可调旋钮，不是已证事实。
+    sticky-ttl-sec: ${APP_DECISION_STICKY_TTL_SEC:600}
+  # ===== U6 人格层提示词（人设【文本】）=====
+  # ★ 与 app.llm.persona.* 区分：那里是【采样参数】（T25 §12），这里是【提示词文本】（U6）。
+  #   键名不同、互不覆盖。改文本必须重建镜像（资源在 jar 内）；改 enabled 只需重建容器（不重发镜像）。
+  #   读不到时按空串处理（人格缺失不该让问答不可用），但启动自检会显式打 persona=NOT_LOADED，绝不静默。
+  persona:
+    enabled: ${APP_PERSONA_ENABLED:true}
+    path: ${APP_PERSONA_PATH:classpath:prompts/persona-public.txt}
   # 接口鉴权：默认关闭方便本地演示；改为 true 后所有 /api/** 需携带 X-API-Token 头
   auth:
     enabled: true   # 默认开启鉴权：登录会话 Token 或系统级 API Token 任一通过即可
@@ -403,12 +435,10 @@ app:
     eval-store-file: data/model-quota-eval.json
     # ===== 匿名公开演示独立额度（P4，/api/public/ask 专用）=====
     # 为什么必须单独一本账：公开端点匿名可达，被刷爆是常态；共用用户额度会让站主自己用不了系统。
-    # T25：30 → 60（站主 2026-10-15 已批准 ✓）。30/日实际只支撑约 10~15 次问答
-    #      （一次提问最多 2 次模型调用 + 失败重试），匿名访客很容易打满。
-    #      ★ 线上真正生效的是 docker-compose.yml 的 SPRING_APPLICATION_JSON
-    #        （优先级高于本文件），这里改的是"没被覆盖时"的默认值 —— 两处必须同批改 ✗
+    # 默认 30：够几十个访客各试一句，又不足以被当成免费模型接口刷。
+    # 【T25 B 组（30→60）规划侧拍板暂缓，等 T25-b 每 IP 日额度同批上】⇒ 本批保持 30 ✗
     # ★ 开发期临时放大到 300（见 RUNBOOK「开发期额度覆盖 / 发布前回收清单」）。
-    public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:60}
+    public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:30}
     public-store-file: data/model-quota-public.json
 
   # ===== 评测身份（独立凭据 + 流量打标 + RESPONDER 模拟）=====

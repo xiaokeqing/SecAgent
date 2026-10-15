@@ -127,7 +127,17 @@ public class HealthController {
         result.put("embeddedGitDirty", embeddedGit.getDirty() == null ? "unknown" : embeddedGit.getDirty());
         result.put("embeddedGitBuildTime", embeddedGit.getBuildTime());
         result.put("embeddedGitCommitTime", embeddedGit.getCommitTime());
-        result.put("embeddedGitCommitMessage", embeddedGit.getCommitMessageShort());
+        // 【U5 部分收口，2026-10-16】这里原本还返回 embeddedGitCommitMessage（提交标题）。
+        // 它是这个端点上【最脏】的一项：提交标题里写的是内部 RUNBOOK 章节号、待办描述与
+        // "别再回显口令"这类修复细节，等于把内部工程叙事挂到公网匿名端点上。
+        // 为什么只删这一项、其余指纹字段保留：embeddedGitCommit / artifactMd5 /
+        // fingerprintMismatch 是【部署与回滚门禁的硬校验输入】——
+        // scripts/srv1-redeploy.sh 与 scripts/srv1-rollback.sh 靠它们判定"这次部署是否成功"，
+        // srv1-health-watchdog.sh 读 commit，docker-compose 的 healthcheck 也打这个端点。
+        // 收口成 {"status":"ok"} 会让重建后的校验直接失败并自动回滚 ⇒ 完整收口必须与
+        // 这些脚本（以及站点侧的 /api/health 消费端）同批改，属独立批次。
+        // 本项之所以能单独删：全仓库 + 站点侧都没有任何消费端读 embeddedGitCommitMessage。
+        // （这也正是 U5 里"提交信息"那一半；"mock 开关 / documentVectors"那一半见待办 U5 备注。）
         result.put("embeddedGitPropertiesPresent", embeddedGit.isPresent());
 
         // 双指纹（P0-4）：不再只靠 buildSha 自述，能看出"跑的是哪个产物、哪份源码"

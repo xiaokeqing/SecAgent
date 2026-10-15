@@ -103,6 +103,8 @@ class DeepSeekLlmProviderTest {
         ReflectionTestUtils.setField(p, "model", "deepseek-chat");
         ReflectionTestUtils.setField(p, "apiKey", "test-key-not-a-real-credential");
         ReflectionTestUtils.setField(p, "temperature", 0.0);
+        ReflectionTestUtils.setField(p, "personaTemperature", 0.8);
+        ReflectionTestUtils.setField(p, "personaTopP", 0.8);
         ReflectionTestUtils.setField(p, "maxTokens", 800);
         ReflectionTestUtils.setField(p, "timeouts", timeouts);
         ReflectionTestUtils.setField(p, "guard", guard);
@@ -432,5 +434,40 @@ class DeepSeekLlmProviderTest {
                 new com.fasterxml.jackson.databind.ObjectMapper().readTree(body);
         assertEquals("", root.path("messages").get(0).path("content").asText());
         assertEquals("", root.path("messages").get(1).path("content").asText());
+        assertFalse(root.has("top_p"), "5 参数版本必须【不写】top_p —— 决策链路的请求体与改造前逐字一致");
+    }
+
+    // ==================== T25 §12：采样参数（人格链路 vs 决策链路） ====================
+
+    @Test
+    @DisplayName("T25 §12：人格链路（带采样重载）必须真的把 top_p 与 persona 温度写进请求体")
+    void personaSamplingIsSentInBody() throws Exception {
+        respondCode = 200;
+        DeepSeekLlmProvider p = provider(DeepSeekConfig.defaults());
+
+        p.generate("你是牧濑红莉栖。", "问题", 0.8, 0.8);
+
+        com.fasterxml.jackson.databind.JsonNode root =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(receivedBodies.get(0));
+        assertEquals(0.8, root.path("temperature").asDouble(), 1e-9);
+        // ★ 这一条是本节的核心：不加 top_p，DeepSeek 面就永远没有第二个旋钮
+        assertTrue(root.has("top_p"), "请求体里必须有 top_p："
+                + "没有它，「可配采样」就只是半件配置：" + receivedBodies.get(0));
+        assertEquals(0.8, root.path("top_p").asDouble(), 1e-9);
+    }
+
+    @Test
+    @DisplayName("T25 §12：决策链路（两参 generate）请求体里【没有】top_p，温度仍是 0.0")
+    void decisionPathKeepsRequestShape() throws Exception {
+        respondCode = 200;
+        DeepSeekLlmProvider p = provider(DeepSeekConfig.defaults());
+
+        p.generate("你是安全研判分析员，只输出 JSON。", "问题：什么是 SSRF？");
+
+        com.fasterxml.jackson.databind.JsonNode root =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(receivedBodies.get(0));
+        assertEquals(0.0, root.path("temperature").asDouble(), 1e-9,
+                "决策链路必须保持确定性（温度上去 = schema 校验失败率上升 = 假故障复发）");
+        assertFalse(root.has("top_p"), "决策链路不得新增 top_p：改造前的请求形状不能变");
     }
 }

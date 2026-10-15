@@ -59,6 +59,16 @@ public class DashScopeLlmProvider implements LlmProvider {
     private int maxTokens;
 
     /**
+     * 决策链路的核采样阈值（T25 §12）。
+     *
+     * <p>改造前它是本类 {@code createChatModel(api, temperature, maxTokens, 0.1)} 里的<b>硬编码 0.1</b>
+     * —— 同一个语义在两个 provider 实现里各写一套，于是"看不见的常量"永远调不动。
+     * 这里显式化成配置键，默认值仍是 0.1（行为不变）。
+     */
+    @Value("${app.llm.top-p:0.1}")
+    private double topP;
+
+    /**
      * 单次模型调用的硬超时（毫秒）。默认 15 秒。
      *
      * <p><b>为什么必须在代码层限时</b>：实测断网时（iptables DROP，连接既不成功也不被拒绝）
@@ -144,6 +154,14 @@ public class DashScopeLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
+        // 决策链路默认：temperature = app.llm.temperature（0.0）、topP = app.llm.top-p（0.1，原硬编码值）
+        return generate(systemPrompt, userPrompt, temperature, topP);
+    }
+
+    /** 带采样的生成（T25 §12）：人格链路传 0.8 / 0.8；决策链路走上面的两参版本（行为不变）。 */
+    @Override
+    public String generate(String systemPrompt, String userPrompt, double temperature, double topP)
+            throws Exception {
         // 配额按【调用来源】分派：评测身份走评测计数器、匿名公开演示走公开计数器、
         // 其余走用户计数器。三个池子各自的持久化文件不同，因此"用户额度耗尽 → 评测仍可跑"、
         // "公开端点被刷爆 → 站主自己仍可用"这两件事同时成立。
@@ -160,7 +178,7 @@ public class DashScopeLlmProvider implements LlmProvider {
         }
         java.util.concurrent.Future<String> future = POOL.submit(() -> {
             DashScopeApi api = chatService.createDashScopeApi();
-            DashScopeChatModel model = chatService.createChatModel(api, temperature, maxTokens, 0.1);
+            DashScopeChatModel model = chatService.createChatModel(api, temperature, maxTokens, topP);
             ReactAgent agent = ReactAgent.builder()
                     .name("llm_provider")
                     .model(model)

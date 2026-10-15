@@ -1,5 +1,6 @@
 package org.example.publicapi;
 
+import org.example.agent.multi.DecisionWhitelist;
 import org.example.agent.multi.MultiAgentResult;
 import org.example.security.PromptInjectionGuard;
 import org.example.service.ModelQuotaService;
@@ -131,6 +132,8 @@ public class PublicAskService {
                     + "命中特征数：" + injectionHits.size() + "（不展示具体正则，避免变成绕过提示）。";
             PublicOutputGuard.Sanitized sanitizedRefusal = outputGuard.sanitize(refusal);
             data.put("outputFindings", sanitizedRefusal.findings());
+            // T14：输入被拒也要有【显式回退决策】，前端才不会"什么都不做"（静默失败）
+            data.put("decision", DecisionWhitelist.fallbackDecision("INJECTION_BLOCKED"));
             return refused(data, "input-insufficient", sanitizedRefusal.text());
         }
 
@@ -164,16 +167,18 @@ public class PublicAskService {
             data.put("failureReason", "今日公开演示模型额度已用完");
             data.put("note", "公开演示：额度用尽是显式状态，不是「系统坏了」；"
                     + "本站主的自用额度与评测额度不受影响。");
+            data.put("decision", DecisionWhitelist.fallbackDecision("QUOTA_EXHAUSTED"));
             return data;
         }
 
         // ---------- 编排（与 /api/chat 同一条链路，身份=公开演示） ----------
         String answer;
+        MultiAgentResult result = null;
         boolean modelFailed = false;
         try {
             // 公开身份标注必须在调用前设置：配额分派与 RESPONDER 分流都读它
             org.example.security.EvalIdentity.markPublicRequest();
-            MultiAgentResult result = orchestrationService.run(wrapUntrusted(q), List.of(), deadlineMs);
+            result = orchestrationService.run(wrapUntrusted(q), List.of(), deadlineMs);
             answer = result == null ? null : result.getFinalAnswer();
         } catch (OrchestrationService.OrchestrationTimeoutException e) {
             logger.warn("公开问答总预算用尽：{}", e.getMessage());
@@ -195,6 +200,14 @@ public class PublicAskService {
                 answer == null ? new PublicOutputGuard.Sanitized("", List.of()) : outputGuard.sanitize(answer);
         data.put("outputFindings", sanitized.findings());
 
+        // ---------- T14 情绪决策：与 state/outputFindings 同一个信封下发 ----------
+        // 不另开通道（前端只读一次响应就够）。模型没产出时也要给【显式回退决策】——
+        // 否则前端只能"什么都不做"，那正是静默失败；回退目标是语义安全的
+        // normal / idle / 空 lineId（见 DecisionWhitelist.fallbackDecision）。
+        data.put("decision", result != null && result.getDecision() != null
+                ? result.getDecision()
+                : DecisionWhitelist.fallbackDecision(modelFailed ? "MODEL_FAILED" : "NO_DECISION"));
+
         // ---------- state 解析（唯一来源：编排产出；本层只做归一化） ----------
         String fallback = modelFailed ? "model-failed"
                 : (retrievalFailed ? "retrieval-failed"
@@ -212,6 +225,7 @@ public class PublicAskService {
             data.put("stateLabel", PublicOutputGuard.stateLabel(state));
             data.put("generated", false);
             data.put("note", "公开演示：本次没有产生结论（模型不可用或链路不可用），**没有**用模板冒充模型输出。");
+            data.put("decision", DecisionWhitelist.fallbackDecision("MODEL_FAILED"));
             return data;
         }
 
@@ -258,6 +272,9 @@ public class PublicAskService {
         data.put("generated", false);
         data.put("citations", data.getOrDefault("citations", List.of()));
         data.put("note", "公开演示：本次未调用模型（输入未通过前置检查），因此没有结论可展示。");
+        // T14：输入类拒绝（空问题 / 超长）也要有显式回退决策。
+        // 注入命中那条更具体的原因已在上游 put 过，这里不覆盖它。
+        data.putIfAbsent("decision", DecisionWhitelist.fallbackDecision("INPUT_REJECTED"));
         return data;
     }
 

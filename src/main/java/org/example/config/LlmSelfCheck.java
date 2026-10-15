@@ -1,10 +1,13 @@
 package org.example.config;
 
+import org.example.agent.multi.DecisionWhitelist;
+import org.example.agent.multi.PersonaPrompt;
 import org.example.llm.DeepSeekLlmProvider;
 import org.example.llm.DashScopeLlmProvider;
 import org.example.llm.LlmProviderSelector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -78,6 +81,18 @@ public class LlmSelfCheck {
 
     /** 逐依赖超时矩阵（与 OutboundSelfCheck 同一口径） */
     private final OutboundTimeouts timeouts;
+
+    /**
+     * T14 决策白名单（可空注入：单测直接 new 这个类时没有它，自检就如实打 MISSING）。
+     */
+    @Autowired(required = false)
+    private DecisionWhitelist decisionWhitelist;
+
+    /**
+     * U6 人格提示词（可空注入：同上）。它必须<b>显式可见</b>——见 {@link #personaLine()}。
+     */
+    @Autowired(required = false)
+    private PersonaPrompt personaPrompt;
 
     public LlmSelfCheck(LlmProviderSelector selector,
                         DeepSeekLlmProvider deepSeek,
@@ -212,6 +227,10 @@ public class LlmSelfCheck {
                 ? "DISABLED" : fallbackProvider.trim());
         sb.append(" timeouts=")
           .append(timeouts == null ? MISSING : timeouts.describe());
+        // T14：白名单有没有真的打进 jar —— 部署后一眼核对（读不到必须显式 MISSING，绝不静默）
+        sb.append(" decision=").append(decisionLine());
+        // U6：人格提示词有没有真的打进 jar 并被读入（bytes 口径 = UTF-8 字节数）
+        sb.append(" persona=").append(personaLine());
         sb.append(" deps=").append(describeDependencyKeys());
         sb.append(" rows=").append(rows.size());
         for (ProviderRow r : rows) {
@@ -230,6 +249,38 @@ public class LlmSelfCheck {
         // 这段是给人看的：切供应商/切回来就靠它核对，不需要翻配置文件
         sb.append(" | switch=").append(describeSwitch());
         return sb.toString();
+    }
+
+    /**
+     * T14：决策白名单是否真的打进 jar。
+     *
+     * <p>与 {@code max_tokens} 同一个性质：它不在任何既有自检行里，于是"资源没打进 jar"
+     * 这种事在部署后<b>看不出来</b>，只能靠行为猜。这里把它变成一行可 grep 的事实；
+     * 读不到时显式写 {@code MISSING}（不是留空、也不是假装 0）。
+     */
+    private String decisionLine() {
+        if (decisionWhitelist == null || !decisionWhitelist.loaded()) {
+            return "whitelist{MISSING}";
+        }
+        return "whitelist{actions=" + decisionWhitelist.actions().size()
+                + ",hostEntries=" + decisionWhitelist.hostEntries().size()
+                + ",emotions=" + decisionWhitelist.emotions().size()
+                + ",lines=" + decisionWhitelist.lineIds().size()
+                + ",md5=" + decisionWhitelist.md5() + "}";
+    }
+
+    /**
+     * U6：人格提示词是否真的打进 jar 并被读入。
+     *
+     * <p>关掉（{@code app.persona.enabled=false}）或读不到都必须显式写 {@code NOT_LOADED}，
+     * <b>不许</b>写成含混的 {@code bytes=0} —— "没加载"与"加载了但内容是空"是两件事。
+     * {@code bytes} 口径写死为 <b>UTF-8 字节数</b>（不是字符数），避免同一行两种口径。
+     */
+    private String personaLine() {
+        if (personaPrompt == null || !personaPrompt.loaded()) {
+            return "NOT_LOADED";
+        }
+        return "loaded(bytes=" + personaPrompt.bytes() + ",md5=" + personaPrompt.md5() + ")";
     }
 
     /** 怎么切、怎么切回 —— 写进日志里，避免"要翻文档才知道" */
