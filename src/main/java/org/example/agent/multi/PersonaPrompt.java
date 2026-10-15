@@ -45,6 +45,16 @@ public class PersonaPrompt {
     private String md5 = "MISSING";
     private boolean loaded;
 
+    /**
+     * <b>原始资源字节数</b>（UTF-8，含末尾换行）—— 不是 trim 之后内存里那段文本的长度。
+     *
+     * <p>口径写死在这一行：启动自检里 {@code bytes=} 回答的问题是
+     * "打进 jar 的是不是这一版资源"（U6 验收写的是 3565），所以必须报资源本身的字节数；
+     * 报 trim 后的长度会得到 3564 —— 与文档差 1，看起来像"资源不对"，实为口径不同。
+     * md5 同样算在原始字节上（两者必须同源，否则一个对得上、一个对不上）。
+     */
+    private int resourceBytes;
+
     @jakarta.annotation.PostConstruct
     void load() {
         if (!enabled) {
@@ -60,6 +70,7 @@ public class PersonaPrompt {
                 s = s.substring(1);
             }
             text = s.trim();
+            resourceBytes = bytes.length;
             md5 = hex(MessageDigest.getInstance("MD5").digest(bytes)).substring(0, 8);
             loaded = !text.isEmpty();
             if (!loaded) {
@@ -93,8 +104,8 @@ public class PersonaPrompt {
         return md5;
     }
 
-    /** ★ 口径写死：UTF-8 <b>字节数</b>（3565），不是字符数 —— "打进 jar 的资源多大"是字节问题 */
+    /** ★ 口径写死：UTF-8 <b>原始资源字节数</b>（3565），不是字符数、也不是 trim 后的长度 */
     public int bytes() {
-        return text.getBytes(StandardCharsets.UTF_8).length;
+        return resourceBytes;
     }
 }
