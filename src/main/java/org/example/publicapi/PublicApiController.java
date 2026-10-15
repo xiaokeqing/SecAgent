@@ -188,12 +188,38 @@ public class PublicApiController {
      * {@link CredentialStructure#PASSWORD_HIDDEN}，而 {@code hidePasswords} 幂等
      * （占位符里没有 {@code 口令=…} 形状），所以<b>输出不变</b>。
      * {@code PublicHoneypotScrubPipelineTest} 钉住这一点。
+     *
+     * <p><b>为什么这里还要补一道 IP 口径（2026-10-16 收口）</b>：{@link PublicIpPolicy}
+     * 的 {@link PublicIpPolicy#displayText(String)} 原先只在<b>少数几个</b>自由文本字段上
+     * 被显式调用（{@code /honeypot} 的 detail、攻击故事、知识库片段、问答输出护栏……），
+     * 而告警链路的 {@code title} / {@code ruleName} 一处都没调 —— 于是
+     * {@code GET /api/public/alerts} 在真实态下把蜜罐规则原文里的<b>内网来源地址</b>
+     * （线上实测 {@code 蜜罐(Dionaea): SMB 连接/认证尝试 来源=172.19.0.1:57386}）
+     * 原样发到公网，而同一条记录的 {@code srcIp} 字段已经是「内网/未知」。
+     * 违反的是 {@code PublicIpPolicy} 里"内网/保留/链路地址在任何口径下都不上公开面"
+     * 这条<b>与开关无关</b>的硬约束（RUNBOOK §27.1："真实态下这类值一律写成「内网/未知」"）。
+     *
+     * <p>修法与口令那次<b>同源</b>：补在唯一的出海闸门上，而不是补在
+     * {@code publicAggregate()} / {@code publicAlert()} 里。补在闸门上，今天所有端点一并覆盖，
+     * 以后新加的公开端点默认就带 IP 口径；补在某一个 {@code buildXxx()} 里则只修了那一条路径
+     * —— 那正是口令那次与这次共同的失败模式。
+     *
+     * <p><b>幂等 / 不改变既有输出</b>：
+     * <ul>
+     *   <li>真实态：结构化字段已经过 {@code display()}，公网地址原样、内网地址已是「内网/未知」，
+     *       再过一遍 {@code maskInternalOnly} 逐字节不变；自由文本里的公网攻击源地址
+     *       <b>照旧保留</b>（本站口径就是显示观测到的真实来源地址），只把内网/保留地址换掉。</li>
+     *   <li>掩码态：{@code display()} 的产物形如 {@code 45.83.***.***}，
+     *       不含"四段数字"，{@code maskAll} 不会再改它；原先自由文本里漏出来的完整 IP
+     *       则被补上掩码 —— 这正是掩码态本来就该有的口径。</li>
+     * </ul>
+     * 回归：{@code PublicFreeTextIpGateTest}（两种口径 + 列表与下钻两条路径）。
      */
     private String scrubText(String s) {
         if (s == null || s.isEmpty()) {
             return s;
         }
-        return CredentialStructure.hidePasswords(assets().scrub(s));
+        return policy().displayText(CredentialStructure.hidePasswords(assets().scrub(s)));
     }
 
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
