@@ -160,12 +160,35 @@ class PublicIpPolicyTest {
     }
 
     @Test
-    @DisplayName("removalContact 留空时退回默认关于页（口径字段不许是空串）")
+    @DisplayName("removalContact 留空时退回默认页（口径字段不许是空串）")
     void blankRemovalContactFallsBack() {
         PublicIpPolicy p = PublicIpPolicy.of(false);
         org.springframework.test.util.ReflectionTestUtils.setField(p, "removalContact", "   ");
 
         assertEquals(PublicIpPolicy.DEFAULT_REMOVAL_CONTACT, p.disclosure().get("removalContact"));
         assertEquals(PublicIpPolicy.DEFAULT_REMOVAL_CONTACT, p.removalContact());
+        assertFalse(PublicIpPolicy.DEFAULT_REMOVAL_CONTACT.contains("/about/"),
+                "默认值不得再指向 /about/（该页已删除并 301 —— 外部审查 R1 指出的死路）");
+    }
+
+    @Test
+    @DisplayName("【2026-10-16】callerDisclosure：调用者自身地址的口径恒为 masked=true，且键形状与主口径一致")
+    void callerDisclosureIsAlwaysMasked() {
+        // 为什么单独一条：/ask 上唯一出现的地址是访客本人的，与"观测到的攻击源"是两类东西。
+        // 真实态（mask-ips=false）下也必须 masked=true，否则等于对外宣称"这是真实访客地址"。
+        for (PublicIpPolicy p : List.of(PublicIpPolicy.revealing(), PublicIpPolicy.masking())) {
+            Map<String, Object> d = p.callerDisclosure();
+            assertEquals(Boolean.TRUE, d.get("masked"), "调用者口径必须恒为掩码：" + d);
+            assertEquals(PublicIpPolicy.NOTICE, d.get("notice"), "notice 与主口径同一句话");
+            assertEquals(List.of("masked", "notice", "removalContact"), List.copyOf(d.keySet()),
+                    "键顺序与主口径一致（页面与快照比对都依赖它）");
+        }
+        // 配置里的 removalContact 必须被沿用（不能用 masking() 那种"写死默认值"的构造绕开配置）
+        PublicIpPolicy configured = PublicIpPolicy.revealing();
+        org.springframework.test.util.ReflectionTestUtils.setField(configured, "removalContact",
+                "mailto:owner@example.com");
+        assertEquals("mailto:owner@example.com", configured.callerDisclosure().get("removalContact"));
+        assertEquals(Boolean.FALSE, configured.disclosure().get("masked"),
+                "攻击源口径不受影响：主口径仍跟随开关");
     }
 }

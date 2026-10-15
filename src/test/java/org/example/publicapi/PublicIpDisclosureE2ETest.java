@@ -318,25 +318,32 @@ class PublicIpDisclosureE2ETest {
     // ==================== /ask 的信封（POST 不走 ok(...)，口径必须一样） ====================
 
     @Test
-    @DisplayName("/ask 信封：既有 clientIpMasked 永远掩码，新增 clientIp 按口径，ipDisclosure 同在")
-    void askEnvelopeUsesTheSamePolicy() throws Exception {
-        // POST /api/public/ask 走的是控制器里另一条 return 路径（不走 ok(...)），
-        // 所以它的口径必须单独钉一次 —— 这正是"某个端点忘了读开关"最容易发生的地方。
+    @DisplayName("【2026-10-16 收口】/ask 信封：只给永远掩码的 clientIpMasked，原始地址字段 clientIp 已删除，口径字段 masked 恒 true")
+    void askEnvelopeNeverReturnsCallerRawIp() throws Exception {
+        // 站主红线段：「访客 IP 一律不上页面」。
+        // 注意与"真实态"的区别：app.public.mask-ips=false 的对象是**观测到的攻击源**
+        // （附录-5.3 的 U1 裁决：保留真实值、展示层掩最后一段）；而 /ask 上唯一出现的地址是
+        // **访客本人**的 ⇒ 两种开关状态下都必须掩码，且不得给出任何原始形态的字段。
         Map<String, Object> masked = askEnvelope(PublicIpPolicy.masking());
         assertEquals("106.37.***.***", masked.get("clientIpMasked"), "既有字段语义不变（永远掩码）");
-        assertEquals("106.37.***.***", masked.get("clientIp"), "掩码态下新字段同样掩码");
+        assertFalse(masked.containsKey("clientIp"), "原始地址字段必须已删除：" + masked.keySet());
         assertEquals(Boolean.TRUE, disclosureOf(masked).get("masked"));
 
         Map<String, Object> real = askEnvelope(PublicIpPolicy.revealing());
         assertEquals("106.37.***.***", real.get("clientIpMasked"),
                 "字段名里就写着 Masked，塞真实地址等于让字段名说谎（契约也不许改名）");
-        assertEquals(ATTACKER, real.get("clientIp"), "新字段按口径显示观测到的真实地址");
-        assertEquals(PublicIpPolicy.NOTICE, disclosureOf(real).get("notice"));
-        assertEquals(Boolean.FALSE, disclosureOf(real).get("masked"));
+        assertFalse(real.containsKey("clientIp"), "真实态也不例外：访客 IP 一律不上页面");
+        assertEquals(Boolean.TRUE, disclosureOf(real).get("masked"),
+                "这个端点的口径字段必须是 masked=true（攻击源口径不受影响 —— /stories 仍按开关走）");
+        assertEquals(PublicIpPolicy.NOTICE, disclosureOf(real).get("notice"), "两个口径同一句话");
+        // 最硬的一条：整份信封序列化后不得出现调用者原始地址
+        String json = MAPPER.writeValueAsString(real);
+        assertFalse(json.contains(ATTACKER), "信封里不得出现调用者原始地址：" + json);
 
         Map<String, Object> internal = askEnvelope(PublicIpPolicy.revealing(), LINK_LOCAL);
-        assertEquals(PublicIpMask.INTERNAL_UNKNOWN_LABEL, internal.get("clientIp"),
-                "调用方来源是链路地址时也不许当真地址展示");
+        assertFalse(internal.containsKey("clientIp"), "链路地址同样不给原始字段");
+        assertEquals(PublicIpMask.INTERNAL_ADDRESS_LABEL, internal.get("clientIpMasked"),
+                "内网/链路地址在掩码态写成「内部地址」，不原样透出");
     }
 
     private static Map<String, Object> askEnvelope(PublicIpPolicy policy) throws Exception {

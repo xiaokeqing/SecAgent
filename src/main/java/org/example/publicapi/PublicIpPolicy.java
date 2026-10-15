@@ -58,8 +58,15 @@ public class PublicIpPolicy {
     /** 认不出来的取值在真实态下的写法（不猜、不原样透出） */
     public static final String UNKNOWN_LABEL = "未知";
 
-    /** 移除 / 更正入口的默认值（站主可改：真实邮箱或博客关于页 URL） */
-    public static final String DEFAULT_REMOVAL_CONTACT = "https://xiaokeqing.cn/about/";
+    /**
+     * 移除 / 更正入口的默认值。
+     *
+     * <p>【2026-10-16 修正】原值是 {@code https://xiaokeqing.cn/about/}，而该页已被删除并 301
+     * （站主决定删 /about/，见 `docs/待办-施工任务清单-给执行AI.md` 的 T27）⇒ 对外审查报告 R1
+     * 指出"口径字段指向死路"。站上目前**没有**联系/关于页，因此默认值改为站点根
+     * （一定存在），站主可随时用 {@code APP_PUBLIC_REMOVAL_CONTACT} 换成真实联系页或邮箱。
+     */
+    public static final String DEFAULT_REMOVAL_CONTACT = "https://xiaokeqing.cn/";
 
     /**
      * 是否掩码。配置为 {@code app.public.mask-ips}，默认 {@code false}（显示真实 IP）。
@@ -156,6 +163,28 @@ public class PublicIpPolicy {
     public Map<String, Object> disclosure() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("masked", maskIps);
+        m.put("notice", NOTICE);
+        m.put("removalContact", removalContact());
+        return m;
+    }
+
+    /**
+     * <b>调用者自身地址</b>的口径字段：{@code masked} <b>恒为 true</b>。
+     *
+     * <h3>为什么与 {@link #disclosure()} 分开（2026-10-16 站主红线）</h3>
+     * {@code app.public.mask-ips=false} 的对象是<b>观测到的攻击源</b>——站主要求保留真实值
+     * （附录-5.3 的 U1 裁决：不翻转全局开关，展示层只掩最后一段）。但<b>调用者自己的来源地址</b>
+     * 是另一类东西：它标识的是**访客本人**，不是被观测的攻击者。
+     * 站主红线段：「访客 IP 一律不上页面」✗ ⇒ 公开接口不得把调用者原始 IP 返回给前端。
+     *
+     * <p>所以这一份口径只服务"响应里与调用者自身有关的那一个字段"：
+     * {@code masked} 恒 true、{@code notice} 与真实态同一句（避免出现两句话两套口径）、
+     * {@code removalContact} 取配置值。<b>不改</b>全局开关，因此攻击源字段
+     * （{@code stories[].srcIp} 等）不受影响 ✓。
+     */
+    public Map<String, Object> callerDisclosure() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("masked", true);
         m.put("notice", NOTICE);
         m.put("removalContact", removalContact());
         return m;

@@ -257,11 +257,15 @@ public class PublicAskService {
         // 【既有字段，语义不变】永远是掩码形态 —— 名字里就写着 Masked，
         // 把真实地址塞进这个字段等于让字段名说谎（契约"只许新增字段"也不允许改名）。
         m.put("clientIpMasked", PublicIpMask.mask(clientIp));
-        // 【新增字段】按统一口径显示的调用方来源地址（真实态 = 观测到的真实地址）。
-        // 老字段保持原样，页面要真实地址就读这个；两个字段同时存在是刻意的。
-        m.put("clientIp", policy().display(clientIp));
-        // 统一口径字段（与所有公开端点同一位置、同一形状）
-        m.put(PublicIpPolicy.DISCLOSURE_FIELD, policy().disclosure());
+        // 【2026-10-16 收口（站主红线：访客 IP 一律不上页面）】
+        // 这里原本还有一个 clientIp 字段，按 app.public.mask-ips 的口径返回**调用者的原始地址**
+        // （那个开关的语义对象是"观测到的攻击源"，而 /ask 上唯一出现的地址是**访客本人**的）。
+        // 现在：① 不再返回任何原始形态的调用者地址；② 只保留永远掩码的 clientIpMasked；
+        //       ③ 口径字段改用 callerDisclosure()（masked 恒 true）。
+        // 站点侧只读 clientIpMasked（static/js/app.js + _dev/gen-demo-pages.py 的渲染），
+        // 所以删掉这个字段对前端零影响（grep 证据见执行记录）。
+        // 全局开关 app.public.mask-ips 不动 ⇒ 攻击源字段（stories[].srcIp 等）不受影响 ✓。
+        m.put(PublicIpPolicy.DISCLOSURE_FIELD, policy().callerDisclosure());
         return m;
     }
 

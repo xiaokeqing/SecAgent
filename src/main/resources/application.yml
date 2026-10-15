@@ -312,8 +312,11 @@ app:
   #   true  = 掩码（改造前口径：45.205.***.***、内网 →「内部地址」）
   #   false = 【默认】显示观测到的真实来源 IP（内网/保留/链路地址仍写「内网/未知」）
   #   影响面（全部走 PublicIpPolicy）：/api/public/overview、/alerts（含 /alerts/{aggId}
-  #   成员与来源字段）、/honeypot（来源 + timeline）、/audit（reason/target）、/ask
-  #   （回答里的来源 + clientIp）、/kb、/latest，以及后加的 /api/public/geo。
+  #   成员与来源字段）、/honeypot（来源 + timeline）、/audit（reason/target）、
+  #   /kb、/latest，以及后加的 /api/public/geo。
+  #   ⚠️ /api/public/ask **不适用**本开关：它上面唯一出现的地址是**访客本人**的，
+  #      【2026-10-16 站主红线】一律不返回原始形态（只给永远掩码的 clientIpMasked，
+  #      口径字段走 PublicIpPolicy.callerDisclosure()，masked 恒 true）✗
   #   ⚠️ 与 APP_QUOTA_*/APP_RAG_* 同一个坑：docker-compose.yml 的 environment 段必须
   #      显式透传 APP_PUBLIC_MASK_IPS，否则"在 .env 里加一行"可能不生效且不报错。
   # 【永不公开】与开关无关的两条（代码里硬保证，不随配置变化）：
@@ -321,8 +324,9 @@ app:
   #   · 内部资产名：公开响应出海前统一过停用词表（PublicAssetFilter，见 asset-blocklist）
   public:
     mask-ips: ${APP_PUBLIC_MASK_IPS:false}
-    # 口径字段 ipDisclosure.removalContact 的值：站主可填自己的邮箱或博客关于页 URL。
-    removal-contact: ${APP_PUBLIC_REMOVAL_CONTACT:https://xiaokeqing.cn/about/}
+    # 口径字段 ipDisclosure.removalContact 的值：站主可填自己的邮箱或联系页 URL。
+    # 【2026-10-16 修正】原默认是 /about/，该页已删并 301 ⇒ 改成站点根（站主可随时覆盖）。
+    removal-contact: ${APP_PUBLIC_REMOVAL_CONTACT:https://xiaokeqing.cn/}
     # 内部资产名停用词表（逗号分隔）。命中的词在公开响应里替换为「[内部标识已脱敏]」，
     # 作用面是整棵响应树（含 F5-B 直出到回答正文的知识库引用片段）。
     # 默认值 = 实测泄露过的那些名字（不是想象的清单）。改动前先想清楚会不会误伤正常内容。

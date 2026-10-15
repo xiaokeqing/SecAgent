@@ -121,7 +121,7 @@ services:
       # false = 显示观测到的真实来源 IP（默认，站主拍板）；true = 掩码（改造前口径）。
       # 影响所有 /api/public/** 端点；内网/保留地址在任何口径下都写「内网/未知」。
       APP_PUBLIC_MASK_IPS: "${APP_PUBLIC_MASK_IPS:-false}"
-      APP_PUBLIC_REMOVAL_CONTACT: "${APP_PUBLIC_REMOVAL_CONTACT:-https://xiaokeqing.cn/about/}"
+      APP_PUBLIC_REMOVAL_CONTACT: "${APP_PUBLIC_REMOVAL_CONTACT:-https://xiaokeqing.cn/}"
       APP_PUBLIC_ASSET_BLOCKLIST: "${APP_PUBLIC_ASSET_BLOCKLIST:-web-01,web-02,web-03,db-01,auth.log,/api/order/detail,/upload/files/}"
 
       # ===== 离线地理富化（DB-IP Lite，CC BY 4.0；RUNBOOK §26）=====
