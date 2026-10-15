@@ -2,7 +2,12 @@ package org.example.agent.multi;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -143,5 +148,168 @@ class AnalystVerdictTest {
                 "来源 1.2.3.4");
         assertNotNull(out);
         assertTrue(out.contains("HIGH"));
+    }
+
+    // ==================================================================
+    // T14 情绪决策：失败注入（不调模型、不烧额度、进每次 CI）
+    //
+    // 为什么是这 8 条：每一条都对应一种"模型会说但白名单不认"的真实写法 ——
+    // 剪辑名幻觉 / 素材里有但不在状态机内（clips_not_in_graph）/ 台词还没入库（60 句计划）/
+    // 把状态机宿主键当契约值（surprised）/ 把台词库标签当契约值（shy）/ 数值越界。
+    // 断言三件事：① 正文没被连坐丢掉 ② 非法字段被替换成语义安全值 ③ rejectReason 命中预期。
+    // ==================================================================
+
+    private static DecisionWhitelist whitelist() {
+        DecisionWhitelist w = new DecisionWhitelist();
+        ReflectionTestUtils.setField(w, "resource",
+                new ClassPathResource("kurisu/decision-whitelist.json"));
+        w.load();
+        assertTrue(w.loaded(), "白名单资源必须能加载：读不到会让所有决策用例静默退化");
+        return w;
+    }
+
+    private static MultiAgentCoordinatorImpl coordinatorWithWhitelist() {
+        MultiAgentCoordinatorImpl c = new MultiAgentCoordinatorImpl();
+        ReflectionTestUtils.setField(c, "decisionWhitelist", whitelist());
+        return c;
+    }
+
+    private static String verdictWithDecision(String action, String lineId, String emoTo, double urgency) {
+        return "{\"attackType\":\"SSH暴力破解\",\"confidence\":0.9,\"severity\":\"INFO\","
+                + "\"evidence\":[\"片段原句\"],\"recommendation\":\"只看公开知识库\",\"unknown\":false,"
+                + "\"reason\":\"概念问答\",\"emotionFrom\":\"normal\",\"emotionTo\":\"" + emoTo + "\","
+                + "\"action\":\"" + action + "\",\"lineId\":\"" + lineId + "\",\"urgency\":" + urgency + "}";
+    }
+
+    private static Map<String, Object> decide(MultiAgentCoordinatorImpl c, String action, String lineId,
+                                             String emoTo, double urgency) {
+        String out = c.validateVerdict(verdictWithDecision(action, lineId, emoTo, urgency),
+                "什么是SSH暴力破解", true);
+        assertNotNull(out, "决策字段非法绝不能把正文一起丢掉（否则 state=model-failed，代价过大）");
+        Map<String, Object> d = c.currentDecision();
+        assertNotNull(d, "公开面必须产出决策");
+        assertEquals(DecisionWhitelist.SCHEMA_VERSION, d.get("schemaVersion"));
+        return d;
+    }
+
+    @Test
+    @DisplayName("T14 ①：全字段合法 ⇒ fallbackUsed=false、rejectReason 为空、六字段齐全")
+    void decisionAllWhitelisted() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "thinking_trans", "nav_monitor", "sided_thinking", 0.6);
+        assertEquals("normal", d.get("emotionFrom"));
+        assertEquals("sided_thinking", d.get("emotionTo"));
+        assertEquals("thinking_trans", d.get("action"));
+        assertEquals("nav_monitor", d.get("lineId"));
+        assertEquals(0.6, (Double) d.get("urgency"), 1e-9);
+        assertEquals(Boolean.FALSE, d.get("fallbackUsed"));
+        assertEquals("", d.get("rejectReason"));
+        assertEquals(java.util.List.of("片段原句"), d.get("citations"));
+    }
+
+    @Test
+    @DisplayName("T14 ②：lineId=空串是【合法值】（只出字幕不出声），不是错误")
+    void decisionEmptyLineIdIsLegal() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "thinking_trans", "", "sided_thinking", 0.6);
+        assertEquals("", d.get("lineId"));
+        assertEquals(Boolean.FALSE, d.get("fallbackUsed"), "空串是契约里的合法值，不该触发回退");
+    }
+
+    @Test
+    @DisplayName("T14 ③：action 幻觉 ⇒ 丢弃并由 emotionTo 反推（sided_thinking → thinking_trans）")
+    void decisionHallucinatedActionIsReplaced() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "angry_ultra_trans", "nav_monitor", "sided_thinking", 0.6);
+        assertEquals("thinking_trans", d.get("action"));
+        assertEquals(Boolean.TRUE, d.get("fallbackUsed"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("ACTION_NOT_IN_WHITELIST"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ④：action 命中素材但不在状态机（clips_not_in_graph 的 smile）⇒ 判非法")
+    void decisionClipNotInGraphRejected() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "smile", "nav_monitor", "happy", 0.6);
+        assertEquals(Boolean.TRUE, d.get("fallbackUsed"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("ACTION_NOT_IN_GRAPH"),
+                "smile 在素材里有、但不在 38 节点内，必须与'纯幻觉'区分开：" + d.get("rejectReason"));
+        assertEquals("trans_smile", d.get("action"), "happy 的回退动作是 trans_smile");
+    }
+
+    @Test
+    @DisplayName("T14 ⑤：lineId 命中「60 句计划但未入库」⇒ 回退空串，原因是 LINE_PLANNED_NOT_SHIPPED")
+    void decisionPlannedButNotShippedLineRejected() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "thinking_trans", "event_bruteforce", "sided_thinking", 0.6);
+        assertEquals("", d.get("lineId"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("LINE_PLANNED_NOT_SHIPPED"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ⑥：emotionTo=surprised（状态机宿主键，不是契约值）⇒ 回退 normal")
+    void decisionStateMachineKeyIsNotContractValue() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "surprise_trans", "nav_monitor", "surprised", 0.6);
+        assertEquals("normal", d.get("emotionTo"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("EMOTION_TO_UNKNOWN"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ⑦：emotionTo=shy（台词库标签，不是契约值）⇒ 回退 normal")
+    void decisionVoiceBankLabelIsNotContractValue() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "shy_trans", "nav_monitor", "shy", 0.6);
+        assertEquals("normal", d.get("emotionTo"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("EMOTION_TO_UNKNOWN"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ⑧：urgency 越界 ⇒ 钳到 [0,1] 并记 URGENCY_CLAMPED")
+    void decisionUrgencyClamped() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        Map<String, Object> d = decide(c, "thinking_trans", "nav_monitor", "sided_thinking", 1.4);
+        assertEquals(1.0, (Double) d.get("urgency"), 1e-9);
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("URGENCY_CLAMPED"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ⑨：白名单读不到 ⇒ fail-closed（全字段回退），绝不静默放行模型自创值")
+    void decisionFailsClosedWhenWhitelistMissing() {
+        MultiAgentCoordinatorImpl c = new MultiAgentCoordinatorImpl();   // 不注入白名单
+        Map<String, Object> d = decide(c, "thinking_trans", "nav_monitor", "sided_thinking", 0.6);
+        assertEquals("normal", d.get("emotionTo"));
+        assertEquals("idle", d.get("action"));
+        assertEquals("", d.get("lineId"));
+        assertEquals(Boolean.TRUE, d.get("fallbackUsed"));
+        assertTrue(DecisionWhitelist.rejectsOf(d).contains("WHITELIST_UNLOADED"),
+                String.valueOf(d.get("rejectReason")));
+    }
+
+    @Test
+    @DisplayName("T14 ⑩：内部研判面不产出决策（决策只在公开面落地）")
+    void decisionOnlyOnPublicFace() {
+        MultiAgentCoordinatorImpl c = coordinatorWithWhitelist();
+        // 先跑一次公开面，制造线程局部残留
+        decide(c, "thinking_trans", "nav_monitor", "sided_thinking", 0.6);
+        String out = c.validateVerdict(
+                verdict("SSH暴力破解", 0.92, "HIGH", "[\"Failed password for root\"]", "封禁源IP", false),
+                "2026-10-12 10:00 来源 45.83.91.55 多次登录失败 root");
+        assertNotNull(out);
+        assertNull(c.currentDecision(), "内部面必须没有任何决策残留（否则同线程串决策）");
+    }
+
+    @Test
+    @DisplayName("T14 ⑪：进 prompt 的白名单清单不能失控（38 个剪辑名 + 12 句 id 的可读上限）")
+    void promptHintIsBounded() {
+        String hint = whitelist().promptHint();
+        assertTrue(hint.contains("thinking_trans"), "清单里必须有真实剪辑名");
+        assertTrue(hint.contains("nav_monitor"), "清单里必须有真实台词 id");
+        assertTrue(hint.length() < 900, "清单长度失控会把 prompt 预算吃掉：" + hint.length());
     }
 }

@@ -2,6 +2,7 @@ package org.example.agent.multi;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 多智能体编排结果。
@@ -16,6 +17,15 @@ public class MultiAgentResult {
     private String finalAnswer;           // 汇总后的最终答复
     private long totalDurationMs;         // 总耗时
     private String plannerNote;           // 调度员的路由决策说明（可选）
+
+    /**
+     * T14 情绪决策（结构化枚举：emotionFrom/emotionTo/action/lineId/urgency/reason/…）。
+     *
+     * <p>由 {@code MultiAgentCoordinatorImpl} 在公开面产出；可能是"回退决策"
+     * （{@code fallbackUsed=true}）。{@code PublicAskService} 把它放进响应体的
+     * {@code data.decision}，前端据此驱动状态机与台词。内部研判面为 null（不产出决策）。
+     */
+    private Map<String, Object> decision;
 
     public MultiAgentResult() {
         this.steps = new ArrayList<>();
@@ -71,5 +81,13 @@ public class MultiAgentResult {
 
     public void setPlannerNote(String plannerNote) {
         this.plannerNote = plannerNote;
+    }
+
+    public Map<String, Object> getDecision() {
+        return decision;
+    }
+
+    public void setDecision(Map<String, Object> decision) {
+        this.decision = decision;
     }
 }

@@ -115,6 +115,20 @@ public class DeepSeekLlmProvider implements LlmProvider {
     @Value("${app.llm.temperature:0.0}")
     private double temperature;
 
+    /**
+     * 人格链路的采样温度（T25 §12）—— 与 {@link #temperature} 刻意分开。
+     *
+     * <p>决策链路（PLANNER/工具选择/内部研判）的产物要被 JSON schema 校验，必须保持 0.0；
+     * 人格回答（公开问答正文）恰恰相反：温度过低会让口头禅自我强化成复读
+     * （上游 Code-Amadeus/Amadeus#227 的实测）。共用同一个键就只能二选一。
+     */
+    @Value("${app.llm.persona.temperature:0.8}")
+    private double personaTemperature;
+
+    /** 人格链路的核采样阈值（T25 §12）：0.8 截掉长尾，比 1.0 更不容易反复抽到同一句套话 */
+    @Value("${app.llm.persona.top-p:0.8}")
+    private double personaTopP;
+
     @Value("${app.llm.max-tokens:800}")
     private int maxTokens;
 
@@ -163,6 +177,30 @@ public class DeepSeekLlmProvider implements LlmProvider {
 
     @Override
     public String generate(String systemPrompt, String userPrompt) throws Exception {
+        // 【决策链路】（PLANNER/内部研判/其它既有调用点）：沿用 app.llm.temperature（默认 0.0），
+        // 且 topP 传 null ⇒ 请求体里不出现 top_p，与改造前的请求形状逐字一致。
+        return doGenerate(systemPrompt, userPrompt, temperature, null);
+    }
+
+    /**
+     * 带采样的生成（T25 §12）：人格链路走这里（默认 0.8 / 0.8）。
+     *
+     * <p>★ 关键一行在 {@link #buildRequestBody(String, String, String, double, int, double)}：
+     * 请求体里必须真的写进 {@code top_p}，否则 DeepSeek 面永远只有 temperature 一个旋钮。
+     */
+    @Override
+    public String generate(String systemPrompt, String userPrompt, double temperature, double topP)
+            throws Exception {
+        return doGenerate(systemPrompt, userPrompt, temperature, topP);
+    }
+
+    /**
+     * 生成实现（唯一的请求路径）。
+     *
+     * @param topP 非 null ⇒ 请求体写 {@code top_p}；null ⇒ 不写该字段（等价服务端默认 1.0）
+     */
+    private String doGenerate(String systemPrompt, String userPrompt, double temperature, Double topP)
+            throws Exception {
         if (!available()) {
             throw new IllegalStateException("DeepSeek provider 不可用（provider=" + selectedProvider
                     + "，或 DEEPSEEK_API_KEY 未配置）：本次不调用模型，由上层按 fail-closed 处理");
@@ -176,7 +214,9 @@ public class DeepSeekLlmProvider implements LlmProvider {
         }
 
         String url = chatUrl();
-        String body = buildRequestBody(modelName(), systemPrompt, userPrompt, temperature, maxTokens);
+        String body = topP == null
+                ? buildRequestBody(modelName(), systemPrompt, userPrompt, temperature, maxTokens)
+                : buildRequestBody(modelName(), systemPrompt, userPrompt, temperature, maxTokens, topP);
         OkHttpClient client = buildClient();
 
         return guard.call(DEP_CHAT, timeouts.getEffectiveCallTimeoutMs(), () -> {
@@ -346,6 +386,22 @@ public class DeepSeekLlmProvider implements LlmProvider {
         root.put("temperature", temperature);
         root.put("max_tokens", maxTokens);
         root.put("stream", false);
+        return MAPPER.writeValueAsString(root);
+    }
+
+    /**
+     * 构造带 {@code top_p} 的 OpenAI 兼容请求体（T25 §12 人格链路）。
+     *
+     * <p>与 5 参数版本的关系：5 参数版本写出的请求体<b>不含</b> {@code top_p}
+     * （与改造前逐字一致，决策链路的形状一个字都没变）；只有人格链路调用这个版本。
+     * 拆成两个静态方法而不是"加一个可空参数"，是为了让"决策链路不发 top_p"成为
+     * <b>类型上可见</b>的事实，而不是靠调用方记得传 null。
+     */
+    static String buildRequestBody(String model, String systemPrompt, String userPrompt,
+                                   double temperature, int maxTokens, double topP) throws IOException {
+        ObjectNode root = (ObjectNode) MAPPER.readTree(
+                buildRequestBody(model, systemPrompt, userPrompt, temperature, maxTokens));
+        root.put("top_p", topP);
         return MAPPER.writeValueAsString(root);
     }
 
