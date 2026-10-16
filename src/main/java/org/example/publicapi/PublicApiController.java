@@ -2210,6 +2210,13 @@ public class PublicApiController {
         refreshed += warmOne(latestCache, "latest", maxAge, this::buildLatest);
         refreshed += warmOne(geoCache, "geo", maxAge, this::buildGeo);
         refreshed += warmOne(webStatsCache, "webstats", maxAge, this::buildWebStats);
+        /* ★2026-10-16 补：**聚合端点也必须进预聚合**。
+           漏了它的后果是线上实测出来的：`/api/public/home.js` 的 P50 = **29.9 秒**（min 868ms）——
+           45 秒 TTL 一过，第一个访客就要替所有人现算三块（alerts+geo+honeypot），
+           而单端点那些早就被后台刷热了 ⇒ 聚合反而比单端点慢 20 倍，与本端点"省一次路程"的初衷相反。
+           **顺序有讲究**：放在三个子快照之后 —— 这样 buildHome() 只是"组合三份已热快照"（毫秒级），
+           若放前面，它会触发三个子快照的冷现算，把后台这一轮拖成十几秒。 */
+        refreshed += warmOne(homeCache, "home", maxAge, this::buildHome);
         if (refreshed > 0) {
             logger.debug("公网快照预聚合：本轮刷新 {} 个端点（年龄阈值 {}ms）", refreshed, maxAge);
         }
