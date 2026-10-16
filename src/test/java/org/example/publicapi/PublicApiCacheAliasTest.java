@@ -101,6 +101,10 @@ class PublicApiCacheAliasTest {
                 .andExpect(header().string("Access-Control-Allow-Origin", "*"))
                 .andExpect(header().doesNotExist("Vary"))
                 .andExpect(header().string("X-Content-Type-Options", "nosniff"))
+                // 硬条件：别名是为了"可缓存"才用 .js 后缀，内容类型**必须**仍是 JSON ——
+                // 否则一旦 payload 里有攻击者可控字符串，就是一条 XSS 面。
+                .andExpect(header().string("Content-Type",
+                        org.hamcrest.Matchers.startsWith("application/json")))
                 .andExpect(header().string("Access-Control-Expose-Headers",
                         org.hamcrest.Matchers.containsString("Age")))
                 .andReturn().getResponse().getContentAsString();
