@@ -101,6 +101,13 @@ public class SelfApiController {
             return failed;
         }
         Map<String, Object> data = new LinkedHashMap<>();
+        // 【字段名：两个都给，别让前端或自检脚本去猜】
+        //   loggedIn      —— 站主口径点名的字段（"200 且 loggedIn:true"）
+        //   authenticated —— 自述更准确：这个端点回答的是"令牌是否通过校验"，
+        //                    而服务端**没有**会话可"登录"（无状态，见 logout 的注释）
+        // 只给一个都会造成误读：只用 loggedIn 会被读成"服务端有会话"；
+        // 只用 authenticated 会让站主按自己写的自检脚本查不到字段。
+        data.put("loggedIn", true);
         data.put("authenticated", true);
         data.put("pool", SelfPoolPolicy.POOL);
         data.put("generatedAt", LocalDateTime.now().format(FMT));

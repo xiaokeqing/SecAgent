@@ -66,19 +66,27 @@ public class SelfPoolPolicy {
     public Map<String, Object> quotaSnapshot() {
         Map<String, Object> m = new LinkedHashMap<>();
         ModelQuotaService q = quotaService;
+        // 【形状必须稳定】pool / softLimit 先放，再谈"服务在不在"：
+        // 前端与站主自检脚本都会先读这两个键来判断"这是哪本账、是不是软上限"。
+        // 把它们放在 null 检查之后，就会让"配额服务未接入"时的响应形状与别的情况不同 ——
+        // 前端读到 null，表现是"页面显示未登录或空白"，排查时却看不出跟配额有什么关系。
+        m.put("pool", POOL);
+        m.put("softLimit", true);
         if (q == null) {
             m.put("available", false);
-            m.put("note", "配额服务未接入");
+            m.put("limit", 0);
+            m.put("used", 0);
+            m.put("remaining", 0);
+            m.put("softLimitReached", false);
+            m.put("note", "配额服务未接入（裁剪部署或单测）：不假装有额度，也不假装已用完。");
             return m;
         }
         int limit = q.getSelfSoftLimit();
         int used = q.getSelfUsedToday();
         m.put("available", q.isEnabled());
-        m.put("pool", POOL);
         m.put("limit", limit);
         m.put("used", used);
         m.put("remaining", Math.max(0, limit - used));
-        m.put("softLimit", true);
         m.put("softLimitReached", used >= limit);
         m.put("storeFile", "data/model-quota-self.json");
         m.put("note", softLimitReachedNote(limit));
