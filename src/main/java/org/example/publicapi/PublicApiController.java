@@ -2,6 +2,8 @@ package org.example.publicapi;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.example.core.model.AlertSeverity;
 import org.example.core.model.AlertSource;
 import org.example.core.model.AlertType;
@@ -82,6 +84,27 @@ public class PublicApiController {
     /** 应用内快照有效期；同时作为 Cache-Control 的 max-age 下发给浏览器/边缘 */
     @Value("${app.public-api.cache-seconds:15}")
     private int cacheSeconds;
+
+    /**
+     * 缓存别名路径（{@code .js}）的边缘 TTL。
+     *
+     * <p>比应用内快照（{@code cache-seconds}，默认 15s）长，原因见 {@link #aliasCacheControl()}：
+     * 站点 /alerts/ 每 40 秒轮询一次，边缘 TTL 必须长于轮询间隔，否则每次轮询都过期再验证、
+     * 每 40 秒给源站 9 个请求（≈13.5/分，逼近每 IP 20/分 的上限）。取 45s。
+     */
+    private static final int CACHE_ALIAS_MAX_AGE_SECONDS = 45;
+
+    /** 别名路径的 {@code stale-while-revalidate}：边缘先发旧值、后台再验证 ⇒ 用户侧不被回源卡住 */
+    private static final int CACHE_ALIAS_SWR_SECONDS = 90;
+
+    /**
+     * 别名 ETag 的序列化器：把 Map 键排序 ⇒ ETag 只取决于内容、与插入顺序无关。
+     *
+     * <p>为什么不能直接用"完整响应体哈希"（{@link PublicEtagFilter} 的默认口径）：
+     * 别名体里的 {@code cacheAgeSeconds} 每秒都在变，ETag 会跟着每秒变 ⇒ 再验证永远拿不到 304。
+     */
+    private static final ObjectMapper ETAG_MAPPER = new ObjectMapper()
+            .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
 
     /** 是否在公网端点暴露构建版本号。health 早已公开它，且它是开源仓库的提交号，不敏感 */
     @Value("${app.public-api.expose-build-sha:true}")
@@ -1825,12 +1848,69 @@ public class PublicApiController {
         body.put("code", 200);
         body.put("message", "success");
         // 所有公开 GET 端点的共同出口：资产名过滤 + 统一 ipDisclosure（口径只有一个来源）
-        body.put("data", ship(data));
-        // 【缓存别名专属】旧路径（无 .js 后缀）不写这三个字段 ⇒ 响应体逐字节不变。
+        Map<String, Object> shipped = ship(data);
+        body.put("data", shipped);
+        // 【缓存别名专属】旧路径（无 .js 后缀）不写下面任何一项 ⇒ 响应体与响应头逐字节不变。
         if (isCacheAliasRequest()) {
+            res.setHeader(HttpHeaders.CACHE_CONTROL, aliasCacheControl());
+            String stableEtag = cacheAliasEtag(shipped);
+            if (stableEtag != null) {
+                res.setHeader(HttpHeaders.ETAG, stableEtag);
+            }
             stampSnapshotFreshness(body);
         }
         return ResponseEntity.ok(body);
+    }
+
+    /**
+     * 别名路径的缓存头。
+     *
+     * <h3>为什么 max-age 不是 15，而是 {@value #CACHE_ALIAS_MAX_AGE_SECONDS}</h3>
+     * 站点 {@code /alerts/} 页**每 40 秒轮询一次**（`layouts/partials/xk-demo/api-bind.html:41`
+     * {@code REFRESH = 40000}，配 {@code :1003 setInterval(load, REFRESH)}）。边缘 TTL 若短于轮询间隔，
+     * 每次轮询都落在"已过期"上 ⇒ 每 40 秒给源站 9 个请求（≈13.5/分，逼近公开面每 IP 20/分 的上限，
+     * 而每次回源都消耗访客自己的额度）。取 45 秒后：轮询落在 TTL 内 ⇒ 命中边缘缓存、**零回源**；
+     * 数据最旧 45 秒，且由 {@code snapshotAt} + {@code Age} 如实呈现（红线 D4：被缓存不许假装更新）。
+     *
+     * <h3>为什么要 stale-while-revalidate</h3>
+     * 即使再验证发生，边缘也**先把手上那份发出去**、在后台去源站确认 ⇒ 用户侧不会因为
+     * "回源 + TLS + 边缘选择（实测曾命中 LHR 伦敦）"而卡住。这正是"加载很慢"的直接解药。
+     *
+     * <h3>⚠️ 浏览器侧 TTL 由 Cloudflare 决定，不由这里决定</h3>
+     * 实测（2026-10-16 20:08，srv1）：本机直连 origin 得到 {@code public, max-age=15}；
+     * 经 CF 得到的却是 {@code public, max-age=14400}（4 小时）—— 这是 zone 的
+     * **Browser Cache TTL** 设置在覆写（CF 会把较短的 max-age 抬到该设置值）。
+     * ⇒ 浏览器可能把这份数据缓存 4 小时。**前端因此必须用条件请求/`no-store` 语义取数**
+     * （站点线 B2 那批），或由站主在 CF 控制台把 Browser Cache TTL 改为 "Respect Existing Headers"。
+     * 这一条已写进契约文档，别让它留在线上而不写文档。
+     */
+    private static String aliasCacheControl() {
+        return "public, max-age=" + CACHE_ALIAS_MAX_AGE_SECONDS
+                + ", stale-while-revalidate=" + CACHE_ALIAS_SWR_SECONDS;
+    }
+
+    /**
+     * 别名路径的**稳定 ETag**：只对"数据内容"算，不含 {@code snapshotAt} / {@code cacheAgeSeconds}
+     * 这类每请求都在变的元数据。
+     *
+     * <h3>为什么必须这样算（实测的坑）</h3>
+     * {@link PublicEtagFilter} 默认按**完整响应体**算 ETag。而别名响应体里的
+     * {@code cacheAgeSeconds} 每秒都在变（实测：两次调用 {@code data} 完全相同，
+     * 唯一差异是 {@code cacheAgeSeconds: 9 → 12}）⇒ ETag 每次都不同
+     * ⇒ Cloudflare 的再验证**永远拿不到 304**，每次过期都变成一次完整的 200 回源。
+     * 按"数据内容"算之后，同一快照窗口内 ETag 稳定 ⇒ 再验证可 304 ⇒ 回源从
+     * "每 15 秒每端点 1 次"降到"数据真的变了才回源"。
+     *
+     * <p>序列化器把 Map 键排序 ⇒ ETag 与插入顺序无关，只取决于内容。
+     * 计算失败返回 {@code null}：调用方不下发 ETag，退回过滤器按完整体算（如实降级，不假装稳定）。
+     */
+    private static String cacheAliasEtag(Map<String, Object> shipped) {
+        try {
+            return PublicEtagFilter.etagOf(ETAG_MAPPER.writeValueAsBytes(shipped));
+        } catch (Exception e) {
+            logger.warn("别名 ETag 计算失败，退回按完整响应体计算：{}", e.getMessage());
+            return null;
+        }
     }
 
     /**

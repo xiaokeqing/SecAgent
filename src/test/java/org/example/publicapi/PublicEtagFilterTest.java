@@ -65,6 +65,25 @@ class PublicEtagFilterTest {
     }
 
     @Test
+    @DisplayName("【核心】控制器预置了稳定 ETag → 过滤器必须沿用（不得用易变完整体哈希覆盖）且能据此 304")
+    void presetEtagWins() throws Exception {
+        String preset = "\"snapshot-content-etag\"";
+        // 体里带"每秒都在变"的字段（cacheAgeSeconds）—— 若过滤器仍按完整体哈希算，ETag 必然变、304 拿不到。
+        ContentCachingResponseWrapper first = respond("{\"code\":200,\"cacheAgeSeconds\":9,\"data\":{\"n\":1}}");
+        first.setHeader("ETag", preset);
+        filter.applyEtag(get(null), first);
+        assertEquals(preset, first.getHeader("ETag"), "预置的稳定 ETag 必须原样保留");
+
+        ContentCachingResponseWrapper second = respond("{\"code\":200,\"cacheAgeSeconds\":12,\"data\":{\"n\":1}}");
+        second.setHeader("ETag", preset);
+        filter.applyEtag(get(preset), second);
+
+        assertEquals(304, second.getStatus(), "内容未变（只是元数据变了）必须能 304，否则边缘再验证永远是一次完整回源");
+        assertEquals(0, second.getContentAsByteArray().length, "304 不得带响应体");
+        assertEquals(preset, second.getHeader("ETag"));
+    }
+
+    @Test
     @DisplayName("【核心】带相同 If-None-Match 的第二次请求 → 304 且不带实体")
     void matchingEtagYields304WithoutBody() throws Exception {
         ContentCachingResponseWrapper first = respond("{\"code\":200,\"data\":{\"n\":1}}");

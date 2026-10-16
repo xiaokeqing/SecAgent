@@ -76,13 +76,20 @@ public class PublicEtagFilter extends OncePerRequestFilter {
 
     /**
      * 计算 ETag 并处理条件请求。包装体已经拿到完整 body，但尚未写回真实响应。
+     *
+     * <p><b>预置 ETag 优先</b>：控制器可以自己下 ETag（缓存别名路径就是这么做的 ——
+     * 见 {@code PublicApiController#cacheAliasEtag}，它按"快照内容"算，剔除
+     * {@code snapshotAt}/{@code cacheAgeSeconds} 这类每请求都变的元数据）。
+     * 如果这里仍用"完整响应体哈希"覆盖它，ETag 会每秒都变、再验证永远拿不到 304，
+     * 边缘缓存就白做了。没有预置时行为与以前完全一致（完整响应体哈希）。
      */
     void applyEtag(HttpServletRequest request, ContentCachingResponseWrapper wrapper) {
         if (!isEligible(request, wrapper)) {
             return;
         }
         byte[] body = wrapper.getContentAsByteArray();
-        String etag = etagOf(body);
+        String preset = wrapper.getHeader(HttpHeaders.ETAG);
+        String etag = (preset != null && !preset.isBlank()) ? preset : etagOf(body);
         // ETag 必须在下发响应体之前给出（304 的判定也依赖它）
         wrapper.setHeader(HttpHeaders.ETAG, etag);
 

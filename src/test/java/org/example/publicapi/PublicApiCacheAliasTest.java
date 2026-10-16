@@ -18,6 +18,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -97,7 +98,9 @@ class PublicApiCacheAliasTest {
                 .andExpect(jsonPath("$.snapshotAt").exists())
                 .andExpect(jsonPath("$.cacheAgeSeconds").exists())
                 .andExpect(jsonPath("$.snapshotTtlSeconds").value(15))
-                .andExpect(header().string("Cache-Control", "public, max-age=15"))
+                // TTL 45s（> 站点 40s 轮询间隔）+ stale-while-revalidate（边缘先发旧值再后台验证）
+                .andExpect(header().string("Cache-Control",
+                        "public, max-age=45, stale-while-revalidate=90"))
                 .andExpect(header().string("Access-Control-Allow-Origin", "*"))
                 .andExpect(header().doesNotExist("Vary"))
                 .andExpect(header().string("X-Content-Type-Options", "nosniff"))
@@ -110,6 +113,20 @@ class PublicApiCacheAliasTest {
                 .andReturn().getResponse().getContentAsString();
 
         assertFalse(body.contains("45.83.91.12"), "完整来源 IP 不得出现（别名同样走同一套脱敏）：" + body);
+    }
+
+    @Test
+    @DisplayName("别名 ETag 按【数据内容】算：同一快照窗口内两次请求必须同一个 ETag（否则 CF 再验证永远拿不到 304）")
+    void aliasEtagIsStableWithinSnapshotWindow() throws Exception {
+        // 两次请求之间隔 1.2 秒 ⇒ cacheAgeSeconds 很可能已经不同（这正是线上 ETag 每秒都变的根因）；
+        // 但 ETag 只应对"数据内容"敏感，所以两次必须一致。
+        String etag1 = mvc().perform(get("/api/public/latest.js")).andReturn().getResponse().getHeader("ETag");
+        Thread.sleep(1200);
+        String etag2 = mvc().perform(get("/api/public/latest.js")).andReturn().getResponse().getHeader("ETag");
+
+        assertNotNull(etag1, "别名必须下发 ETag（否则只能按完整体哈希算、每秒都变）");
+        assertEquals(etag1, etag2,
+                "同一快照窗口内 ETag 必须稳定：volatile 字段（cacheAgeSeconds/snapshotAt）不得参与计算");
     }
 
     @Test
