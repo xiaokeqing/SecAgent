@@ -118,13 +118,19 @@ public class SelfTokenInterceptor implements HandlerInterceptor {
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding("UTF-8");
         response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-        if (retryAfter > 0) {
-            response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfter));
-        }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("code", status);
         body.put("message", message);
         body.put("reason", reason);
+        if (retryAfter > 0) {
+            // 秒数<b>两处都给</b>，任何一层都不会退化成"永远显示 60 秒"：
+            //   ① 响应头 Retry-After —— HTTP 层（curl / 中间件 / 非浏览器客户端）用；
+            //   ② 响应体 retryAfter   —— 跨域下浏览器读响应头需要
+            //      Access-Control-Expose-Headers（见 WebMvcConfig.EXPOSED_HEADERS）；
+            //      万一某个入口没带上那个头，前端的 body 兜底仍能拿到真实秒数。
+            response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfter));
+            body.put("retryAfter", retryAfter);
+        }
         objectMapper.writeValue(response.getWriter(), body);
         return false;
     }

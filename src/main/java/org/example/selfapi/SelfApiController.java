@@ -287,13 +287,19 @@ public class SelfApiController {
                 : String.valueOf(req.getAttribute(ATTR_FAIL_MESSAGE));
         Object retry = req.getAttribute(ATTR_FAIL_RETRY_AFTER);
         res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-        if (retry instanceof Integer r && r > 0) {
-            res.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(r));
+        boolean hasRetry = retry instanceof Integer r && r > 0;
+        if (hasRetry) {
+            res.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(retry));
         }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("code", status);
         body.put("message", message);
         body.put("reason", reason);
+        if (hasRetry) {
+            // 与 SelfTokenInterceptor 同一口径：头 + 体都给（跨域下浏览器读头需要
+            // Access-Control-Expose-Headers，见 WebMvcConfig.EXPOSED_HEADERS）。
+            body.put("retryAfter", retry);
+        }
         return ResponseEntity.status(status).body(body);
     }
 

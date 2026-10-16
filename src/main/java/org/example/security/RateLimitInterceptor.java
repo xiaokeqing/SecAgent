@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
@@ -49,12 +50,20 @@ public class RateLimitInterceptor implements HandlerInterceptor {
         Window w = store.compute(ip, (k, v) -> (v == null || now - v.start >= WINDOW_MS) ? new Window(now) : v);
         synchronized (w) {
             if (w.count >= max) {
+                // 固定窗口的剩余秒数（向上取整、且至少 1 秒：下发 0 会被前端读成"立刻重试"）。
+                // 跨域下这条头浏览器默认读不到（Retry-After 不在 CORS 安全列表响应头里），
+                // 所以【头 + 响应体字段】两处都给：见 WebMvcConfig.EXPOSED_HEADERS。
+                long retryAfterSeconds = Math.max(1L, (WINDOW_MS - (now - w.start) + 999L) / 1000L);
                 response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
                 response.setContentType(MediaType.APPLICATION_JSON_VALUE);
                 response.setCharacterEncoding("UTF-8");
+                response.setHeader(HttpHeaders.RETRY_AFTER, String.valueOf(retryAfterSeconds));
+                response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
                 Map<String, Object> body = new HashMap<>();
                 body.put("code", 429);
                 body.put("message", "请求过于频繁，请稍后再试");
+                body.put("reason", "RATE_LIMITED");
+                body.put("retryAfter", retryAfterSeconds);
                 objectMapper.writeValue(response.getWriter(), body);
                 return false;
             }

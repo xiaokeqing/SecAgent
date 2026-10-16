@@ -56,6 +56,22 @@ public class WebMvcConfig implements WebMvcConfigurer {
     private String[] allowedOrigins;
 
     /**
+     * 跨域下<b>允许前端 JS 读到</b>的响应头。
+     *
+     * <p><b>为什么必须有这一条</b>：CORS 规范里的"安全列表响应头"
+     * （safelisted response headers）只有 {@code Cache-Control / Content-Language /
+     * Content-Length / Content-Type / Expires / Last-Modified / Pragma}，
+     * <b>不含 {@code Retry-After}</b>。所以少了 {@code Access-Control-Expose-Headers}，
+     * 浏览器里 {@code response.headers.get('Retry-After')} <b>恒为 null</b> ——
+     * 而请求本身 200/429 正常、服务端日志也正常，表现只是"限流提示的秒数永远显示兜底值"。
+     * 这是本站真实踩过的坑（2026-10-16 站点线报）。
+     *
+     * <p>它与 {@code allowedHeaders} <b>不是一回事</b>：后者管<b>请求</b>能带什么头
+     * （例如自用面的 {@code X-User-Token}），这里管<b>响应</b>能被 JS 读到什么头。
+     */
+    private static final String EXPOSED_HEADERS = "Retry-After";
+
+    /**
      * 全局 CORS 只配"业务端点"需要的来源，<b>公网端点的来源白名单不放在这里</b>。
      *
      * <p>为什么要分开看：{@code /api/public/**} 是匿名可达面，它的来源白名单是另一道边界。
@@ -67,6 +83,7 @@ public class WebMvcConfig implements WebMvcConfigurer {
                 .allowedOrigins(allowedOrigins)
                 .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
+                .exposedHeaders(EXPOSED_HEADERS)
                 .maxAge(3600);
     }
 

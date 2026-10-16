@@ -93,6 +93,25 @@ class SelfApiControllerGuardTest {
         assertEquals(HttpStatus.TOO_MANY_REQUESTS, entity.getStatusCode());
         assertEquals("600", res.getHeader("Retry-After"));
         assertEquals(429, entity.getBody().get("code"));
+        // 跨域下浏览器读 Retry-After 头需要 Access-Control-Expose-Headers
+        // （见 WebMvcConfig.EXPOSED_HEADERS）；响应体字段是前端的三层兜底之一，
+        // 所以头与体必须同时给、且数值一致。
+        assertEquals(600, entity.getBody().get("retryAfter"),
+                "429 的响应体必须带 retryAfter（秒），与 Retry-After 头一致");
+    }
+
+    @Test
+    @DisplayName("401 兜底不带 retryAfter（避免前端把『令牌不对』显示成『被限流』）")
+    void unauthorizedFailureHasNoRetryAfter() {
+        MockHttpServletRequest req = failedRequest(401, "TOKEN_INVALID", "令牌无效或已轮换", 0);
+        MockHttpServletResponse res = new MockHttpServletResponse();
+
+        ResponseEntity<Map<String, Object>> entity = controller.status(req, res);
+
+        assertNotNull(entity);
+        assertEquals(HttpStatus.UNAUTHORIZED, entity.getStatusCode());
+        assertNull(res.getHeader("Retry-After"), "401 不该有限流秒数");
+        assertNull(entity.getBody().get("retryAfter"), "401 的响应体里不该出现 retryAfter");
     }
 
     @Test
