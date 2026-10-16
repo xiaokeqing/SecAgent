@@ -122,11 +122,59 @@ public class PublicApiController {
     @Value("${app.build.sha:unknown}")
     private String buildSha;
 
+    /** 构建时的源提交 / 产物指纹 / 构建时间：与 {@code /api/health} 同源（容器自述，非独立证据） */
+    @Value("${app.build.source-sha:unknown}")
+    private String buildSourceSha;
+
+    @Value("${app.build.artifact-md5:unknown}")
+    private String buildArtifactMd5;
+
+    @Value("${app.build.time:unknown}")
+    private String buildTime;
+
+    /**
+     * 发布信息文件（可选）：发布号 / 提交 / 切换时刻 / 文件数由**运维链**落地成本文件，本端点只读透传。
+     * 为什么不由本服务自己算：发布切换发生在 srv2 上，本进程（srv1）读不到那个目录 ——
+     * 读不到就写 {@code available=false}，绝不用进程启动时刻冒充"发布时间"。
+     */
+    @Value("${app.public-api.deploy-file:}")
+    private String deployFile;
+
+    /**
+     * 评测报告文件（可选）：{@code scripts/eval/} 跑出来的真值报告，落在本文件里供端点透传。
+     * 为什么本服务不自己算这些指标：它们要跑题库与评分器（离线、耗时长、依赖题库与知识库），
+     * 放在请求路径上既不可能也不该做。
+     */
+    @Value("${app.public-api.eval-report-file:}")
+    private String evalReportFile;
+
+    /** 进程启动时刻（部署可追溯端点展示 uptime 用；类加载≈启动，误差在秒级） */
+    private static final long STARTED_AT_MS = System.currentTimeMillis();
+
+    /** 公开端点读 JSON 文件的大小上限：超过就按"读不到"处理，**不截断**（截断会发出半个真相） */
+    private static final long JSON_FILE_MAX_BYTES = 256 * 1024L;
+
+    /** 发布信息文件允许透传的键（白名单：不把运维文件的任意内容端到公网） */
+    private static final List<String> DEPLOY_FILE_KEYS = List.of(
+            "release", "releaseDir", "commit", "fileCount", "totalBytes", "switchedAt", "publishedAt", "host");
+
+    /** 评测报告允许透传的键（白名单：正好是 C2 面板要的那几个真值 + 自证新鲜度用的 generatedAt） */
+    private static final List<String> EVAL_REPORT_KEYS = List.of(
+            "generatedAt", "sampleSize", "dataset", "model", "metrics", "keyPointHitRate",
+            "refusalRate", "strictRate", "citationRate", "personaCatchphraseRate", "tabooRate");
+
     private final Snapshot overviewCache = new Snapshot();
     private final Snapshot alertsCache = new Snapshot();
     private final Snapshot honeypotCache = new Snapshot();
     private final Snapshot auditCache = new Snapshot();
     private final Snapshot latestCache = new Snapshot();
+
+    /** ① 聚合端点（alerts+geo+honeypot 三合一）的快照：TTL 与其它端点同源（{@code cacheSeconds}） */
+    private final Snapshot homeCache = new Snapshot();
+
+    /** ①b 部署可追溯 / ② AI 质量真值：两者都是"读一个小 JSON + 白名单透传"，同样按快照 TTL 缓存 */
+    private final Snapshot deployCache = new Snapshot();
+    private final Snapshot evalCache = new Snapshot();
 
     // ==================== 公开面口径：IP 开关 + 内部资产名词表 ====================
     //
@@ -638,6 +686,204 @@ public class PublicApiController {
             return tooMany(res);
         }
         return ok(honeypotCache.get(cacheSeconds, this::buildHoneypot), res);
+    }
+
+    // ==================== ① 聚合端点：一次请求拿三块（弱网收益最大的一处） ====================
+
+    /**
+     * <b>内容页聚合端点</b>：一次请求拿回 {@code alerts + geo + honeypot} 三块。
+     *
+     * <h3>为什么要有它（2026-10-16 站主弱网实测的直接产物）</h3>
+     * 手机热点（无代理）下首屏 TTFB ≈ 6s，而首屏要发 3 个公开请求
+     * （{@code /api/public/alerts.js} + {@code geo.js} + {@code honeypot.js}）——
+     * 每个请求各自付一次"客户端 → CF → 源站"的路程，三段路程串起来就是访客感知的"取数慢"。
+     * 三合一后：**访客只付一次路程**，且**只消耗一份限流额度**（原来 3 个请求 = 3 次额度，
+     * 20 次/分的上限被三个端点分掉）。
+     *
+     * <h3>口径：与单端点<b>逐字段一致</b>（不新增、不改名、不丢字段）</h3>
+     * 每个子块单独过一次 {@link #ship(Map)}（因此各自带自己的 {@code ipDisclosure}），
+     * 再嵌进 {@code data.alerts / data.geo / data.honeypot}。于是：
+     * <pre>home.data.alerts ≡ alerts.data（逐字段相同）</pre>
+     * 这条由 {@code PublicApiHomeEndpointTest} 用真实响应体断言，不靠人眼。
+     *
+     * <p>新鲜度三件套（{@code snapshotAt / cacheAgeSeconds / snapshotTtlSeconds}）仍在**信封层**，
+     * 由 {@link #stampSnapshotFreshness(Map)} 统一盖 —— 它的值来自本端点自带快照的装载时刻
+     * （{@link Snapshot#load} 在 loader 返回后打点），所以"这份聚合数据有多旧"是如实值。
+     *
+     * <p>缓存 / ETag / 429 / CORS 与其它端点走**同一条通路**：同一个 {@code ok(...)}、
+     * 同一个别名口径（{@code max-age=45, stale-while-revalidate=90} + 按数据内容算的稳定 ETag）。
+     */
+    @GetMapping({"/home", "/home.js"})
+    public ResponseEntity<Map<String, Object>> home(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(homeCache.get(cacheSeconds, this::buildHome), res);
+    }
+
+    /**
+     * 组装聚合块：三个子块各走自己的快照缓存（各自 TTL / 各自后台预聚合 / 各自失败兜底），
+     * 并各自 {@link #ship(Map)} 一次 —— 这一步是"逐字段一致"的关键：
+     * 单端点的 {@code ok(...)} 会给 data 补 {@code ipDisclosure}，所以子块也必须补，
+     * 否则聚合里的子块会少一个字段（而少字段不会报错，只会让前端的一个字段永远读不到）。
+     */
+    private Map<String, Object> buildHome() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("alerts", ship(alertsCache.get(cacheSeconds, this::buildAlerts)));
+        out.put("geo", ship(geoCache.get(cacheSeconds, this::buildGeo)));
+        out.put("honeypot", ship(honeypotCache.get(cacheSeconds, this::buildHoneypot)));
+        return out;
+    }
+
+    // ==================== ①b 给 C2 面板线的两个只读端点 ====================
+
+    /**
+     * <b>部署可追溯</b>（C2 面板要的）：当前构建 + 容器启动时刻 + 可选的"发布信息"文件。
+     *
+     * <h3>为什么这些字段可信度分级写</h3>
+     * {@code build.*} 来自容器环境变量与 {@code git.properties}（**自述**，health 端点已有同样口径：
+     * 实测出现过"版本号是新的、容器里跑的是旧代码"，所以自述必须与证据分开写）；
+     * 而 {@code release.*}（发布号/文件数/切换时刻）**在另一台机器上**（srv2 的 releases 目录），
+     * 本进程读不到 ⇒ 只有在运维链把一份 JSON 落到 {@code app.public-api.deploy-file}
+     * 指向的路径时才给值，否则如实 {@code available=false} + 原因，**绝不编造发布号与文件数**。
+     */
+    @GetMapping({"/deploy", "/deploy.js"})
+    public ResponseEntity<Map<String, Object>> deploy(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(deployCache.get(cacheSeconds, this::buildDeploy), res);
+    }
+
+    private Map<String, Object> buildDeploy() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("generatedAt", generatedAt());
+
+        Map<String, Object> build = new LinkedHashMap<>();
+        build.put("sha", buildSha);
+        build.put("sourceSha", buildSourceSha);
+        build.put("artifactMd5", buildArtifactMd5);
+        build.put("buildTime", buildTime);
+        build.put("selfReported", true);   // 明确标注：这几个值是"容器自述"，不是独立证据
+        out.put("build", build);
+
+        Map<String, Object> runtime = new LinkedHashMap<>();
+        runtime.put("startedAt", Instant.ofEpochMilli(STARTED_AT_MS)
+                .atZone(ZoneId.systemDefault()).truncatedTo(ChronoUnit.SECONDS)
+                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+        runtime.put("uptimeSeconds", Math.max(0, (System.currentTimeMillis() - STARTED_AT_MS) / 1000));
+        out.put("runtime", runtime);
+
+        out.put("release", readDeployFile());
+        out.put("available", true);   // 构建信息恒可得；release 的可得性由 release.available 单列
+        out.put("note", "build.* 是容器自述（与 /api/health 同源）；release.* 来自 app.public-api.deploy-file，"
+                + "取不到就写 available=false —— 不用 0 或猜测值冒充发布信息。");
+        return out;
+    }
+
+    /** 发布信息文件（可选）：只透传白名单键，未配置/缺失/坏 JSON 一律如实说不可得 */
+    private Map<String, Object> readDeployFile() {
+        Map<String, Object> rel = new LinkedHashMap<>();
+        if (deployFile == null || deployFile.isBlank()) {
+            rel.put("available", false);
+            rel.put("reason", "RELEASE_INFO_NOT_CONFIGURED");
+            rel.put("note", "未配置 app.public-api.deploy-file（发布号在 srv2 的 releases 目录，本进程读不到）");
+            return rel;
+        }
+        Object parsed = readJsonOrNull(deployFile);
+        if (parsed == null) {
+            rel.put("available", false);
+            rel.put("reason", "RELEASE_INFO_UNREADABLE");
+            rel.put("note", "发布信息文件不存在或不是合法 JSON：" + deployFile + "（不用旧值冒充新发布）");
+            return rel;
+        }
+        if (!(parsed instanceof Map<?, ?> m)) {
+            rel.put("available", false);
+            rel.put("reason", "RELEASE_INFO_SHAPE");
+            rel.put("note", "发布信息文件顶层必须是 JSON 对象");
+            return rel;
+        }
+        rel.put("available", true);
+        for (String k : DEPLOY_FILE_KEYS) {
+            if (m.containsKey(k)) {
+                rel.put(k, m.get(k));
+            }
+        }
+        rel.put("source", "app.public-api.deploy-file");
+        return rel;
+    }
+
+    /**
+     * <b>AI 质量真值</b>（C2 面板要的）：评测脚本产出的那份报告。
+     *
+     * <p>这些数字（要点命中 / 拒答 / 严格 / 引用 / 口癖命中率 + 样本量）是**评测跑出来的**，
+     * 不是本服务能算的：它们由 {@code scripts/eval/} 那批离线脚本产出。所以本端点的口径是
+     * "<b>把那份报告如实端出来</b>"——文件在就给值，不在就 {@code available=false} + 原因，
+     * 绝不用 0 冒充"没测过"、也不用旧报告冒充新报告（旧报告由报告里的 {@code generatedAt} 自证）。
+     */
+    @GetMapping({"/eval", "/eval.js"})
+    public ResponseEntity<Map<String, Object>> evalReport(HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        return ok(evalCache.get(cacheSeconds, this::buildEval), res);
+    }
+
+    private Map<String, Object> buildEval() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (evalReportFile == null || evalReportFile.isBlank()) {
+            out.put("available", false);
+            out.put("reason", "EVAL_REPORT_NOT_CONFIGURED");
+            out.put("note", "未配置 app.public-api.eval-report-file：本服务不自己算评测数字，"
+                    + "也不以内置样本或 0 值顶替（0 会被误读成'测过但全错'）。");
+            return out;
+        }
+        Object parsed = readJsonOrNull(evalReportFile);
+        if (parsed == null) {
+            out.put("available", false);
+            out.put("reason", "EVAL_REPORT_UNREADABLE");
+            out.put("note", "评测报告文件不存在或不是合法 JSON：" + evalReportFile);
+            return out;
+        }
+        if (!(parsed instanceof Map<?, ?> m)) {
+            out.put("available", false);
+            out.put("reason", "EVAL_REPORT_SHAPE");
+            out.put("note", "评测报告顶层必须是 JSON 对象");
+            return out;
+        }
+        out.put("available", true);
+        for (String k : EVAL_REPORT_KEYS) {
+            if (m.containsKey(k)) {
+                out.put(k, m.get(k));
+            }
+        }
+        out.put("source", evalReportFile);
+        out.put("note", "数字来自离线评测报告原文（未重算、未四舍五入、未合并）；"
+                + "唯一改动是把白名单字段挑出来。报告自身的 generatedAt 决定它有多新。");
+        return out;
+    }
+
+    /**
+     * 读一个小 JSON 文件（只读、限长、任何异常一律返回 null）。
+     *
+     * <p>为什么限长：这是公开端点的数据源，若被误指向一个巨大文件，会把一次 HTTP 请求
+     * 变成一次全文件读取。超过上限就当"读不到"（而不是截断后当合法 JSON —— 那会发出半个真相）。
+     */
+    private Object readJsonOrNull(String path) {
+        try {
+            java.io.File f = new java.io.File(path);
+            if (!f.isFile() || !f.canRead()) {
+                return null;
+            }
+            if (f.length() > JSON_FILE_MAX_BYTES) {
+                logger.warn("公开端点 JSON 文件超过上限（{} > {}）：按读不到处理", f.length(), JSON_FILE_MAX_BYTES);
+                return null;
+            }
+            return new ObjectMapper().readValue(f, Map.class);
+        } catch (Exception e) {
+            logger.warn("公开端点读取 JSON 失败（{}）：{}", path, e.getMessage());
+            return null;
+        }
     }
 
     /** 处置审计（只读）：封禁记录 + 审计流水，IP 按开关口径显示，不含原始 detail。 */
