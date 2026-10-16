@@ -56,6 +56,21 @@ public class PublicCorsInterceptor implements HandlerInterceptor {
                     + "X-RateLimit-Remaining, X-Public-Concurrency";
     private static final String MAX_AGE = "3600";
 
+    /**
+     * 缓存别名路径的后缀（Cloudflare 默认按扩展名决定是否缓存，{@code /api/public/alerts}
+     * 这种无扩展名路径**必然** {@code DYNAMIC}、每次回源；实测本 zone：{@code .js}/{@code .txt}
+     * 命中默认缓存列表，{@code .json}/{@code .xml} 不命中）。
+     *
+     * <p>别名是<b>纯增量路由</b>：同一个控制器方法、同一份 payload、同一套口径；旧路径一字不变。
+     */
+    static final String CACHE_ALIAS_SUFFIX = ".js";
+
+    /**
+     * 别名路径额外放行的响应头：{@code Age}（真实年龄 = 体内 {@code cacheAgeSeconds} + 本头）。
+     * {@code Access-Control-Expose-Headers} 必须显式列出，否则跨域下 JS 读不到。
+     */
+    private static final String ALIAS_EXPOSE_HEADERS = EXPOSE_HEADERS + ", Age";
+
     /** 允许的跨域来源（逗号分隔）。默认只有博客域名与本机预览端口，<b>不含通配符</b>。 */
     @Value("${app.public-api.allowed-origins:https://xiaokeqing.cn,https://www.xiaokeqing.cn,http://localhost:1313,http://127.0.0.1:1313}")
     private String allowedOriginsConfig;
@@ -63,6 +78,15 @@ public class PublicCorsInterceptor implements HandlerInterceptor {
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler)
             throws Exception {
+        // ① 每个公开请求开始时重置"快照时刻"记录（线程池复用，必须清）
+        PublicSnapshotClock.clear();
+        PublicSnapshotClock.mark(System.currentTimeMillis());
+
+        // ② 缓存别名路径：另一套 CORS 口径（详见下方注释），与白名单口径互不干扰
+        if (isCacheAlias(request)) {
+            return handleCacheAlias(request, response);
+        }
+
         String origin = request.getHeader(HttpHeaders.ORIGIN);
         boolean allowed = isAllowed(origin);
 
@@ -93,6 +117,47 @@ public class PublicCorsInterceptor implements HandlerInterceptor {
 
         if (allowed) {
             response.setHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, EXPOSE_HEADERS);
+        }
+        return true;
+    }
+
+    /** 本请求是否走缓存别名路径（URI 以 {@link #CACHE_ALIAS_SUFFIX} 结尾） */
+    static boolean isCacheAlias(HttpServletRequest request) {
+        String uri = request.getRequestURI();
+        return uri != null && uri.endsWith(CACHE_ALIAS_SUFFIX);
+    }
+
+    /**
+     * 缓存别名路径的 CORS 处置 —— <b>为什么不回显来源、也不下 {@code Vary: Origin}</b>：
+     *
+     * <ol>
+     *   <li><b>为什么可以用 {@code *}</b>：实测（2026-10-16）同一端点在
+     *       {@code https://xiaokeqing.cn} / {@code https://www.xiaokeqing.cn} /
+     *       {@code https://example.com} / 无 Origin 四种情形下，响应体<b>逐字节一致</b>
+     *       （把秒级 {@code generatedAt} 这类时间字段剔除后比对）—— 载荷里没有任何随来源变化的东西，
+     *       所以"给所有人同一个响应"不会串味。</li>
+     *   <li><b>为什么必须去掉 {@code Vary: Origin}</b>：带 `Vary` 的响应在边缘缓存上的命中率会打折
+     *       （而这个端点的全部意义就是让 Cloudflare 能缓存它 —— 实测本 zone 的 {@code /api/public/*}
+     *       因无扩展名而 100% {@code DYNAMIC}）。用 {@code *} 就不需要按来源分桶。</li>
+     *   <li><b>代价（写在这里，别被忘掉）</b>：白名单原本的作用是"别让别的网站借访客浏览器
+     *       读我们的数据并展示成自己的"；别名路径放弃这层浏览器侧限制（数据本来也是公开只读的，
+     *       服务端 {@code curl} 一直能读）。<b>旧路径仍然严格按白名单回显</b> —— 折中是有意的。</li>
+     *   <li><b>安全头</b>：别名故意用 {@code .js} 扩展名换取可缓存性，因此必须显式
+     *       {@code X-Content-Type-Options: nosniff}，防止"扩展名是 .js 于是被当脚本执行"
+     *       的误判路径（Content-Type 仍是 {@code application/json}，见 controller 的返回类型）。</li>
+     * </ol>
+     */
+    private boolean handleCacheAlias(HttpServletRequest request, HttpServletResponse response) {
+        response.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, "*");
+        response.setHeader("X-Content-Type-Options", "nosniff");
+        response.setHeader(HttpHeaders.ACCESS_CONTROL_EXPOSE_HEADERS, ALIAS_EXPOSE_HEADERS);
+
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+            response.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_METHODS, ALLOW_METHODS);
+            response.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS);
+            response.setHeader(HttpHeaders.ACCESS_CONTROL_MAX_AGE, MAX_AGE);
+            response.setStatus(HttpStatus.NO_CONTENT.value());
+            return false;
         }
         return true;
     }

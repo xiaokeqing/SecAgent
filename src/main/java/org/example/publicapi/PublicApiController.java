@@ -23,9 +23,16 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import org.springframework.web.context.request.RequestAttributes;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -355,7 +362,7 @@ public class PublicApiController {
      * 不返回原始内部路径与文件名；内部文档即使被语义命中也不会出现在这里
      * （口径见 {@link org.example.knowledge.PublicKbVisibility}）。
      */
-    @GetMapping("/kb")
+    @GetMapping({"/kb", "/kb.js"})
     public ResponseEntity<Map<String, Object>> kb(@RequestParam(value = "q", required = false) String q,
                                                   HttpServletRequest req,
                                                   HttpServletResponse res) {
@@ -519,7 +526,7 @@ public class PublicApiController {
     // ==================== 端点 ====================
 
     /** 首页状态条用：两台服务器在线状态 + 告警概览。载荷刻意做小。 */
-    @GetMapping("/overview")
+    @GetMapping({"/overview", "/overview.js"})
     public ResponseEntity<Map<String, Object>> overview(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -529,7 +536,7 @@ public class PublicApiController {
     }
 
     /** 告警看板用：聚合后的实时告警流 + 分布 + 24 小时趋势，一次请求拿全。 */
-    @GetMapping("/alerts")
+    @GetMapping({"/alerts", "/alerts.js"})
     public ResponseEntity<Map<String, Object>> alerts(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -593,7 +600,7 @@ public class PublicApiController {
      * <p>来源 IP 按 {@code app.public.mask-ips} 口径显示（默认真实地址，内网/保留写「内网/未知」）；
      * 口令在任何口径下都只给长度/字符类/弱口令标记，永不给出原文。
      */
-    @GetMapping("/honeypot")
+    @GetMapping({"/honeypot", "/honeypot.js"})
     public ResponseEntity<Map<String, Object>> honeypot(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -602,7 +609,7 @@ public class PublicApiController {
     }
 
     /** 处置审计（只读）：封禁记录 + 审计流水，IP 按开关口径显示，不含原始 detail。 */
-    @GetMapping("/audit")
+    @GetMapping({"/audit", "/audit.js"})
     public ResponseEntity<Map<String, Object>> audit(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -634,7 +641,7 @@ public class PublicApiController {
      * <p>无数据时如实返回 {@code available=false} + 可读原因（machine-readable 的 {@code reason}
      * 与人读的 {@code note} 成对给出），绝不用 0 冒充"这段时间太平"。
      */
-    @GetMapping("/latest")
+    @GetMapping({"/latest", "/latest.js"})
     public ResponseEntity<Map<String, Object>> latest(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -712,7 +719,7 @@ public class PublicApiController {
      * 所以 {@code note} 与 {@code geoAttribution} 两处都带
      * {@link org.example.geoip.GeoIpService#ATTRIBUTION}。
      */
-    @GetMapping("/geo")
+    @GetMapping({"/geo", "/geo.js"})
     public ResponseEntity<Map<String, Object>> geo(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -853,7 +860,7 @@ public class PublicApiController {
      * 同一个 15 秒 {@link Snapshot}（按 window 分开存）、同一个 {@code ok(...)}
      * （因此自动带 {@code ipDisclosure} 与内部资产名过滤），不新增任何公开面机制。
      */
-    @GetMapping("/stories")
+    @GetMapping({"/stories", "/stories.js"})
     public ResponseEntity<Map<String, Object>> stories(
             @RequestParam(value = "window", required = false) String window,
             @RequestParam(value = "limit", required = false) String limit,
@@ -891,7 +898,7 @@ public class PublicApiController {
      * 索引查询本身就是字段白名单（{@code data.password} / {@code data.message} / {@code full_log}
      * 根本不进入进程）。蜜罐命令时间线没有数据源 → {@code commandsAvailable=false}（不编）。
      */
-    @GetMapping("/story")
+    @GetMapping({"/story", "/story.js"})
     public ResponseEntity<Map<String, Object>> story(
             @RequestParam(value = "src", required = false) String src,
             @RequestParam(value = "window", required = false) String window,
@@ -1018,7 +1025,7 @@ public class PublicApiController {
      * （启动回填还没读完）、{@code WINDOW_EMPTY}（日志可读但 24h 内确实没有请求）——
      * <b>绝不用"空分布"冒充"这段时间太平"</b>。
      */
-    @GetMapping("/webstats")
+    @GetMapping({"/webstats", "/webstats.js"})
     public ResponseEntity<Map<String, Object>> webstats(HttpServletRequest req, HttpServletResponse res) {
         if (!rateLimiter.allow(clientIp(req))) {
             return tooMany(res);
@@ -1819,7 +1826,62 @@ public class PublicApiController {
         body.put("message", "success");
         // 所有公开 GET 端点的共同出口：资产名过滤 + 统一 ipDisclosure（口径只有一个来源）
         body.put("data", ship(data));
+        // 【缓存别名专属】旧路径（无 .js 后缀）不写这三个字段 ⇒ 响应体逐字节不变。
+        if (isCacheAliasRequest()) {
+            stampSnapshotFreshness(body);
+        }
         return ResponseEntity.ok(body);
+    }
+
+    /**
+     * 缓存别名请求的判定：URI 以 {@link PublicCorsInterceptor#CACHE_ALIAS_SUFFIX} 结尾。
+     *
+     * <p>为什么用 URI 而不是参数/Header：别名是<b>纯 URL 形状</b>的约定（Cloudflare 按扩展名
+     * 决定是否缓存），任何请求头/查询参数都不能改变它 —— 也让"客户端加了 {@code ?cb=} 反而
+     * 命中不到边缘缓存"这件事变得可解释（契约里明文禁止 cache-buster）。
+     */
+    private static boolean isCacheAliasRequest() {
+        RequestAttributes attrs = RequestContextHolder.getRequestAttributes();
+        if (!(attrs instanceof ServletRequestAttributes sra)) {
+            return false;
+        }
+        String uri = sra.getRequest().getRequestURI();
+        return uri != null && uri.endsWith(PublicCorsInterceptor.CACHE_ALIAS_SUFFIX);
+    }
+
+    /**
+     * 给别名响应体盖上"数据真实生成时刻"的戳（站主红线 D4：被缓存不等于可以假装更新）。
+     *
+     * <ul>
+     *   <li>{@code snapshotAt} —— 本响应体内数据的真实生成时刻（ISO-8601 带时区）。页面显示
+     *       "刚刚同步"必须用它，<b>不许</b>用接收响应的时刻；</li>
+     *   <li>{@code cacheAgeSeconds} —— 生成本响应体时，这份数据已经有多旧（走快照的端点在快照
+     *       命中时大于 0）；</li>
+     *   <li>{@code snapshotTtlSeconds} —— 应用内快照 TTL，同时也是 {@code Cache-Control: max-age}
+     *       的值（两者同一个来源 {@code app.public-api.cache-seconds}）。</li>
+     * </ul>
+     *
+     * <p><b>真实年龄 = {@code cacheAgeSeconds} + 响应头 {@code Age}</b>：前者是"源站生成时它多旧"，
+     * 后者是"边缘/中间缓存又放了多久"。{@code Age} 不是 CORS 安全响应头，所以别名路径在
+     * {@code Access-Control-Expose-Headers} 里显式放行了它（见 {@link PublicCorsInterceptor}）。
+     *
+     * <p>{@code freshnessNote} 是给前端与未来的接手者读的<b>口径说明</b>（一句话，不参与判断）。
+     */
+    private void stampSnapshotFreshness(Map<String, Object> body) {
+        Long marked = PublicSnapshotClock.peek();
+        PublicSnapshotClock.clear();
+        long now = System.currentTimeMillis();
+        long generatedAt = marked == null ? now : marked;
+        body.put("snapshotAt", Instant.ofEpochMilli(generatedAt)
+                .atZone(ZoneId.systemDefault())
+                .truncatedTo(ChronoUnit.SECONDS)
+                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+        body.put("cacheAgeSeconds", Math.max(0, (now - generatedAt) / 1000));
+        body.put("snapshotTtlSeconds", Math.max(0, cacheSeconds));
+        body.put("freshnessNote",
+                "snapshotAt=本响应体内数据的真实生成时刻（页面按它显示同步时间）；"
+                        + "cacheAgeSeconds=生成时它已有多旧；真实年龄=cacheAgeSeconds+响应头Age；"
+                        + "禁止给本地址加 ?cb= 之类 cache-buster（会绕过边缘缓存）");
     }
 
     private ResponseEntity<Map<String, Object>> tooMany(HttpServletResponse res) {
@@ -1880,19 +1942,27 @@ public class PublicApiController {
         private volatile Map<String, Object> value;
         private volatile long expiresAt;
 
+        /** 上一次真正去加载（或首次加载）的时刻：别名响应体的 {@code snapshotAt} 用它 */
+        private volatile long loadedAtMs;
+
         Map<String, Object> get(int ttlSeconds, Supplier<Map<String, Object>> loader) {
             Map<String, Object> cur = value;
             if (cur != null && System.currentTimeMillis() < expiresAt) {
+                PublicSnapshotClock.mark(loadedAtMs);
                 return cur;
             }
             synchronized (this) {
                 if (value != null && System.currentTimeMillis() < expiresAt) {
+                    PublicSnapshotClock.mark(loadedAtMs);
                     return value;
                 }
                 try {
                     Map<String, Object> fresh = loader.get();
+                    long now = System.currentTimeMillis();
                     value = fresh;
-                    expiresAt = System.currentTimeMillis() + Math.max(0, ttlSeconds) * 1000L;
+                    expiresAt = now + Math.max(0, ttlSeconds) * 1000L;
+                    loadedAtMs = now;
+                    PublicSnapshotClock.mark(now);
                     return fresh;
                 } catch (Exception e) {
                     // 刷新失败：有旧快照就继续用旧的（页面标注同步时间），
@@ -1900,6 +1970,7 @@ public class PublicApiController {
                     logger.warn("公网快照刷新失败：{}", e.getMessage());
                     if (value != null) {
                         expiresAt = System.currentTimeMillis() + 5000L;
+                        PublicSnapshotClock.mark(loadedAtMs);
                         return value;
                     }
                     throw new IllegalStateException("公网快照刷新失败且无可用旧快照", e);

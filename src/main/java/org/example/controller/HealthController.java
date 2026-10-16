@@ -57,12 +57,6 @@ public class HealthController {
     @Autowired
     private VectorStoreGateway vectorStore;
 
-    @Value("${cls.mock-enabled:false}")
-    private boolean clsMock;
-
-    @Value("${prometheus.mock-enabled:false}")
-    private boolean prometheusMock;
-
     /** 构建镜像时的 commit 短号（由 compose 通过 BUILD_SHA 注入）—— 自述，非证据 */
     @Value("${app.build.sha:unknown}")
     private String buildSha;
@@ -115,9 +109,6 @@ public class HealthController {
 
         // buildSha 保留，但【降级为展示用】：它是环境变量自述，谁都能写，证明不了任何事
         result.put("buildSha", buildSha);
-        result.put("buildShaNote",
-                "环境变量自述（BUILD_SHA），仅展示/对照用，非证据 —— 不参与指纹核对；"
-                        + "真正的证据是 jar 内固化的 embeddedGitCommit");
         result.put("expectedReleaseCommit", buildSha);
         result.put("buildTime", buildTime);
 
@@ -143,13 +134,18 @@ public class HealthController {
         // 双指纹（P0-4）：不再只靠 buildSha 自述，能看出"跑的是哪个产物、哪份源码"
         result.put("sourceSha", sourceSha);
         result.put("artifactMd5", artifactMd5);
-        result.put("fingerprint",
-                "embeddedGitCommit=jar 内固化的 commit(硬证据)｜artifactMd5=镜像内 jar MD5(硬证据)"
-                        + "｜buildSha=env 自述(非证据)｜sourceSha=服务器源码树");
+        // 【U5 收口第 2 段，2026-10-16】原本这里还有两项，均已从**匿名**端点移除：
+        //   · "fingerprint"      = 一段解释"哪个字段是硬证据"的长文案（内部运行手册口径）；
+        //   · "logsMockEnabled" / "alertsMockEnabled" = `${cls,prometheus}.mock-enabled`，
+        //     它们是**AI 工具层的能力开关**（QueryMetricsTools/QueryLogsTools 为 true 时返回模拟
+        //     数据、OutboundSelfCheck 为 true 时不发出站请求），跟"公开监控页的数据真假"无关
+        //     （公开页读的是 Wazuh 真实链路，响应头 X-Data-Source=WAZUH_REAL）。
+        //   但字段名会被任何看到 health 的人读成"线上在混 mock 数据" —— 这正是要收口的原因：
+        //   想核这两项的人请看容器启动日志（QueryMetricsTools/QueryLogsTools 的 "Mock模式: …" 行）。
+        //   为什么不加"带令牌才返回"的隐藏分支：health 是匿名端点且**没有任何限速**，
+        //   那样等于给令牌校验开了一个不限速的爆破口 —— 收口不能以扩大攻击面为代价。
         result.put("vectorStore", vectorStore.backend());
         result.put("documentVectors", vectorStore.count());
-        result.put("logsMockEnabled", clsMock);
-        result.put("alertsMockEnabled", prometheusMock);
         result.put("uptimeMs", ManagementFactory.getRuntimeMXBean().getUptime());
         return result;
     }

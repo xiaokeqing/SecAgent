@@ -66,8 +66,6 @@ class HealthControllerTest {
         ReflectionTestUtils.setField(c, "sourceSha", "unknown");
         ReflectionTestUtils.setField(c, "artifactMd5", "ac7e643e5ce56e5d1e19fc3f3fc3fec3");
         ReflectionTestUtils.setField(c, "buildTime", "unknown");
-        ReflectionTestUtils.setField(c, "clsMock", true);
-        ReflectionTestUtils.setField(c, "prometheusMock", true);
         return c.health();
     }
 
@@ -77,6 +75,19 @@ class HealthControllerTest {
         Map<String, Object> h = healthBody();
         assertFalse(h.containsKey("embeddedGitCommitMessage"),
                 "提交标题属于内部工程叙事，不得出现在匿名端点上：" + h);
+    }
+
+    @Test
+    @DisplayName("U5 第2段：匿名端点不再返回 mock 开关与内部口径长文案（字段名的误读面）")
+    void doesNotLeakMockSwitchesNorInternalNotes() {
+        Map<String, Object> h = healthBody();
+        // 这两个是 AI 工具层的能力开关，字段名会被读成"线上在混 mock 数据" ⇒ 已移出匿名端点。
+        // 想核这两项请看容器启动日志里的 "Mock模式: …" 行（QueryMetricsTools/QueryLogsTools）。
+        assertFalse(h.containsKey("alertsMockEnabled"), "mock 开关不得出现在匿名端点上：" + h.keySet());
+        assertFalse(h.containsKey("logsMockEnabled"), "mock 开关不得出现在匿名端点上：" + h.keySet());
+        // 内部口径长文案（解释哪个字段是硬证据）属于运行手册内容，同样不出现。
+        assertFalse(h.containsKey("buildShaNote"), "构建自述长文案不得出现在匿名端点上：" + h.keySet());
+        assertFalse(h.containsKey("fingerprint"), "内部指纹口径长文案不得出现在匿名端点上：" + h.keySet());
     }
 
     @Test
