@@ -83,7 +83,7 @@ class PublicSnapshotWarmerTest {
 
     @Test
     @DisplayName("预聚合：没到年龄阈值不刷，到了就刷（且会推进快照时刻）")
-    void refreshIfOlderThanRespectsThreshold() {
+    void refreshIfOlderThanRespectsThreshold() throws Exception {
         PublicApiController.Snapshot s = snapshot();
         AtomicInteger loads = new AtomicInteger();
         s.get(45, () -> Map.of("n", loads.incrementAndGet()));
@@ -92,6 +92,16 @@ class PublicSnapshotWarmerTest {
         assertFalse(s.refreshIfOlderThan(60_000L, 45, () -> Map.of("n", loads.incrementAndGet())),
                 "年龄没到阈值就不该刷新（否则白打上游、频率比原来还高）");
         assertEquals(1, loads.get());
+
+        /* ★2026-10-16 修【CI 偶发失败的真根因，不是 runner 抖动】：
+           下面这行原本是 `refreshIfOlderThan(0L, ...)`，而实现是
+           `if (cur != null && (System.currentTimeMillis() - loadedAtMs) <= maxAgeMillis) return false;`
+           ⇒ 只要"装载"和"这次判断"落在**同一毫秒**，`0 <= 0` 成立 ⇒ 返回 false ⇒ 断言失败。
+           机器越快、JIT 越热，越容易踩中；这就是 CI 上"约 60 秒内失败、重跑即过"的成因
+           （重跑改变时序 ⇒ 有时同毫秒、有时不同）。
+           修法：显式等过 1 个毫秒刻度，让"年龄 > 0"成为**事实**而不是**巧合**。
+           （不改实现：`<= maxAge` 的语义是对的 —— "刚装载完就不该刷"是刻意行为。） */
+        Thread.sleep(5L);
 
         assertTrue(s.refreshIfOlderThan(0L, 45, () -> Map.of("n", loads.incrementAndGet())),
                 "年龄超过阈值必须刷新");
