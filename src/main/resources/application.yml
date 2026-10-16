@@ -444,6 +444,47 @@ app:
     # ★ 开发期临时放大到 300（见 RUNBOOK「开发期额度覆盖 / 发布前回收清单」）。
     public-daily-limit: ${APP_QUOTA_PUBLIC_DAILY_LIMIT:30}
     public-store-file: data/model-quota-public.json
+    # ===== 自用池软上限（X-User-Token 命中的登录自用面，2026-10-16）=====
+    # 【它是"软"的】达到这个数字【继续服务】，只做两件事：响应体标注 + 每天一条 WARN。
+    #   理由：站主原话「自用额度不设硬上限（或软上限如 500/日，到点提醒不硬停）」。
+    #   硬停只会把站主自己挡在门外，而它并不防第三方（第三方根本没有令牌）。
+    # 【它仍然单独一本账】公开面被刷爆不该吃掉站主自用的账，反之亦然 —— 与另外三本同一纪律。
+    # ⚠️ 与 APP_QUOTA_*/APP_WEBSTATS_* 同一个坑：docker-compose.yml 的 environment 段必须显式透传
+    #    下面两个键，否则"在 .env 里加一行"不生效且不报错。
+    self-daily-soft-limit: ${APP_QUOTA_SELF_SOFT_LIMIT:500}
+    self-store-file: ${APP_QUOTA_SELF_STORE_FILE:data/model-quota-self.json}
+
+  # ===== 自用登录面（后端令牌方案；站主 2026-10-16 拍板：不做 Cloudflare Access）=====
+  # 【它是什么】站主手动把令牌粘进浏览器 localStorage，请求头带 X-User-Token；
+  #   服务器只存 sha256（APP_USER_TOKEN_SHA256），明文绝不入库、绝不落日志。
+  # 【怎么开】在 srv1 的 .env 里写 APP_USER_TOKEN_SHA256=<64 位十六进制> → --force 重建容器。
+  #   **默认空 = 登录面整体关闭**（/api/user/** 一律 401 USER_LOGIN_DISABLED）—— fail-closed。
+  # 【怎么关/回滚】把那行清空再 --force：语义级回滚，不用换镜像、不用改代码。
+  # 【代码位置】org.example.selfapi（与公开面 org.example.publicapi **完全隔离**，
+  #   由两条对称的隔离测试在构建期强制）。
+  # ⚠️ 与 APP_QUOTA_*/APP_WEBSTATS_* 同一个坑：docker-compose.yml 的 environment 段必须显式透传
+  #    下面这些键，否则"在 .env 里加一行"不生效且不报错。
+  # ⚠️ 这几个键【不要留空字符串】给 int 键（空串绑 int 会让应用直接启动失败）；
+  #    token-sha256 例外（空串正是"登录面关闭"的语义）。
+  user:
+    enabled: ${APP_USER_ENABLED:true}                       # 面级总开关；真正的开关是下面那个哈希
+    token-sha256: ${APP_USER_TOKEN_SHA256:}                 # 令牌 sha256（64 位小写十六进制）；空 = 关闭
+    max-body-chars: ${APP_USER_MAX_BODY_CHARS:4000}         # 入口字符上限（站主口径 4000）
+    deadline-ms: ${APP_USER_DEADLINE_MS:60000}              # 单次提问总预算（站主口径 60 s）
+    # 自用池输出上限口径 4000。目前模型出口读【全局】 app.llm.max-tokens（2000）；
+    # 要让 4000 真正生效需在 provider 请求构造处按身份取值（见设计文档 §4.2 与
+    # SelfPoolPolicy 的 TODO(SELF-MAX-TOKENS)）。本批不改 provider，也不放宽全局键 ✗
+    max-tokens: ${APP_USER_MAX_TOKENS:4000}
+    audit-file: ${APP_USER_AUDIT_FILE:data/user-token-audit.jsonl}   # 审计（JSONL 追加写；永不记令牌）
+    login:
+      requests-per-minute: ${APP_USER_LOGIN_PER_MINUTE:10}  # 登录面每 IP 每分钟（status+ask 共用一个桶）
+      fail-threshold: ${APP_USER_FAIL_THRESHOLD:10}         # 触发短时封禁的失败次数
+      fail-window-seconds: ${APP_USER_FAIL_WINDOW_SEC:600}  # 失败计数窗口（秒）
+      ban-seconds: ${APP_USER_BAN_SEC:600}                  # 封禁时长（秒）
+    conversation:
+      max-rounds: ${APP_USER_CONV_MAX_ROUNDS:5}             # 3~5 轮窗口（越界值夹回 3~5）
+      ttl-minutes: ${APP_USER_CONV_TTL_MINUTES:30}           # 会话过期（分钟）
+      max-conversations: ${APP_USER_CONV_MAX:200}            # 同时跟踪的会话上限（超限按最久未访问淘汰）
 
   # ===== 评测身份（独立凭据 + 流量打标 + RESPONDER 模拟）=====
   # token 从环境变量注入；【未配置则该功能完全关闭】，行为与改造前一致。

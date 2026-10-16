@@ -95,15 +95,22 @@ public class OrchestrationService {
         final long budget = deadlineMs > 0 ? deadlineMs : defaultDeadlineMs;
 
         // 身份标注必须在【提交任务之前】读取：提交后当前线程可能已经离开请求作用域。
-        // public 与 eval 互斥（EvalIdentity 里强制），因此这里按优先级取一个即可，
-        // 但两个都要读出来 —— 只读一个会让另一个身份静默降级成"用户额度"。
+        // public 与 eval 互斥（EvalIdentity 里强制），自用（X-User-Token）是第三个标注
+        // （SelfIdentity，与那两个也是互斥的：一次请求只可能属于一条面）。
+        // 三个都要读出来 —— 只读其中两个会让第三个身份静默降级成"普通用户额度"。
         final boolean evalRequest = org.example.security.EvalIdentity.isEvalRequest();
         final boolean publicRequest = org.example.security.EvalIdentity.isPublicRequest();
+        final boolean selfRequest = org.example.selfapi.SelfIdentity.isSelfRequest();
         final String runId = org.example.security.EvalIdentity.currentRunId();
 
         Future<MultiAgentResult> future = ORCHESTRATOR_POOL.submit(() -> {
             // 线程池会复用线程，而 InheritableThreadLocal 只在【线程创建时】继承：
             // 不在这里显式重设，池线程就可能带着上一次请求的身份跑这一次的编排。
+            if (selfRequest) {
+                org.example.selfapi.SelfIdentity.markSelfRequest();
+            } else {
+                org.example.selfapi.SelfIdentity.markNonSelfRequest();
+            }
             if (publicRequest) {
                 org.example.security.EvalIdentity.markPublicRequest();
             } else if (evalRequest) {
@@ -116,6 +123,7 @@ public class OrchestrationService {
             } finally {
                 // 两层清理之一：池线程这一侧
                 org.example.security.EvalIdentity.endEvalRequest();
+                org.example.selfapi.SelfIdentity.end();
             }
         });
 

@@ -27,6 +27,19 @@ public class WebMvcConfig implements WebMvcConfigurer {
     private org.example.security.RbacInterceptor rbacInterceptor;
 
     /**
+     * 自用面（{@code /api/user/**}）的鉴权拦截器。
+     *
+     * <p><b>顺序很关键</b>：它必须排在 {@code apiTokenInterceptor} <b>之前</b>。
+     * 原因是 {@code /api/user/**} 只认 {@code X-User-Token}（自用令牌），
+     * 而 {@code apiTokenInterceptor} 不认这个头、也没把该前缀列进白名单 ——
+     * 排在后面前者已经先判定了，就不会出现"自用请求被系统 Token 规则拒掉"的错配。
+     * 两个拦截器各自只认自己的面：{@code /api/user/**} 由本拦截器<b>独占</b>，
+     * 其余路径本拦截器直接放行（见 {@code SelfTokenInterceptor.isSelfPath}）。
+     */
+    @Autowired
+    private org.example.selfapi.SelfTokenInterceptor selfTokenInterceptor;
+
+    /**
      * 公网只读端点的 CORS 白名单拦截器。
      *
      * <p>为什么要把它和全局 CORS 分开：{@code /api/public/**} 是<b>匿名可达面</b>，
@@ -59,9 +72,13 @@ public class WebMvcConfig implements WebMvcConfigurer {
 
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
-        // 先限流、后鉴权、最后做角色权限控制；静态资源不经过 /api，不拦截
+        // 先限流、再鉴权（自用面优先于系统 Token 面）、最后做角色权限控制；静态资源不经过 /api，不拦截
         registry.addInterceptor(rateLimitInterceptor)
                 .addPathPatterns("/api/**", "/milvus/**");
+        // 自用面：/api/user/** 只认 X-User-Token。排在 apiTokenInterceptor 之前，
+        // 且只对 /api/user/** 生效（其余路径直接放行，见类注释）。
+        registry.addInterceptor(selfTokenInterceptor)
+                .addPathPatterns("/api/user/**");
         registry.addInterceptor(apiTokenInterceptor)
                 .addPathPatterns("/api/**", "/milvus/**");
         registry.addInterceptor(rbacInterceptor)

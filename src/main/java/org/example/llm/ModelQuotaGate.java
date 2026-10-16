@@ -37,6 +37,12 @@ public class ModelQuotaGate {
         if (EvalIdentity.isPublicRequest()) {
             return ModelQuotaService.Identity.PUBLIC;
         }
+        // 自用面（X-User-Token）：站主自己的账，软上限。
+        // 必须排在 USER 之前 —— 漏了它不会报错，只会把站主的自用调用记到普通用户额度上，
+        // 于是"站主某天突然没额度了"，而查起来毫无线索。
+        if (org.example.selfapi.SelfIdentity.isSelfRequest()) {
+            return ModelQuotaService.Identity.SELF;
+        }
         return ModelQuotaService.Identity.USER;
     }
 
@@ -45,6 +51,7 @@ public class ModelQuotaGate {
         return switch (identity == null ? ModelQuotaService.Identity.USER : identity) {
             case EVAL -> "评测";
             case PUBLIC -> "公开演示（匿名）";
+            case SELF -> "自用";
             case USER -> "";
         };
     }

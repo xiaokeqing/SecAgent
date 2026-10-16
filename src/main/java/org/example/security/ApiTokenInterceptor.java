@@ -68,6 +68,12 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
 
         String path = request.getRequestURI();
 
+        // 自用面（/api/user/**）由 SelfTokenInterceptor 独占负责：本拦截器不做任何判定，
+        // 也不把它当"匿名可访问"（见 isSelfPath 的注释）。
+        if (isSelfPath(path)) {
+            return true;
+        }
+
         // 0) 评测身份（app.eval.token）：必须在会话校验【之前】判定。
         //    如果放在之后，"评测 token 恰好等于某个会话 token"这种极端巧合会走成管理员，
         //    而这个身份的设计前提就是"权限比分析员更小"，不能被任何路径提升。
@@ -118,6 +124,23 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
 
         logger.warn("拒绝未授权访问: {} {}", request.getMethod(), path);
         return writeError(response, HttpStatus.UNAUTHORIZED, "未授权访问：缺少或错误的 API Token");
+    }
+
+    /**
+     * 是否属于<b>自用面</b>（{@code /api/user/**}）。
+     *
+     * <h3>为什么这里要显式让开，而不是把它写进白名单</h3>
+     * 白名单的语义是"<b>无需鉴权</b>即放行"。自用面恰恰相反——它需要鉴权，
+     * 只是用另一套凭据（{@code X-User-Token}）。把它列进白名单会让
+     * "这个路径为什么不需要鉴权"与"它其实由另一个拦截器鉴权"两件事混淆，
+     * 而后者一旦顺序被改动（{@code WebMvcConfig}）就没有第二道锁。
+     *
+     * <p>这里的让开是<b>协作声明</b>：{@code /api/user/**} 由
+     * {@link org.example.selfapi.SelfTokenInterceptor} 独占负责。两个拦截器都保留
+     * "只认自己的面"的结构，任一被单独改动都不会让自用面变成匿名可访问。
+     */
+    private static boolean isSelfPath(String path) {
+        return path != null && (path.equals("/api/user") || path.startsWith("/api/user/"));
     }
 
     /** 统一的失败响应（401 未授权 / 403 越权共用同一形状，避免两套错误体） */
