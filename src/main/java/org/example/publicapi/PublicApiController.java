@@ -17,6 +17,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -40,6 +41,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 
 /**
@@ -81,20 +83,27 @@ public class PublicApiController {
     @Autowired
     private PublicRateLimiter rateLimiter;
 
-    /** 应用内快照有效期；同时作为 Cache-Control 的 max-age 下发给浏览器/边缘 */
-    @Value("${app.public-api.cache-seconds:15}")
+    /** 应用内快照有效期；同时作为 Cache-Control 的 max-age 下发给浏览器/边缘（默认 45s，见 application.yml 注释） */
+    @Value("${app.public-api.cache-seconds:45}")
     private int cacheSeconds;
 
     /**
-     * 缓存别名路径（{@code .js}）的边缘 TTL。
+     * 定时预聚合的"年龄阈值比例"（对应下面 {@code warmPublicSnapshots}）。
      *
-     * <p>比应用内快照（{@code cache-seconds}，默认 15s）长，原因见 {@link #aliasCacheControl()}：
-     * 站点 /alerts/ 每 40 秒轮询一次，边缘 TTL 必须长于轮询间隔，否则每次轮询都过期再验证、
-     * 每 40 秒给源站 9 个请求（≈13.5/分，逼近每 IP 20/分 的上限）。取 45s。
+     * <p>快照年龄超过 {@code TTL × 本比例} 就主动刷新，默认 0.5（TTL 45s ⇒ 22.5s）。
+     * 为什么不是"过期才刷"：过期才刷等于把现算留给下一个访客；提前刷 ⇒ 访客侧永远拿到热快照。
+     * 为什么不是更小（例如 0.2）：那会把上游查询频率抬得比"有访客才算"更高，白白增加索引器压力。
+     * 后台检查间隔由 {@code @Scheduled} 的 {@code warm-interval-ms}（默认 30s）决定。
      */
-    private static final int CACHE_ALIAS_MAX_AGE_SECONDS = 45;
+    @Value("${app.public-api.warm-threshold-ratio:0.5}")
+    private double warmThresholdRatio;
 
-    /** 别名路径的 {@code stale-while-revalidate}：边缘先发旧值、后台再验证 ⇒ 用户侧不被回源卡住 */
+    /**
+     * 别名路径的 {@code stale-while-revalidate}：边缘先发旧值、后台再验证 ⇒ 用户侧不被回源卡住。
+     *
+     * <p>取两倍 TTL。max-age 本身**不再单独硬编码** —— 它必须与 {@code app.public-api.cache-seconds}
+     * （快照 TTL）一致，否则会出现"快照已经 45 秒旧、却告诉缓存 15 秒"这种自相矛盾。
+     */
     private static final int CACHE_ALIAS_SWR_SECONDS = 90;
 
     /**
@@ -1863,29 +1872,33 @@ public class PublicApiController {
     }
 
     /**
-     * 别名路径的缓存头。
+     * 别名路径的缓存头（max-age 与快照 TTL 同源：{@code app.public-api.cache-seconds}）。
      *
-     * <h3>为什么 max-age 不是 15，而是 {@value #CACHE_ALIAS_MAX_AGE_SECONDS}</h3>
+     * <h3>为什么 max-age 必须等于快照 TTL，而不是另一个数</h3>
      * 站点 {@code /alerts/} 页**每 40 秒轮询一次**（`layouts/partials/xk-demo/api-bind.html:41`
      * {@code REFRESH = 40000}，配 {@code :1003 setInterval(load, REFRESH)}）。边缘 TTL 若短于轮询间隔，
      * 每次轮询都落在"已过期"上 ⇒ 每 40 秒给源站 9 个请求（≈13.5/分，逼近公开面每 IP 20/分 的上限，
-     * 而每次回源都消耗访客自己的额度）。取 45 秒后：轮询落在 TTL 内 ⇒ 命中边缘缓存、**零回源**；
-     * 数据最旧 45 秒，且由 {@code snapshotAt} + {@code Age} 如实呈现（红线 D4：被缓存不许假装更新）。
+     * 而每次回源都消耗访客自己的额度）。现在快照 TTL 与边缘 TTL 都是 45s（> 40s 轮询间隔）⇒
+     * 常规轮询落在有效期内的**快照**上 ⇒ 命中边缘、且源站那一腿是热的（3~5ms）。
+     * 数据最旧 45 秒，由 {@code snapshotAt} + {@code Age} 如实呈现（红线 D4：被缓存不许假装更新）。
+     *
+     * <p>为什么不能各写一个数：只要两者不一致，就会出现"快照已经 45 秒旧、却告诉缓存 15 秒"或反之的
+     * 自相矛盾 —— 而这类矛盾不会报错，只会在线上表现为"偶尔很慢"。
      *
      * <h3>为什么要 stale-while-revalidate</h3>
      * 即使再验证发生，边缘也**先把手上那份发出去**、在后台去源站确认 ⇒ 用户侧不会因为
      * "回源 + TLS + 边缘选择（实测曾命中 LHR 伦敦）"而卡住。这正是"加载很慢"的直接解药。
      *
      * <h3>⚠️ 浏览器侧 TTL 由 Cloudflare 决定，不由这里决定</h3>
-     * 实测（2026-10-16 20:08，srv1）：本机直连 origin 得到 {@code public, max-age=15}；
-     * 经 CF 得到的却是 {@code public, max-age=14400}（4 小时）—— 这是 zone 的
-     * **Browser Cache TTL** 设置在覆写（CF 会把较短的 max-age 抬到该设置值）。
+     * 实测（2026-10-16 20:08，srv1）：本机直连 origin 得到 {@code public, max-age=45}；
+     * 经 CF 得到的却是 {@code public, max-age=14400}（4 小时，SWR 被保留）—— 这是 zone 的
+     * **Browser Cache TTL** 在覆写（CF 会把较短的 max-age 抬到该设置值）。
      * ⇒ 浏览器可能把这份数据缓存 4 小时。**前端因此必须用条件请求/`no-store` 语义取数**
      * （站点线 B2 那批），或由站主在 CF 控制台把 Browser Cache TTL 改为 "Respect Existing Headers"。
      * 这一条已写进契约文档，别让它留在线上而不写文档。
      */
-    private static String aliasCacheControl() {
-        return "public, max-age=" + CACHE_ALIAS_MAX_AGE_SECONDS
+    private String aliasCacheControl() {
+        return "public, max-age=" + Math.max(0, cacheSeconds)
                 + ", stale-while-revalidate=" + CACHE_ALIAS_SWR_SECONDS;
     }
 
@@ -1910,6 +1923,59 @@ public class PublicApiController {
         } catch (Exception e) {
             logger.warn("别名 ETag 计算失败，退回按完整响应体计算：{}", e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * 定时预聚合：把"读 indexer + 聚合"的现算成本**从访客请求路径搬到后台**。
+     *
+     * <h3>它解决什么</h3>
+     * 站主实测："页面打开很快，但取数慢（约 10s 才出数据）"。根因之一就是
+     * <b>冷快照要现算</b>：{@code alerts} 冷 3.7s / {@code webstats} 冷 4.1s / {@code honeypot} 冷 3.8s
+     * （暖态 3~5ms）。快照一旦过期，第一个到达的访客就要替所有人付这笔钱。
+     * 后台每 {@code warm-interval-ms}（默认 30s）检查一遍：只要某个快照的年龄超过
+     * {@code TTL × warm-threshold-ratio}（默认 45s × 0.5 = 22.5s）就主动刷新 ⇒
+     * 访客侧几乎永远命中热快照（目标：源站响应 ≤50ms，无论冷暖）。
+     *
+     * <h3>三个刻意的设计</h3>
+     * <ol>
+     *   <li><b>不比原来更频繁地查上游</b>：阈值取 TTL 的一半，而不是"每 30 秒无条件重算" ——
+     *       后者会把上游查询量抬到"有访客才算"的几十倍；</li>
+     *   <li><b>绝不阻塞、绝不抛</b>：任何端点刷新失败只记一条 WARN，保留旧快照
+     *       （{@link Snapshot#refreshIfOlderThan} 内部已兜底）；整个方法再包一层 try/catch，
+     *       保证"预聚合坏掉"不会影响任何请求、也不会让定时线程崩掉；</li>
+     *   <li><b>与请求侧共用同一个 Snapshot 与同一把"刷新权"</b>：后台正在刷时，请求侧立刻拿旧值，
+     *       两边不会同时打上游（也天然防击穿）。</li>
+     * </ol>
+     *
+     * <p>为什么放在控制器里而不是单独一个 {@code @Component}：这些快照实例与各端点的 builder
+     * 都是本类的私有成员，放在这里才能复用同一份实例 —— 换个类就得把这些状态暴出去，
+     * 反而更容易出"两份缓存"的错。
+     */
+    @Scheduled(fixedDelayString = "${app.public-api.warm-interval-ms:30000}",
+            initialDelayString = "${app.public-api.warm-initial-delay-ms:10000}")
+    public void warmPublicSnapshots() {
+        long maxAge = Math.max(1000L, (long) (Math.max(1, cacheSeconds) * 1000L * Math.max(0.1d, warmThresholdRatio)));
+        int refreshed = 0;
+        refreshed += warmOne(overviewCache, "overview", maxAge, this::buildOverview);
+        refreshed += warmOne(alertsCache, "alerts", maxAge, this::buildAlerts);
+        refreshed += warmOne(honeypotCache, "honeypot", maxAge, this::buildHoneypot);
+        refreshed += warmOne(auditCache, "audit", maxAge, this::buildAudit);
+        refreshed += warmOne(latestCache, "latest", maxAge, this::buildLatest);
+        refreshed += warmOne(geoCache, "geo", maxAge, this::buildGeo);
+        refreshed += warmOne(webStatsCache, "webstats", maxAge, this::buildWebStats);
+        if (refreshed > 0) {
+            logger.debug("公网快照预聚合：本轮刷新 {} 个端点（年龄阈值 {}ms）", refreshed, maxAge);
+        }
+    }
+
+    /** 单个端点的预聚合：任何异常都吞掉并记 WARN —— 预聚合坏掉不许影响请求或定时线程 */
+    private int warmOne(Snapshot snapshot, String name, long maxAgeMillis, Supplier<Map<String, Object>> loader) {
+        try {
+            return snapshot.refreshIfOlderThan(maxAgeMillis, cacheSeconds, loader) ? 1 : 0;
+        } catch (Exception e) {
+            logger.warn("公网快照预聚合失败（{}，保留旧快照）：{}", name, e.getMessage());
+            return 0;
         }
     }
 
@@ -2011,13 +2077,26 @@ public class PublicApiController {
     }
 
     /**
-     * 极简快照缓存：TTL 内直接返回上一次的结果。
+     * 极简快照缓存：TTL 内直接返回上一次的结果；**过期时只让一个线程去算，其余线程立刻拿旧值**。
      *
      * <p>为什么值得要：公网页面每次刷新都会触发一次"读 indexer + 聚合"，
      * 而数据本身只按分钟级变化。缓存把上游查询量与访客数解耦，
      * 同时让"数据同步时间"变成一个可以如实展示的值（generatedAt）。
+     *
+     * <h3>为什么不阻塞（2026-10-16 晚改）</h3>
+     * 旧实现是 {@code synchronized}：快照过期时，第一个请求进去现算（实测 alerts 冷 3.7s /
+     * webstats 冷 4.1s），**同时到达的其他请求会被锁住一起等** —— 这就是站主看到的"页面打开快、
+     * 取数慢（约 10s）"。现在改成：
+     * <ul>
+     *   <li>未过期 ⇒ 直接返回（3~5ms）；</li>
+     *   <li>已过期 ⇒ 抢到"刷新权"的那个线程去算，**其余线程立刻返回旧值**（旧值只差几十秒，
+     *       且由 {@code snapshotAt}/{@code cacheAgeSeconds} 如实标注年龄）；</li>
+     *   <li>只有"从来没有过值"（应用刚起来）才会短暂等待，等待超时仍按 fail-closed 抛错，
+     *       不返回空白 200。</li>
+     * </ul>
+     * 再配合 {@link #warmPublicSnapshots()} 的后台预聚合，"过期"这件事在正常情况下根本不会发生。
      */
-    private static final class Snapshot {
+    static final class Snapshot {
 
         private volatile Map<String, Object> value;
         private volatile long expiresAt;
@@ -2025,37 +2104,98 @@ public class PublicApiController {
         /** 上一次真正去加载（或首次加载）的时刻：别名响应体的 {@code snapshotAt} 用它 */
         private volatile long loadedAtMs;
 
+        /** 是否有线程正在刷新：用它替代"锁"，保证请求侧不等现算（也天然防击穿） */
+        private final AtomicBoolean refreshing = new AtomicBoolean(false);
+
+        /** 首次无值时的等待上限（毫秒）：冷启动并发首访才会用到 */
+        private static final long FIRST_WAIT_TIMEOUT_MS = 3000L;
+
         Map<String, Object> get(int ttlSeconds, Supplier<Map<String, Object>> loader) {
             Map<String, Object> cur = value;
             if (cur != null && System.currentTimeMillis() < expiresAt) {
                 PublicSnapshotClock.mark(loadedAtMs);
                 return cur;
             }
-            synchronized (this) {
-                if (value != null && System.currentTimeMillis() < expiresAt) {
+            if (!refreshing.compareAndSet(false, true)) {
+                // 别的线程正在算：有旧值就**立刻**给旧值（不阻塞、不等待）
+                if (cur != null) {
                     PublicSnapshotClock.mark(loadedAtMs);
-                    return value;
+                    return cur;
+                }
+                return awaitFirstValue(loader, ttlSeconds);
+            }
+            try {
+                return load(ttlSeconds, loader);
+            } finally {
+                refreshing.set(false);
+            }
+        }
+
+        /**
+         * 定时预聚合用：值比 {@code maxAgeMillis} 旧（或还没有值）就刷新。
+         *
+         * <p>为什么按"年龄阈值"而不是"过期才刷"：过期才刷等于把现算留给下一个访客。
+         * 阈值取 TTL 的一半（默认）⇒ 访客侧永远拿到热快照，而上游查询频率不会比原来更高。
+         *
+         * @return 本轮是否真的执行了刷新（有人在算时直接跳过，不排队）
+         */
+        boolean refreshIfOlderThan(long maxAgeMillis, int ttlSeconds, Supplier<Map<String, Object>> loader) {
+            Map<String, Object> cur = value;
+            if (cur != null && (System.currentTimeMillis() - loadedAtMs) <= maxAgeMillis) {
+                return false;
+            }
+            if (!refreshing.compareAndSet(false, true)) {
+                return false;
+            }
+            try {
+                load(ttlSeconds, loader);
+                return true;
+            } finally {
+                refreshing.set(false);
+            }
+        }
+
+        /** 带异常兜底的真实加载：成功则发布新值；失败保留旧值，没有旧值才抛（fail-closed） */
+        private Map<String, Object> load(int ttlSeconds, Supplier<Map<String, Object>> loader) {
+            try {
+                Map<String, Object> fresh = loader.get();
+                long now = System.currentTimeMillis();
+                value = fresh;
+                loadedAtMs = now;
+                expiresAt = now + Math.max(0, ttlSeconds) * 1000L;
+                PublicSnapshotClock.mark(now);
+                return fresh;
+            } catch (Exception e) {
+                // 刷新失败：有旧快照就继续用旧的（页面标注同步时间），
+                // 没有旧快照就抛出，让调用方看到错误而不是"空白但 200"
+                logger.warn("公网快照刷新失败：{}", e.getMessage());
+                Map<String, Object> cur = value;
+                if (cur != null) {
+                    expiresAt = System.currentTimeMillis() + 5000L;
+                    PublicSnapshotClock.mark(loadedAtMs);
+                    return cur;
+                }
+                throw new IllegalStateException("公网快照刷新失败且无可用旧快照", e);
+            }
+        }
+
+        /** 冷启动并发首访：另一个线程正在算且还没有值 —— 有限等待，超时抛错（不返回空白 200） */
+        private Map<String, Object> awaitFirstValue(Supplier<Map<String, Object>> loader, int ttlSeconds) {
+            long deadline = System.currentTimeMillis() + FIRST_WAIT_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                Map<String, Object> v = value;
+                if (v != null) {
+                    PublicSnapshotClock.mark(loadedAtMs);
+                    return v;
                 }
                 try {
-                    Map<String, Object> fresh = loader.get();
-                    long now = System.currentTimeMillis();
-                    value = fresh;
-                    expiresAt = now + Math.max(0, ttlSeconds) * 1000L;
-                    loadedAtMs = now;
-                    PublicSnapshotClock.mark(now);
-                    return fresh;
-                } catch (Exception e) {
-                    // 刷新失败：有旧快照就继续用旧的（页面标注同步时间），
-                    // 没有旧快照就抛出，让调用方看到错误而不是"空白但 200"
-                    logger.warn("公网快照刷新失败：{}", e.getMessage());
-                    if (value != null) {
-                        expiresAt = System.currentTimeMillis() + 5000L;
-                        PublicSnapshotClock.mark(loadedAtMs);
-                        return value;
-                    }
-                    throw new IllegalStateException("公网快照刷新失败且无可用旧快照", e);
+                    Thread.sleep(50L);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
             }
+            throw new IllegalStateException("公网快照首次加载等待超时（另一个线程仍在计算）");
         }
     }
 }

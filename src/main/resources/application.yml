@@ -336,7 +336,15 @@ app:
   # 而这件事不会有任何报错。
   public-api:
     requests-per-minute: 20   # 比业务限流更严；进程内按 IP 固定窗口（304 也计入，不因 ETag 免费）
-    cache-seconds: 15         # 应用内快照 TTL，同时作为 Cache-Control: max-age 下发
+    cache-seconds: 45         # 应用内快照 TTL，同时作为 Cache-Control: max-age 下发。
+    # 为什么是 45 而不是 15（2026-10-16 晚改，依据实测）：
+    #   · CF 对缓存别名路径（/api/public/<name>.js）的边缘 TTL 就是本值；
+    #   · 站点 /alerts/ 每 40 秒轮询一次（layouts/partials/xk-demo/api-bind.html:41 REFRESH=40000）；
+    #   15s 会让"每次轮询都可能撞上已过期的快照"，于是访客请求要**现算**
+    #   （alerts 冷 3.7s / webstats 冷 4.1s / honeypot 冷 3.8s，暖态 3~5ms）——
+    #   这就是"页面打开快、取数慢"的来源。45s > 40s 轮询间隔 ⇒ 常规轮询落在快照有效期内；
+    #   再配合定时预聚合（PublicSnapshotWarmer，每 30s 主动刷新），请求侧基本不再付现算成本。
+    #   数据最旧 45s，由 snapshotAt / cacheAgeSeconds / 响应头 Age 如实呈现（红线 D4）。
     expose-build-sha: true    # 只暴露开源仓库的提交号，与 /api/health 同一口径
     # 公网端点的 CORS 白名单（精确匹配，不回显非白名单来源）。
     # 为什么不复用 app.cors.allowed-origins：公网端点是匿名可达面，

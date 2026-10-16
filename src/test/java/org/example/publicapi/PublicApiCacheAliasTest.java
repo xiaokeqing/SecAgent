@@ -51,7 +51,7 @@ class PublicApiCacheAliasTest {
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
         ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(controller, "cacheSeconds", 45);
         ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
         ReflectionTestUtils.setField(controller, "buildSha", "test");
 
@@ -97,8 +97,8 @@ class PublicApiCacheAliasTest {
                 .andExpect(jsonPath("$.data.available").value(true))
                 .andExpect(jsonPath("$.snapshotAt").exists())
                 .andExpect(jsonPath("$.cacheAgeSeconds").exists())
-                .andExpect(jsonPath("$.snapshotTtlSeconds").value(15))
-                // TTL 45s（> 站点 40s 轮询间隔）+ stale-while-revalidate（边缘先发旧值再后台验证）
+                .andExpect(jsonPath("$.snapshotTtlSeconds").value(45))
+                // TTL 与快照同源（45s，> 站点 40s 轮询间隔）+ stale-while-revalidate
                 .andExpect(header().string("Cache-Control",
                         "public, max-age=45, stale-while-revalidate=90"))
                 .andExpect(header().string("Access-Control-Allow-Origin", "*"))
@@ -139,7 +139,7 @@ class PublicApiCacheAliasTest {
                 .andExpect(jsonPath("$.data.available").value(true))
                 .andExpect(jsonPath("$.snapshotAt").doesNotExist())
                 .andExpect(jsonPath("$.cacheAgeSeconds").doesNotExist())
-                .andExpect(header().string("Cache-Control", "public, max-age=15"))
+                .andExpect(header().string("Cache-Control", "public, max-age=45"))
                 .andExpect(header().string("Access-Control-Allow-Origin", "https://xiaokeqing.cn"))
                 .andExpect(header().string("Vary", "Origin"))
                 .andExpect(header().doesNotExist("X-Content-Type-Options"))
