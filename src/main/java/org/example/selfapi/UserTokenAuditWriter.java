@@ -45,6 +45,10 @@ public class UserTokenAuditWriter {
 
     private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final AtomicBoolean started = new AtomicBoolean(false);
+    /** 最后一次成功写入的纳秒时刻；空闲超过 IDLE_CLOSE_NANOS 就关句柄（见 loop()）。 */
+    private final java.util.concurrent.atomic.AtomicLong lastWriteNanos =
+            new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
+    private static final long IDLE_CLOSE_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
 
     /** 为空 = 不落盘。volatile：configure 在启动期写，写线程读 */
     private volatile String file;
@@ -153,6 +157,15 @@ public class UserTokenAuditWriter {
                 if (line == null) {
                     if (writer != null) {
                         writer.flush();
+                        /* 队列空超过 IDLE_CLOSE_SECONDS 就关掉句柄：
+                           ① 生产上审计一天最多几百条，长时间占用文件句柄没有收益；
+                           ② Windows 上打开的句柄会让临时目录删不掉（测试 @TempDir 清理偶发
+                              "Failed to delete temp directory"，曾把一次发布卡掉）。
+                           下一条到达时会重新打开（APPEND，不丢内容）。 */
+                        if (System.nanoTime() - lastWriteNanos.get() > IDLE_CLOSE_NANOS) {
+                            closeQuietly(writer);
+                            writer = null;
+                        }
                     }
                     continue;
                 }
@@ -172,6 +185,7 @@ public class UserTokenAuditWriter {
                 writer.newLine();
                 // 每条都 flush：审计的价值在"出事时确实有"，而这里一天最多几百条
                 writer.flush();
+                lastWriteNanos.set(System.nanoTime());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
