@@ -27,6 +27,31 @@ public class MultiAgentResult {
      */
     private Map<String, Object> decision;
 
+    /**
+     * 公开面上屏正文 = <b>她本人的直答</b>（纯文本，不含任何内部痕迹）。
+     *
+     * <h3>为什么不能继续用 finalAnswer 上屏</h3>
+     * {@link #finalAnswer} 是<b>给站主与日志看的内部编排报告</b>（"## 多智能体协同结果" /
+     * "> 调度员判定本次任务为【…】" / "> state=…" / "> 结论生成方式：…"）。
+     * 公开面原先把这份报告原样贴给访客，实测结果是：问"这个网站是干嘛的"也会看到
+     * 调度员判定、模型自评与三遍重复的口径声明 —— 那不是她的回答，是流水单。
+     * 所以内部报告与公开直答分成两个字段：{@code finalAnswer} 不动（/api/chat、审计、日志
+     * 全都继续读它），{@code publicAnswer} 只给公开端点。
+     *
+     * <p>内部身份下本字段恒为 {@code null} —— 空值本身就是"这里没有公开面"的显式信号。
+     */
+    private String publicAnswer;
+
+    /**
+     * 公开面的机读状态（model / input-insufficient / no-retrieval / retrieval-failed /
+     * model-failed / rule-based …）。
+     *
+     * <p>与 {@code publicAnswer} 配套：<b>正文里不再出现 {@code state=} 字样</b>，
+     * 状态走这个专门字段，由 {@code PublicAskService} 写进响应体既有的 {@code state} 字段。
+     * 这样"机读状态"与"人读正文"各自干净，不必再靠正则在正文里抠。
+     */
+    private String state;
+
     public MultiAgentResult() {
         this.steps = new ArrayList<>();
     }
@@ -89,5 +114,21 @@ public class MultiAgentResult {
 
     public void setDecision(Map<String, Object> decision) {
         this.decision = decision;
+    }
+
+    public String getPublicAnswer() {
+        return publicAnswer;
+    }
+
+    public void setPublicAnswer(String publicAnswer) {
+        this.publicAnswer = publicAnswer;
+    }
+
+    public String getState() {
+        return state;
+    }
+
+    public void setState(String state) {
+        this.state = state;
     }
 }

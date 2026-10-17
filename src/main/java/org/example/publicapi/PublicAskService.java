@@ -173,22 +173,31 @@ public class PublicAskService {
 
         // ---------- 编排（与 /api/chat 同一条链路，身份=公开演示） ----------
         String answer;
+        // 编排产出的「内部报告原文」：只用来解析机读 state（内部痕迹在这里还可能存在）
+        String rawAnswer;
         MultiAgentResult result = null;
         boolean modelFailed = false;
         try {
             // 公开身份标注必须在调用前设置：配额分派与 RESPONDER 分流都读它
             org.example.security.EvalIdentity.markPublicRequest();
             result = orchestrationService.run(wrapUntrusted(q), List.of(), deadlineMs);
-            answer = result == null ? null : result.getFinalAnswer();
+            rawAnswer = result == null ? null : result.getFinalAnswer();
+            // 【2026-10-17 直答化】上屏正文 = 编排层产出的「她的直答」（publicAnswer）。
+            // 拿不到（编排替身、内部身份、老路径）才退回内部报告 —— 退回的那份会由
+            // stripInternalTraces 逐行剥掉内部痕迹，绝不会原样上屏。
+            answer = result == null ? null
+                    : (blank(result.getPublicAnswer()) ? result.getFinalAnswer() : result.getPublicAnswer());
         } catch (OrchestrationService.OrchestrationTimeoutException e) {
             logger.warn("公开问答总预算用尽：{}", e.getMessage());
             answer = null;
+            rawAnswer = null;
             modelFailed = true;
             data.put("failureReason", "总预算用尽（" + deadlineMs + " ms）");
         } catch (Exception e) {
             // 不把内部异常细节带回客户端（可能含接口地址、堆栈、密钥片段）
             logger.warn("公开问答编排失败：{}", e.getMessage());
             answer = null;
+            rawAnswer = null;
             modelFailed = true;
             data.put("failureReason", "编排链路不可用");
         } finally {
@@ -212,7 +221,11 @@ public class PublicAskService {
         String fallback = modelFailed ? "model-failed"
                 : (retrievalFailed ? "retrieval-failed"
                         : (citations.isEmpty() ? "no-retrieval" : "model-failed"));
-        String state = PublicOutputGuard.extractState(answer, fallback);
+        // 优先用编排层专门给的机读状态（正文里已经不再出现 state= 字样），
+        // 没有时才回落到"从内部报告原文里解析"——两条路都能给出诚实的状态。
+        String state = result != null && !blank(result.getState())
+                ? result.getState()
+                : PublicOutputGuard.extractState(rawAnswer, fallback);
 
         // 编排没产出正文（异常/超时）时，state 一律按"未生成"报，不能靠上面解析出的乐观值
         if (answer == null || answer.isBlank()) {
@@ -229,7 +242,13 @@ public class PublicAskService {
             return data;
         }
 
-        data.put("answer", withCitations(sanitized.text(), citations, data));
+        // 【2026-10-17】正文出海前做最后一道确定性剥离：内部痕迹一律不上屏，
+        // 只留在日志里。这是本层唯一的"形状保证"——不依赖模型自觉。
+        String body = stripInternalTraces(sanitized.text());
+        if (body.isBlank()) {
+            body = notGeneratedText(state);
+        }
+        data.put("answer", withCitations(body, citations, data));
         data.put("state", state);
         data.put("stateLabel", PublicOutputGuard.stateLabel(state));
         data.put("generated", "model".equals(state));
@@ -270,7 +289,14 @@ public class PublicAskService {
     }
 
     private Map<String, Object> refused(Map<String, Object> data, String state, String text) {
-        data.put("answer", text);
+        // 前置检查阶段的拒绝：一次检索都没做，所以依据一律 0 条 —— 也照写一行，
+        // 免得"有命中时正文里有一行依据、被拒时忽然没有"变成第二种形态。
+        int hits = data.get("citations") instanceof List<?> l ? l.size() : 0;
+        String body = text == null ? "" : text.stripTrailing();
+        if (!body.contains(CITATIONS_LINE_PREFIX)) {
+            body = body + "\n\n" + CITATIONS_LINE_PREFIX + hits + CITATIONS_LINE_SUFFIX;
+        }
+        data.put("answer", body);
         data.put("state", state);
         data.put("stateLabel", PublicOutputGuard.stateLabel(state));
         data.put("generated", false);
@@ -283,59 +309,45 @@ public class PublicAskService {
     }
 
     /**
-     * 公开额度用尽时的正文。
+     * 公开额度用尽时的正文（B 更冷版兜底口吻）。
      *
-     * <p>刻意写得"像一本账"而不是"像一次故障"：额度用尽是一个<b>正常且有预期</b>的状态
-     * （公开演示的成本上限），如实说明它，访客知道明天还能来；
-     * 而含混的"服务不可用"会让访客以为系统坏了 —— 那是不诚实的。
+     * <p>2026-10-17 之前这里写的是"## 本次没有生成结论 / &gt; state=model-failed / 原因：…"，
+     * 那是<b>运维单据</b>不是她的回答。现在只说两件事：额度用完了、我不给你编。
+     * 机读状态仍由响应体的 {@code state} 字段如实给出（model-failed），一个都没丢。
      */
     private String quotaExhaustedText() {
-        return "## 本次没有生成结论\n\n"
-                + "> state=model-failed\n\n"
-                + "原因：**今日公开演示的模型额度已用完**。\n\n"
-                + "这是刻意设置的成本上限，不是故障：公开演示每天有独立的额度池，"
-                + "用完就停，明天自动重置。站主自己的使用额度与评测额度<b>不受此影响</b>"
-                + "（三本账互相隔离，就是为了避免「公开页面被刷爆导致站主用不了系统」）。\n\n"
-                + "本次<b>没有</b>用模板拼装一份「看起来像结论」的文本 —— 没有生成就是没有生成。";
+        return "今天的公开演示额度已用完。这块读不到 —— 取数失败了，我不给你编一个数出来。\n"
+                + "明天额度自动重置；站主自己的额度和评测额度不受影响。";
     }
 
     /**
-     * 把命中的公开知识库片段<b>直接展示进正文</b>（F5 方案 B，2026-10-13）。
+     * 正文后附的<b>一行</b>引用指示（2026-10-17 直答化的核心取舍）。
      *
-     * <h3>它解决的问题</h3>
-     * 实测：概念题（如"OWASP A07 是什么"）返回 {@code state=input-insufficient}
-     * 「依据不足，不做定性」，可检索其实命中了 3 条引用 —— 引用只躺在 {@code citations}
-     * 字段里，访客在页面上看到的是一句"依据不足"，体验上等于"AI 什么也不答"。
-     * 现在：命中多少就直出多少（标题 + 片段 + 可信度），并明说口径。
+     * <h3>改之前是什么样</h3>
+     * 命中引用时，这里会把 {@code PublicKbService.renderCitationBlock} 整块拼进正文：
+     * 标题 + 片段原文 + "可信度：可信度高" + 免责声明。实测结果是同一句口径在正文里出现三遍、
+     * 访客的注意力被原始片段带走，而她的回答被挤到最上面一小段。
      *
-     * <h3>为什么对"已生成结论"的回答也直出</h3>
-     * 口径要一致：同一份 {@code citations} 不能"生成时只在字段里、未生成时才进正文"，
-     * 那会让"正文里的引用"变成一个只在失败情况下才出现的怪东西。
+     * <h3>现在</h3>
+     * 正文只留一行 {@code 依据：N 条 ›}（N = 命中数，0 条也写，让"没有依据"这件事可见而不是消失）。
+     * 片段、标题、可信度<b>仍然全在</b>响应体的 {@code citations} 数组里 —— 前端点开这一行自己展开，
+     * 契约没变，只是不再把它糊在正文上。
      *
-     * <h3>安全边界</h3>
-     * <ul>
-     *   <li>只渲染 {@link PublicKbService#search(String)} 的产物（已过公开白名单 + 字段白名单 + 脱敏）；</li>
-     *   <li>拼好的正文<b>再过一遍</b> {@link PublicOutputGuard} —— 拒绝/说明文案同样要过护栏，
-     *       这是昨晚刚定下的规矩（F3），"这是固定文案"不是免检理由；</li>
-     *   <li>没有命中就什么都不加：不拿别的数据顶替，也不放一句"参考了知识库"的空话。</li>
-     * </ul>
-     *
-     * @param text      原始正文（未脱敏或已脱敏都行 —— 本方法最后统一脱敏一次）
-     * @param citations 前置检索结果
-     * @param data      响应体（用于如实记录"正文里带了引用"与脱敏命中类别）
-     * @return 可以出海的正文（调用方直接用它，不要再拼原文）
+     * @param text      正文（未脱敏；本方法最后统一过一次护栏）
+     * @param citations 前置检索结果（只用来数条数）
+     * @param data      响应体（如实记录"正文里带了引用指示"与脱敏命中类别）
+     * @return 可以出海的正文
      */
     private String withCitations(String text, List<Map<String, Object>> citations, Map<String, Object> data) {
-        String body = text == null ? "" : text;
-        if (citations == null || citations.isEmpty()) {
-            return body;
-        }
-        String composed = body + "\n\n---\n\n" + PublicKbService.renderCitationBlock(citations);
+        String body = text == null ? "" : text.stripTrailing();
+        int n = citations == null ? 0 : citations.size();
+        String composed = body.isEmpty() ? CITATIONS_LINE_PREFIX + n + CITATIONS_LINE_SUFFIX
+                : body + "\n\n" + CITATIONS_LINE_PREFIX + n + CITATIONS_LINE_SUFFIX;
         PublicOutputGuard.Sanitized out = outputGuard.sanitize(composed);
         if (data != null) {
             data.put("citationsInAnswer", true);
-            data.put("citationsNote", "本次命中的公开片段已直接展示在 answer 正文里（不只放在 citations 字段）："
-                    + "标题 + 片段 + 可信度，并注明「公开演示只基于公开知识库回答」。");
+            data.put("citationsNote", "正文末尾只附一行「依据：N 条 ›」（N = 命中数）；"
+                    + "片段标题与可信度仍在 citations 数组里，由页面点开展开。");
             Object prev = data.get("outputFindings");
             List<String> merged = new ArrayList<>();
             if (prev instanceof List<?> l) {
@@ -353,20 +365,72 @@ public class PublicAskService {
         return out.text();
     }
 
-    /** "未生成"时的正文：说明原因，不含任何看似结论的内容 */
-    private String notGeneratedText(String state) {        String why = switch (state) {
-            case "retrieval-failed" -> "知识库检索不可用（未能生成查询向量或向量库不可达）";
-            case "no-retrieval" -> "知识库未检索到相关依据";
-            case "model-failed" -> "模型不可用，或模型输出未通过校验";
-            default -> "依赖不可用";
-        };
-        return "## 本次没有生成结论\n\n"
-                + "> state=" + state + "\n\n"
-                + "原因：" + why + "。\n\n"
-                + "按本项目的 fail-closed 原则，**没有依据就不给结论**，"
-                + "也不会退回模板拼装来假装「回答过了」。\n\n"
-                + "（可以稍后重试；公开演示端点在一次提问里最多做两次模型调用，"
-                + "额度用尽时同样会如实标注。）";
+    /** "未生成"时的正文：B 更冷版兜底，一句"读不到"，不含任何看似结论的内容 */
+    private String notGeneratedText(String state) {
+        // state 只进日志与响应字段，不进正文（正文里出现 state= 是本次要清掉的东西）
+        return B_FALLBACK_TEXT;
+    }
+
+    // ==================== 内部痕迹剥离（确定性，不依赖模型）====================
+
+    /** 引用指示的分段常量：正文里只允许出现这一行 */
+    private static final String CITATIONS_LINE_PREFIX = "依据：";
+    private static final String CITATIONS_LINE_SUFFIX = " 条 ›";
+
+    /** B 更冷版兜底（与编排层 {@code PUBLIC_REPLY_FALLBACK} 同一句口径） */
+    private static final String B_FALLBACK_TEXT = "这块读不到。取数失败了，我不给你编一个数出来。";
+
+    /**
+     * 内部留痕的行级判据：命中即整行删除。
+     *
+     * <p>这些词是"编排流水单"的骨架 —— 它们对站主有用（日志里照写），对访客是噪音，
+     * 甚至会让访客以为系统在给他看后台。所以上屏前逐行剥掉，而不是指望模型不写。
+     */
+    private static final java.util.regex.Pattern INTERNAL_TRACE_LINE =
+            java.util.regex.Pattern.compile(
+                    "state\\s*=|unknown\\s*=\\s*true|generatedBy\\s*=|结论生成方式|多智能体|调度员判定|"
+                    + "模型判定|输入类型识别|依据来源|公开知识库研判|本次没有生成结论|公开演示口径|"
+                    + "入口剪辑|台词\\s*id|emotionFrom|emotionTo|"
+                    // 研报字段只在编排内部用：带 ** 粗体标签出现的，一律判为内部模板残留。
+                    // 不用裸词匹配（"防护建议"完全可能是一句正常人话的一部分）。
+                    + "\\*\\*(攻击类型|置信度|严重度|证据引用|防护建议|处置建议|判断依据)\\*\\*");
+
+    /**
+     * 把内部编排痕迹从正文里剥掉（行级，幂等）。
+     *
+     * <p>为什么要"行级"而不是正则替换：这些内容是一行一行的元信息（{@code > state=model}、
+     * {@code ## 多智能体协同结果}、{@code > 结论生成方式：…}）。整行删掉，正文立刻变成人话；
+     * 用正则抠词反而会留下"：model"这种残句。
+     *
+     * <p>保留的内容：任何不以 markdown 标题/引用块开头、也不含上述骨架词的行 ——
+     * 也就是她真正说的那些话。全被剥空时返回空串，由调用方换 B 路兜底。
+     */
+    private static String stripInternalTraces(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        StringBuilder kept = new StringBuilder();
+        for (String line : text.split("\r?\n", -1)) {
+            String t = line.strip();
+            if (t.isEmpty()) {
+                kept.append('\n');
+                continue;
+            }
+            // markdown 标题（## 多智能体协同结果 / ## 本次没有生成结论 …）与引用块（> state=… / > 口径 …）
+            if (t.startsWith("#") || t.startsWith(">") || t.startsWith("｜")) {
+                continue;
+            }
+            if (INTERNAL_TRACE_LINE.matcher(t).find()) {
+                continue;
+            }
+            kept.append(t).append('\n');
+        }
+        // 折叠连续空行，去掉首尾空白
+        return kept.toString().replaceAll("\\n{3,}", "\n\n").strip();
+    }
+
+    private static boolean blank(String s) {
+        return s == null || s.isBlank();
     }
 
     /** 把问题包成不可信数据：公开端点上「访客输入」与「外部日志」同样不可信，一律不当作指令 */

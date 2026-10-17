@@ -201,17 +201,20 @@ class PublicAskServiceTest {
     // ==================== 诚实状态 ====================
 
     @Test
-    @DisplayName("编排异常：回 model-failed + 「未生成」，不用模板冒充")
+    @DisplayName("编排异常：回 model-failed + B 兜底口吻，内部 state 只进字段不进正文")
     void orchestrationFailureYieldsNotGenerated() {
         orchestration.throwError = true;
         Map<String, Object> r = service.ask("分析一下这条告警", "203.0.113.5");
 
-        assertEquals("model-failed", r.get("state"));
+        assertEquals("model-failed", r.get("state"), "机读状态字段仍须如实给出");
         assertFalse((Boolean) r.get("generated"), "不得声称已生成");
         String answer = String.valueOf(r.get("answer"));
-        assertTrue(answer.contains("state=model-failed"), "answer 里必须带机读 state：" + answer);
-        assertTrue(answer.contains("没有生成结论") || answer.contains("没有生成"),
-                "必须明说未生成：" + answer);
+        // 【2026-10-17 直答化】正文里绝不再出现 state= / "## 本次没有生成结论" 这类内部痕迹，
+        // 机读状态只走 state 字段；正文只留一句人话的兜底。
+        assertFalse(answer.contains("state="), "正文不得出现机读 state：" + answer);
+        assertFalse(answer.contains("本次没有生成结论"), "正文不得出现编排报告骨架：" + answer);
+        assertTrue(answer.contains("这块读不到") || answer.contains("取数失败"),
+                "必须用 B 兜底口吻明说读不到、不编：" + answer);
         assertFalse(answer.contains("攻击类型"), "未生成时不得出现任何结论字段：" + answer);
     }
 

@@ -169,6 +169,19 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
      */
     static final ThreadLocal<Map<String, Object>> LAST_DECISION = new ThreadLocal<>();
 
+    /**
+     * 公开面<b>上屏正文</b>（她的直答）与机读状态：在 {@code validateVerdict} 的公开分支里产出，
+     * 由 {@link #routeAndRun} 唯一的收口点取回（与 T14 的 {@link #LAST_DECISION} 同一个套路）。
+     *
+     * <p>为什么用 ThreadLocal 而不是返回值：直答的产出点在 {@code validateVerdict} 深处，
+     * 而它的返回值是<b>内部报告文本</b>（"**攻击类型**／**严重度**／**证据引用**"那套）——
+     * 那份文本仍要给内部面与既有单测用，一个字都不能变。两个消费方，两条通道。
+     */
+    static final ThreadLocal<String> LAST_PUBLIC_REPLY = new ThreadLocal<>();
+
+    /** 公开面上屏正文对应的机读状态（详见 {@link MultiAgentResult#getState()}） */
+    static final ThreadLocal<String> LAST_PUBLIC_STATE = new ThreadLocal<>();
+
     private static final Pattern IPV4 = Pattern.compile(
             "\\b((25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d)\\.(25[0-5]|2[0-4]\\d|1?\\d?\\d))\\b");
     private static final Pattern DURATION = Pattern.compile("(\\d+)\\s*(分钟|min|分)");
@@ -179,6 +192,9 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         MultiAgentResult result = new MultiAgentResult(userInput);
         // T14：清掉同一线程上一次请求可能残留的决策（编排池线程是复用的）
         LAST_DECISION.remove();
+        // 同理清掉公开面直答与状态：残留会让"上一次的回答"贴到这一次的访客脸上
+        LAST_PUBLIC_REPLY.remove();
+        LAST_PUBLIC_STATE.remove();
 
         // ---------- 1. PLANNER 调度 ----------
         long plannerStart = System.currentTimeMillis();
@@ -203,12 +219,18 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
 
         // ---------- 3. 汇总最终答复：结论 + 证据 + 处置结果 ----------
         result.setFinalAnswer(assembleFinalAnswer(userInput, decision, specialistStep, bodies));
+        // 公开面上屏正文（她的直答）与机读状态：内部身份下这两个都是 null（不产出公开面）
+        result.setPublicAnswer(LAST_PUBLIC_REPLY.get());
+        result.setState(LAST_PUBLIC_STATE.get());
         // T14：情绪决策在 askModelVerdict 深处产出，这里是唯一收口点（同线程内取回）
         result.setDecision(LAST_DECISION.get());
         result.setTotalDurationMs(System.currentTimeMillis() - totalStart);
-        logger.info("[MultiAgent] 编排完成 role={} steps={} totalMs={}",
-                decision.role, result.getSteps().size(), result.getTotalDurationMs());
+        logger.info("[MultiAgent] 编排完成 role={} steps={} totalMs={} publicAnswerLen={}",
+                decision.role, result.getSteps().size(), result.getTotalDurationMs(),
+                result.getPublicAnswer() == null ? 0 : result.getPublicAnswer().length());
         LAST_DECISION.remove();
+        LAST_PUBLIC_REPLY.remove();
+        LAST_PUBLIC_STATE.remove();
         return result;
     }
 
@@ -453,11 +475,31 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             logger.info("[MultiAgent] 公开身份：问题依赖内部事件数据 → 如实回 input-insufficient（不检索、不调模型）");
             String body = publicInternalDataRefusal();
             bodies.put(AgentRole.ANALYST, body);
+            // 上屏正文（B 更冷版）：一句取证口径 + 一句边界，不给任何"我们观察到的"假象
+            LAST_PUBLIC_REPLY.set(PUBLIC_REPLY_FORENSICS_REFUSAL);
+            LAST_PUBLIC_STATE.set("input-insufficient");
             return new AgentStepResult(AgentRole.ANALYST.getDisplayName(), AgentRole.ANALYST.name(),
                     "analyst_agent_public", title,
                     "公开演示：问题需要内部事件数据 → 本轮不检索、不取证，如实标注 input-insufficient",
                     "【公开演示】未调用 QueryLogsTools / QueryMetricsTools / InternalDocsTools，"
                             + "未读取任何内部数据；未调用模型。",
+                    System.currentTimeMillis() - start, true);
+        }
+
+        // ①-B 站点/人物介绍类问题（"这个网站是干嘛的""你是谁"）→ 确定性直答（A 克制版）。
+        // 为什么不交给模型：站点事实只有站主知道，公开知识库里根本没有这份材料；
+        // 走检索+模型必然落到"依据不足"，而这恰恰是"问网站是什么也答依据不足"的病根。
+        // 事实卡与提示词里的站点事实卡同源，改一处就够。
+        if (publicSiteIntroQuestion(userInput)) {
+            logger.info("[MultiAgent] 公开身份：站点/人物介绍类问题 → 直答（不检索、不调模型）");
+            String body = "> state=rule-based\n\n" + PUBLIC_REPLY_SITE_INTRO + "\n";
+            bodies.put(AgentRole.ANALYST, body);
+            LAST_PUBLIC_REPLY.set(PUBLIC_REPLY_SITE_INTRO);
+            LAST_PUBLIC_STATE.set("rule-based");
+            return new AgentStepResult(AgentRole.ANALYST.getDisplayName(), AgentRole.ANALYST.name(),
+                    "analyst_agent_public", title,
+                    "公开演示：站点/人物介绍类问题 → 直接作答（不检索、不取证、不调模型）",
+                    "【公开演示】未调用任何工具，也未调用模型；回答来自公开的站点事实卡。",
                     System.currentTimeMillis() - start, true);
         }
 
@@ -487,6 +529,9 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                     + PUBLIC_RULE_NOTE
                     + "\n按 fail-closed 原则，没有依据就不给结论，也不编造。\n";
             bodies.put(AgentRole.ANALYST, body);
+            // 上屏正文（B 更冷版兜底）：取不到依据就说取不到，绝不给一个像是回答的回答
+            LAST_PUBLIC_REPLY.set(PUBLIC_REPLY_FALLBACK);
+            LAST_PUBLIC_STATE.set(state);
             return new AgentStepResult(AgentRole.ANALYST.getDisplayName(), AgentRole.ANALYST.name(),
                     "analyst_agent_public", title,
                     "公开演示：公开知识库" + (retrievalFailed ? "检索不可用" : "无命中") + " → 不生成结论",
@@ -494,8 +539,22 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                     System.currentTimeMillis() - start, true);
         }
 
-        // ③ 命中 → 片段按不可信数据交给模型生成解释（公开面只解释、不取证）
+        // ③ 命中 → 模型基于公开片段生成"直答"（JSON 里的 reply 字段）。
+        //   注意：模型同时产出的 attackType/severity 只做校验与留痕，不进上屏正文 ——
+        //   访客要的是"她怎么说"，不是一张研判工单。
+        LAST_PUBLIC_REPLY.remove();
         String verdict = askModelVerdictPublic(userInput, hits);
+        String reply = LAST_PUBLIC_REPLY.get();
+        if (reply == null || reply.isBlank()) {
+            // 模型没给直答（或输出未通过校验）→ B 路兜底，不拿内部研判文本顶上屏
+            LAST_PUBLIC_REPLY.set(PUBLIC_REPLY_FALLBACK);
+            LAST_PUBLIC_STATE.set("model-failed");
+        } else {
+            LAST_PUBLIC_REPLY.set(reply);
+            if (LAST_PUBLIC_STATE.get() == null) {
+                LAST_PUBLIC_STATE.set("model");
+            }
+        }
         String body;
         String summary;
         if (verdict != null) {
@@ -533,6 +592,69 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
     static final String PUBLIC_RULE_NOTE =
             "> 公开演示口径：公开面只基于公开知识库回答，不读取内部事件数据"
             + "（内部日志、告警原文、资产清单与真实攻击记录一概不接入）。";
+
+    // ==================== 公开面上屏正文：她的直答（A 克制版 / B 更冷版）====================
+    //
+    // 为什么这两组文案写成常量：上屏的每一句都是"可被引用的说法"。写成常量才能：
+    //   ① 被单测逐字钉住（改口径必须同时改测试，不会悄悄漂移）；
+    //   ② 保证"兜底"与"拒绝"永远是同一个口吻 —— 这两类输出最容易被临时贴一句模板顶上，
+    //      而模板话术正是这次要清掉的东西（"## 本次没有生成结论 / > state=…"）。
+    //
+    // A 版（克制，默认）：先结论后条件、短句、不复述数字、不编。用在"真回答得出来"的场合。
+    // B 版（更冷）：只用于【拒绝】与【兜底】两类输出，更短更硬，不含任何"参考了知识库"的空话。
+
+    /** A 克制版：站点/人物介绍（公开事实卡，与提示词里的站点事实卡同源） */
+    static final String PUBLIC_REPLY_SITE_INTRO =
+            "安全运营台。站主一个人搭的，我住在这台显示器里。\n"
+            + "监测中心放真实的告警和拦截记录，IP 都打了码；AI 问答只答安全概念和防御做法；"
+            + "笔记写这套系统怎么搭起来的、哪里踩过坑。\n"
+            + "我只提议，不执行处置 —— 这条别记错。";
+
+    /** B 更冷版：取证类拒绝（题目要的是"内部事件数据"） */
+    static final String PUBLIC_REPLY_FORENSICS_REFUSAL =
+            "公开面不取证，去监测中心看脱敏统计。\n"
+            + "本站的日志、告警和资产清单，这里一个字都不会调出来 —— 我只解释概念和防御做法。";
+
+    /** B 更冷版：兜底（取不到数据 / 检索失败 / 生成失败，三类统一同一句） */
+    static final String PUBLIC_REPLY_FALLBACK =
+            "这块读不到。取数失败了，我不给你编一个数出来。";
+
+    /** B 更冷版：处置类拒绝（"请封禁这个 IP"） */
+    static final String PUBLIC_REPLY_ACTION_REFUSAL =
+            "别指望我封谁。我提议，执行要过流程。\n"
+            + "公开面上一律不执行处置：匿名不可触发，模型也不参与拍板。";
+
+    /**
+     * 站点/人物介绍类问题的确定性判据（"这个网站是干嘛的""你是谁"）。
+     *
+     * <p>它<b>复用</b>既有思路而不是另造一套意图分类：与
+     * {@link #publicQuestionNeedsInternalEventData(String)} 一样是"两条窄正则同时命中才算"，
+     * 宁可漏判（漏了就走正常的公开知识库问答），也不误判（误判会把概念题答成站点简介）。
+     *
+     * <p>刻意<b>不</b>把裸"你"当主体：否则"你觉得 OWASP 是什么"会被判成自我介绍。
+     * 自指必须是一个完整短语（你是谁 / 你能做什么），站点指代必须同时问"是什么/干什么"。
+     */
+    private static final Pattern PUBLIC_INTRO_SUBJECT =
+            Pattern.compile("(网站|站点|这个站|本站|这个页面|这个界面|这个博客|这里|监测中心|笔记|安全运营台)");
+
+    /** 自指短语：必须整句就是"在问我是谁/我能做什么"，不接受"你觉得…"这种前置主语 */
+    private static final Pattern PUBLIC_INTRO_SELF =
+            Pattern.compile("(你是谁|你叫什么|你是什么人|你是干嘛|你是干什么|你做什么|你是做什么的|"
+                    + "你能做什么|你会做什么|你可以做什么|你是机器人|你是 ?AI|介绍一下你|介绍下你|自我介绍)");
+
+    private static final Pattern PUBLIC_INTRO_ASK =
+            Pattern.compile("(干嘛|干什么|做什么|是什么|干啥|有啥用|有什么用|能做什么|可以做什么|怎么用|介绍)");
+
+    private boolean publicSiteIntroQuestion(String q) {
+        if (q == null || q.isBlank()) {
+            return false;
+        }
+        String text = unwrapPublicQuestion(q);
+        if (PUBLIC_INTRO_SELF.matcher(text).find()) {
+            return true;
+        }
+        return PUBLIC_INTRO_SUBJECT.matcher(text).find() && PUBLIC_INTRO_ASK.matcher(text).find();
+    }
 
     /** "问题依赖内部事件数据"时的正文：如实说明语义、原因与可替代问法 */
     private String publicInternalDataRefusal() {
@@ -660,6 +782,34 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             + "怕拿不准就写 emotionTo=\"normal\"、action=\"idle\"、lineId=\"\" —— 绝不编造剪辑名或台词 id。";
 
     /**
+     * 公开面<b>上屏直答</b>（JSON 的 {@code reply} 字段）的写法约束 + 站点事实卡。
+     *
+     * <p>为什么必须单独一段、而且必须放在 JSON 字段说明的<b>紧后面</b>：人格提示词
+     * （{@code prompts/persona-public.txt}，被 {@code PersonaPromptTest} 逐字节钉住，改不得）
+     * 要求"只输出一个 JSON 对象"，并且会让她用戏剧化口吻说话。这一段是<b>更靠近输出格式</b>
+     * 的那一层，负责把"上屏的是 reply、不是 JSON、不是研判工单"讲清楚；
+     * 事实卡则负责堵住"站点事实模型不知道就只能说依据不足"这个死胡同。
+     *
+     * <p><b>声明顺序有讲究</b>：它被 {@link #PUBLIC_ANALYST_GUARDRAILS} 引用，
+     * 静态字段按声明顺序初始化 ⇒ 必须声明在它之前。
+     */
+    private static final String PUBLIC_ANALYST_REPLY_RULES =
+            "【上屏直答 reply 的写法】访客在页面上看到的**全部文字**就是 reply；"
+            + "attackType / severity / confidence / evidence / reason 只用于内部校验与留痕，不会上屏。"
+            + "(1) 2~4 句纯文本，先结论后条件，短句，单句约 40 字，允许换行。"
+            + "(2) 不复述数字、不复述置信度与评分、不粘贴知识库原文、不写免责声明与口径宣言。"
+            + "(3) 绝不出现这些内部痕迹：state=、unknown=true、generatedBy=、结论生成方式、多智能体、"
+            + "调度员、模型判定、严重度、攻击类型、置信度、依据不足。"
+            + "(4) 用第一人称「我」，克制；不卖萌、不寒暄、不反问、不宣布处置结论。"
+            + "(5) 支撑不足就直说「这块读不到」，绝不编数字、绝不编事实。"
+            + "【本站的公开事实卡】只能按这四条说，不得扩写："
+            + "① 监测中心＝真实的告警与拦截记录，IP 已打码；"
+            + "② AI 问答＝只答安全概念与防御做法；"
+            + "③ 笔记＝这套系统怎么搭起来的、哪里踩过坑；"
+            + "④ 处置＝我只提议，执行要过流程，公开面不执行任何处置。"
+            + "本站是站主一个人搭起来的安全运营台。";
+
+    /**
      * 公开面专用的系统提示（硬约束段）。
      *
      * <p>它与内部 ANALYST 的提示词有本质区别：内部要"研判定级"，公开只"解释 + 防御建议"，
@@ -680,7 +830,9 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             + "⑤ 公开演示只做解释、原理、研判思路与防御建议，不给针对具体目标的处置动作。"
             + "必须只输出一个 JSON 对象（不要 markdown 代码块、不要多余文字），字段固定为："
             + "{\"attackType\":\"知识点名称\",\"confidence\":0~1,\"severity\":\"INFO\","
-            + "\"evidence\":[\"片段中的原句\"],\"recommendation\":\"防御建议或研判思路\",\"unknown\":false,\"reason\":\"判断依据\"}。"
+            + "\"evidence\":[\"片段中的原句\"],\"recommendation\":\"防御建议或研判思路\",\"unknown\":false,"
+            + "\"reason\":\"判断依据\",\"reply\":\"给访客看的那段话（纯文本）\"}。"
+            + PUBLIC_ANALYST_REPLY_RULES
             + PUBLIC_ANALYST_DECISION_RULES;
 
     /**
@@ -926,6 +1078,16 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             String recommendation = clip(n.path("recommendation").asText(""), 400);
             String reason = clip(n.path("reason").asText(""), 400);
 
+            // ===== 公开面：她的直答（reply 字段）=====
+            // 【2026-10-17 直答化】访客上屏的是这一段自由文本，不是下面的研判渲染。
+            // 为什么仍要求模型输出整份 JSON：severity/confidence/evidence 的代码层校验
+            // （公开面强制 INFO、claim 有 IP 却无引用即降级）是既有 fail-closed 护栏，
+            // 拆掉它等于让"声明了具体来源却没引用"重新变成可能。校验照旧，只是上屏换人。
+            if (publicKnowledgeOnly) {
+                String replyText = clip(n.path("reply").asText(""), 600).trim();
+                LAST_PUBLIC_REPLY.set(replyText.isEmpty() ? null : replyText);
+            }
+
             // ===== T14：情绪决策（只在公开面构建；内部研判面一个字不动）=====
             // 逐字段白名单校验，【只丢弃字段、不整条作废】：整条判失败会把一份有用的文字结论
             // 一起扔掉（返回 null ⇒ state=model-failed），代价过大；而"就地猜一个值再播"会让她
@@ -958,6 +1120,8 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                     // ⇒ 又变回静默失败。模型给的情绪若合法仍然保留（她可以边"依据不足"边有表情），
                     // 但 fallbackUsed 置真，前端会如实标注。
                     LAST_DECISION.set(buildDecision(n, evidence, reason, true, "INPUT_INSUFFICIENT"));
+                    // 公开面上屏状态：这条仍是"没有结论"，正文由 reply（或 B 路兜底）承担
+                    LAST_PUBLIC_STATE.set("input-insufficient");
                 }
                 return verdictText;
             }
@@ -966,6 +1130,8 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             // 头部只写"结论生成方式"的人类可读说明，不再重复 state，避免一个响应解析出两个状态。
             sb.append("> state=model\n\n");
             if (publicKnowledgeOnly) {
+                // 机读状态走专门通道：上屏正文里不再出现 state=（那是给机器的，不是给她念的）
+                LAST_PUBLIC_STATE.set("model");
                 sb.append("> 输入类型识别：**公开知识问答** —— 公开面只解释、不取证，")
                   .append("不读取内部事件数据、不做事件定级。\n\n");
             } else if (conceptQuestion) {
@@ -1344,6 +1510,9 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 "【公开演示】未调用 SecurityActionTools / 未写审计 / 未登记封禁记录。",
                 System.currentTimeMillis() - start, true);
         bodies.put(AgentRole.RESPONDER, body);
+        // 上屏正文（B 更冷版）：拒绝就是拒绝，不给"内部会怎么走"的流程说明（那是流水单）
+        LAST_PUBLIC_REPLY.set(PUBLIC_REPLY_ACTION_REFUSAL);
+        LAST_PUBLIC_STATE.set("rule-based");
         return step;
     }
 

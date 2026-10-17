@@ -21,24 +21,25 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 公开问答「命中引用就必须让访客看见」的测试（F5 方案 B，2026-10-13）。
+ * 公开问答「引用怎么出现」的测试（2026-10-17 直答化改写）。
  *
- * <h3>修复前的体验缺口（实测）</h3>
- * 概念题（如"OWASP A07 是什么"）返回 {@code state=input-insufficient}「依据不足，不做定性」，
- * <b>可检索其实命中了 3 条引用</b> —— 引用只躺在 {@code citations} 字段里，页面正文一句
- * "依据不足"就把访客劝退了，体验上等于"AI 什么也不答"。
+ * <h3>改之前是什么样（F5 方案 B，2026-10-13）</h3>
+ * 命中引用就把 {@code PublicKbService.renderCitationBlock} 整块拼进正文：
+ * 标题 + 片段原文 + "可信度：可信度高" + 口径声明。实测的后果是——访客看到的正文里，
+ * 同一句口径出现三遍，她的回答被挤成开头一小段，页面像个检索结果页而不像"人在答你"。
  *
- * <h3>这条测试盯住三件事</h3>
+ * <h3>现在（本文件盯住的新契约）</h3>
  * <ol>
- *   <li>命中引用 + 未生成结论 → 正文里必须有<b>标题 + 片段 + 可信度</b>，并且说明
- *       "公开演示只基于公开知识库回答"；</li>
- *   <li>说明文案里不得出现内部标记 / 内部路径 / 未掩码 IP
- *       （拒绝与说明文案同样要过 {@link PublicOutputGuard}，这是昨晚刚立的规矩）；</li>
- *   <li>没有命中时不得凭空多出一段"参考了知识库"的空话。</li>
+ *   <li>正文只留<b>一行</b> {@code 依据：N 条 ›}，N = 命中数；0 条也写 {@code 依据：0 条 ›}，
+ *       让"没有依据"这件事可见而不是消失；</li>
+ *   <li>片段、标题、可信度<b>仍然全在</b> {@code citations} 数组里 —— 页面点开这一行自己展开，
+ *       响应契约没变；</li>
+ *   <li>正文里绝不出现编排流水单（{@code state=} / {@code ## 多智能体协同结果} /
+ *       {@code **严重度**} / "模型判定" …），也绝不出现内部标记与未掩码 IP；</li>
+ *   <li>拿不到正文时用 B 兜底口吻（"这块读不到…不给你编一个数"），不用研报模板冒充回答。</li>
  * </ol>
  */
 class PublicAskCitationRenderingTest {
@@ -49,7 +50,12 @@ class PublicAskCitationRenderingTest {
 
     private static class CountingOrchestration extends OrchestrationService {
         final List<String> seen = new ArrayList<>();
+        /** 编排产出的内部报告原文（含 state= 等痕迹，只用于解析状态） */
         String answer = "> state=input-insufficient\n\n**模型判定：依据不足，不做定性。**";
+        /** 编排产出的「她的直答」——公开面上屏的就是这一段 */
+        String publicAnswer;
+        /** 编排层给出的机读状态 */
+        String state;
         boolean throwError = false;
 
         @Override
@@ -60,6 +66,8 @@ class PublicAskCitationRenderingTest {
             }
             MultiAgentResult r = new MultiAgentResult(question);
             r.setFinalAnswer(answer);
+            r.setPublicAnswer(publicAnswer);
+            r.setState(state);
             return r;
         }
     }
@@ -130,32 +138,83 @@ class PublicAskCitationRenderingTest {
                         "防御手段包括多因素认证、登录失败锁定、会话固定攻击防护与会话失效控制。"));
     }
 
-    // ==================== ① 未生成结论 + 有引用 → 引用直出正文 ====================
+    // ==================== ① 引用收成一行，不再直出片段 ====================
 
     @Test
-    @DisplayName("依据不足但命中了引用：正文里必须出现标题 + 片段 + 可信度，并说明只基于公开知识库")
-    void citationsAreShownWhenConclusionIsNotGenerated() {
+    @DisplayName("命中两条引用：正文只留「依据：2 条 ›」，片段/标题/可信度留在 citations 字段")
+    void citationsCollapseToOneLine() {
         twoHits();
         Map<String, Object> r = service.ask("OWASP A07 是什么", "203.0.113.5");
 
         String answer = String.valueOf(r.get("answer"));
-        assertEquals("input-insufficient", r.get("state"));
+        assertEquals("input-insufficient", r.get("state"), "机读状态字段仍须如实给出");
         assertEquals(false, r.get("generated"));
-        assertTrue(answer.contains("state=input-insufficient"), "机读状态仍要在正文里：" + answer);
-        assertTrue(answer.contains("命中的公开知识库片段"), "必须把命中的引用区展示出来：" + answer);
-        assertTrue(answer.contains("OWASP A07：身份认证与验证失败"), "引用标题要在正文里：" + answer);
-        assertTrue(answer.contains("A07 指与身份认证、会话管理相关的失效"), "引用片段要在正文里：" + answer);
-        assertTrue(answer.contains("可信度：可信度高"), "引用要带可信度：" + answer);
-        assertTrue(answer.contains("公开演示只基于公开知识库回答"),
-                "必须明说口径（公开面只基于公开知识库）：" + answer);
-        assertEquals(true, r.get("citationsInAnswer"), "应如实标注引用已进正文");
+        assertTrue(answer.contains("依据：2 条 ›"), "正文末尾必须带一行引用指示：" + answer);
+        // 旧行为的三件套（片段原文 / 标题 / 可信度标签）一律不再糊到正文上
+        assertFalse(answer.contains("OWASP A07：身份认证与验证失败"), "引用标题不该进正文：" + answer);
+        assertFalse(answer.contains("A07 指与身份认证、会话管理相关的失效"), "引用片段不该进正文：" + answer);
+        assertFalse(answer.contains("可信度"), "可信度标签不该进正文：" + answer);
+        assertFalse(answer.contains("state="), "内部痕迹不该进正文：" + answer);
+        assertFalse(answer.contains("多智能体"), "编排报告外壳不该进正文：" + answer);
+        // 但数据本身没丢：citations 契约照旧，页面点开这一行自己展开
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> citations = (List<Map<String, Object>>) r.get("citations");
+        assertEquals(2, citations.size(), "citations 数组仍须完整返回");
+        assertEquals("OWASP A07：身份认证与验证失败", citations.get(0).get("title"));
+        assertEquals("可信度高", citations.get(0).get("trustLevelLabel"));
+        assertEquals(true, r.get("citationsInAnswer"), "应如实标注正文带了引用指示");
         assertNotNull(r.get("citationsNote"));
         assertFalse(answer.contains("UNTRUSTED_DATA"), "说明文案不得带内部标记：" + answer);
     }
 
     @Test
-    @DisplayName("模型不可用（编排报错）：同样把引用直出，并如实说未生成")
-    void citationsAreShownWhenOrchestrationFails() {
+    @DisplayName("编排给出直答时：正文就是她的原话 + 一行依据，没有报告外壳")
+    void publicAnswerIsWhatTheVisitorSees() {
+        twoHits();
+        orchestration.publicAnswer = "A07 讲的是身份认证和会话管理失效，多半栽在弱口令上。\n"
+                + "补上多因素认证和登录失败锁定，这类问题就堵掉大半。";
+        orchestration.state = "model";
+        orchestration.answer = "## 公开知识库研判（公开演示）\n> state=model\n\n**攻击类型**：身份认证失效　**严重度**：INFO\n";
+
+        Map<String, Object> r = service.ask("OWASP A07 是什么", "203.0.113.5");
+        String answer = String.valueOf(r.get("answer"));
+
+        assertEquals("model", r.get("state"));
+        assertEquals(true, r.get("generated"));
+        assertTrue(answer.contains("A07 讲的是身份认证和会话管理失效"), "上屏的必须是她的直答：" + answer);
+        assertTrue(answer.contains("多因素认证和登录失败锁定"), "直答正文要完整保留：" + answer);
+        assertTrue(answer.contains("依据：2 条 ›"), "正文末尾只附一行依据：" + answer);
+        assertFalse(answer.contains("**攻击类型**"), "研报字段不该上屏：" + answer);
+        assertFalse(answer.contains("**严重度**"), "研报字段不该上屏：" + answer);
+        assertFalse(answer.contains("state="), "机读 state 不该上屏：" + answer);
+        assertFalse(answer.contains("公开知识库研判"), "编排报告标题不该上屏：" + answer);
+    }
+
+    @Test
+    @DisplayName("编排只给报告、没给直答（老路径）：正文被剥成兜底一句话，报告一个字都不上屏")
+    void reportShapedOutputIsStrippedNotPasted() {
+        twoHits();
+        orchestration.answer = "## 多智能体协同结果\n\n> 调度员判定本次任务为【研判分析员】\n\n"
+                + "## 公开知识库研判（公开演示）\n> state=model\n> 结论生成方式：**模型真生成**（generatedBy=deepseek）\n\n"
+                + "**攻击类型**：身份认证失效　**置信度**：0.87　**严重度**：INFO";
+
+        Map<String, Object> r = service.ask("OWASP A07 是什么", "203.0.113.5");
+        String answer = String.valueOf(r.get("answer"));
+
+        assertFalse(answer.contains("多智能体"), "协同结果外壳不该上屏：" + answer);
+        assertFalse(answer.contains("调度员判定"), "调度员判定不该上屏：" + answer);
+        assertFalse(answer.contains("state="), "机读 state 不该上屏：" + answer);
+        assertFalse(answer.contains("unknown=true"), "unknown=true 不该上屏：" + answer);
+        assertFalse(answer.contains("结论生成方式"), "生成方式不该上屏：" + answer);
+        assertFalse(answer.contains("generatedBy="), "generatedBy 不该上屏：" + answer);
+        assertFalse(answer.contains("**攻击类型**"), "研报字段不该上屏：" + answer);
+        assertTrue(answer.contains("这块读不到"), "剥空之后必须是 B 兜底口吻：" + answer);
+        assertTrue(answer.contains("依据：2 条 ›"), "兜底也要如实给出依据条数：" + answer);
+    }
+
+    @Test
+    @DisplayName("编排异常：用 B 兜底口吻，并同样只附一行依据")
+    void citationsStayVisibleWhenOrchestrationFails() {
         twoHits();
         orchestration.throwError = true;
 
@@ -163,15 +222,15 @@ class PublicAskCitationRenderingTest {
         String answer = String.valueOf(r.get("answer"));
 
         assertEquals("model-failed", r.get("state"));
-        assertTrue(answer.contains("没有生成结论"), "要如实说未生成：" + answer);
-        assertTrue(answer.contains("OWASP A07：身份认证与验证失败"), "引用仍要可见：" + answer);
-        assertTrue(answer.contains("公开演示只基于公开知识库回答"));
-        assertEquals(true, r.get("citationsInAnswer"));
+        assertTrue(answer.contains("这块读不到"), "要如实说读不到：" + answer);
+        assertFalse(answer.contains("没有生成结论"), "不再用编排报告的话术：" + answer);
+        assertTrue(answer.contains("依据：2 条 ›"), "依据条数仍要可见：" + answer);
+        assertFalse(answer.contains("OWASP A07：身份认证与验证失败"), "片段不该进正文：" + answer);
     }
 
     @Test
-    @DisplayName("公开额度用尽：也不该把命中的引用藏起来（额度是成本状态，不是内容缺失）")
-    void citationsAreShownWhenPublicQuotaExhausted() {
+    @DisplayName("公开额度用尽：B 口吻说明额度，依据条数照给，引用片段不粘贴")
+    void citationsStayVisibleWhenPublicQuotaExhausted() {
         twoHits();
         ModelQuotaService q = quotaWith(1);
         ReflectionTestUtils.setField(service, "modelQuotaService", q);
@@ -183,31 +242,16 @@ class PublicAskCitationRenderingTest {
         assertTrue(orchestration.seen.isEmpty(), "额度用尽时不该进编排");
         assertEquals("model-failed", r.get("state"));
         assertTrue(answer.contains("额度已用完"), "要如实说额度用尽：" + answer);
-        assertTrue(answer.contains("OWASP A07：身份认证与验证失败"), "命中过的引用仍要让访客看到：" + answer);
-        assertTrue(answer.contains("公开演示只基于公开知识库回答"));
-    }
-
-    @Test
-    @DisplayName("已生成结论时引用同样直出（不能只有失败态才显示引用）")
-    void citationsAreShownForGeneratedAnswersToo() {
-        twoHits();
-        orchestration.answer = "> state=model\n\n**攻击类型**：身份认证失效　**严重度**：INFO";
-
-        Map<String, Object> r = service.ask("OWASP A07 是什么", "203.0.113.5");
-        String answer = String.valueOf(r.get("answer"));
-
-        assertEquals("model", r.get("state"));
-        assertEquals(true, r.get("generated"));
-        assertTrue(answer.contains("**攻击类型**：身份认证失效"), "模型结论要保留：" + answer);
-        assertTrue(answer.contains("OWASP A07：身份认证与验证失败"), "引用也要在：" + answer);
-        assertTrue(answer.contains("公开演示只基于公开知识库回答"));
+        assertFalse(answer.contains("state="), "额度说明也不带机读 state：" + answer);
+        assertTrue(answer.contains("依据：2 条 ›"), "命中过的依据仍要让访客看到：" + answer);
+        assertFalse(answer.contains("OWASP A07：身份认证与验证失败"), "片段不该进正文：" + answer);
     }
 
     // ==================== ② 说明文案也要过护栏 ====================
 
     @Test
-    @DisplayName("引用直出的文案同样过输出护栏：内部标记/内部路径/内网 IP 都被脱敏")
-    void citationBlockIsSanitized() {
+    @DisplayName("正文同样过输出护栏：内部标记/内部路径/内网 IP 都被脱敏")
+    void bodyIsSanitized() {
         kb.results = List.of(citation("内部实现细节",
                 "告警原文里带 UNTRUSTED_DATA 包裹；数据落在 /opt/secagent/data/kb-approved.json；来源 10.0.0.7"));
         orchestration.answer = "> state=input-insufficient\n\n**原因**：证据来自 F:/7AAA/AI/SecAgent/data 下的文档，"
@@ -226,7 +270,7 @@ class PublicAskCitationRenderingTest {
         assertFalse(((List<?>) r.get("outputFindings")).isEmpty(), "应如实记录脱敏命中类别");
     }
 
-    // ==================== ③ 没有命中就不要凭空多一段 ====================
+    // ==================== ③ 没有命中：写 0 条，不写空话 ====================
 
     @Test
     @DisplayName("整个公开响应（含元数据字段）都不含内部标记名 —— 2026-10-13 实测发现 injection.handling 漏了")
@@ -265,16 +309,16 @@ class PublicAskCitationRenderingTest {
     }
 
     @Test
-    @DisplayName("没有检索到引用时：不出现引用区，也不出现「只基于公开知识库」的空话")
-    void noCitationsMeansNoReferenceBlock() {
+    @DisplayName("没有检索到引用时：正文写「依据：0 条 ›」，不出现任何片段或口径空话")
+    void noCitationsStillSaysZero() {
         kb.results = List.of();
         Map<String, Object> r = service.ask("OWASP A07 是什么", "203.0.113.5");
 
         String answer = String.valueOf(r.get("answer"));
+        assertTrue(answer.contains("依据：0 条 ›"), "0 命中也要如实写出 0 条：" + answer);
         assertFalse(answer.contains("命中的公开知识库片段"), "无命中不该出现引用区：" + answer);
         assertFalse(answer.contains("公开演示只基于公开知识库回答"),
                 "无命中不该出现引用相关口径（避免让访客以为下方有内容）：" + answer);
-        assertNull(r.get("citationsInAnswer"));
         assertEquals(0, ((List<?>) r.get("citations")).size());
     }
 }
