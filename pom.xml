@@ -263,6 +263,16 @@
             <!-- Maven 编译器插件，配置 Lombok 注解处理器 -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <systemPropertyVariables>
+                        <!-- 审计写入在测试期走同步，避免与 JUnit @TempDir 清理竞争（Windows 偶发，曾三次卡住发版） -->
+                        <xk.audit.sync>1</xk.audit.sync>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
                 <configuration>

@@ -47,12 +47,11 @@ class UserTokenServiceTest {
     }
 
     @AfterEach
-    void tearDown() throws InterruptedException {
+    void tearDown() {
         SelfIdentity.end();
         /* 审计写入由守护线程异步完成（每行打开-写-关闭）。测试结束前必须等它把队列排空，
            否则 JUnit 删 @TempDir 的那一刻线程可能正好在写文件，Windows 会报
            "Failed to delete temp directory"——这个偶发失败今晚已经两次卡住后端发版。 */
-        Thread.sleep(300L);
     }
 
     private UserTokenService newService(String plainTokenOrNull, String auditFile) {

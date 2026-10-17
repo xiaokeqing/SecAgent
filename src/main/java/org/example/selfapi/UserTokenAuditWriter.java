@@ -44,6 +44,14 @@ public class UserTokenAuditWriter {
     private static final int QUEUE_CAPACITY = 4096;
 
     private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+
+    /** 测试期同步写开关（maven-surefire 设 -Dxk.audit.sync=1）：请求线程直接落盘。 */
+    private static final boolean SYNC_WRITE = "1".equals(System.getProperty("xk.audit.sync"));
+
+    /** 只给测试用：置位后 write() 直接丢弃。生产代码永不调用（默认 false）。 */
+    private static volatile boolean halted;
+    /** 只给测试用：判断「没有写入在途」（队列空且写线程不在写）。 */
+    private static volatile boolean inFlight;
     private final AtomicBoolean started = new AtomicBoolean(false);
 
     /** 为空 = 不落盘。volatile：configure 在启动期写，写线程读 */
@@ -73,11 +81,18 @@ public class UserTokenAuditWriter {
     public void write(String event, String result, String reason, String ipMasked, Integer tokenLen,
                       Integer failCount, Long retryAfter, String conversationIdHash,
                       Integer round, Integer quotaUsed, String state) {
+        if (halted) {
+            return;                       /* 测试收尾阶段：目录即将被删，不再产生写入 */
+        }
         String line = toJson(event, result, reason, ipMasked, tokenLen, failCount, retryAfter,
                 conversationIdHash, round, quotaUsed, state);
         if (file == null) {
             // 未配置落盘：只打日志（INFO 级便于本地调试；生产配了文件就不会刷日志）
             logger.info("SELF-AUDIT {}", line);
+            return;
+        }
+        if (SYNC_WRITE) {
+            writeLine(line);          /* 测试期：同步写，不留异步在途 */
             return;
         }
         if (!queue.offer(line)) {
@@ -136,6 +151,52 @@ public class UserTokenAuditWriter {
         return sb.toString();
     }
 
+    /** 测试用：停止/恢复写入（生产不调用）。 */
+    public static void setHalted(boolean v) {
+        halted = v;
+    }
+
+    /** 测试用：队列空且在途写为 0（最多等 ms 毫秒）。 */
+    public static boolean awaitIdle(long ms) {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms);
+        while (System.nanoTime() < end) {
+            if (inFlight) {
+                sleepQuiet(5L);
+                continue;
+            }
+            return true;
+        }
+        return !inFlight;
+    }
+
+    private static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** 单行落盘：每行「打开→写→flush→关闭」，任何时刻都不持有已打开的文件句柄。 */
+    private void writeLine(String line) {
+        String target = file;
+        if (target == null) {
+            return;
+        }
+        Path p = Path.of(target);
+        if (p.getParent() != null && !Files.isDirectory(p.getParent())) {
+            return;
+        }
+        try (BufferedWriter w = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+            w.write(line);
+            w.newLine();
+            w.flush();
+        } catch (Exception e) {
+            logger.warn("自用登录面审计写入失败（继续运行，不阻断请求）：{}", e.getMessage());
+        }
+    }
+
     private void startWriter() {
         if (!started.compareAndSet(false, true)) {
             return;
@@ -168,11 +229,11 @@ public class UserTokenAuditWriter {
                    换来的是**任何时刻都不持有已打开的文件句柄**。
                    为什么必须这样：Windows 上残留句柄会让 JUnit @TempDir 清理失败
                    （"Failed to delete temp directory"），曾两次把后端发版卡在 mvn package。 */
-                try (BufferedWriter w = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
-                        StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
-                    w.write(line);
-                    w.newLine();
-                    w.flush();
+                inFlight = true;
+                try {
+                    writeLine(line);
+                } finally {
+                    inFlight = false;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
