@@ -45,10 +45,6 @@ public class UserTokenAuditWriter {
 
     private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
     private final AtomicBoolean started = new AtomicBoolean(false);
-    /** 最后一次成功写入的纳秒时刻；空闲超过 IDLE_CLOSE_NANOS 就关句柄（见 loop()）。 */
-    private final java.util.concurrent.atomic.AtomicLong lastWriteNanos =
-            new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
-    private static final long IDLE_CLOSE_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(3);
 
     /** 为空 = 不落盘。volatile：configure 在启动期写，写线程读 */
     private volatile String file;
@@ -150,49 +146,39 @@ public class UserTokenAuditWriter {
     }
 
     private void loop() {
-        BufferedWriter writer = null;
         while (true) {
             try {
                 String line = queue.poll(1, TimeUnit.SECONDS);
                 if (line == null) {
-                    if (writer != null) {
-                        writer.flush();
-                        /* 队列空超过 IDLE_CLOSE_SECONDS 就关掉句柄：
-                           ① 生产上审计一天最多几百条，长时间占用文件句柄没有收益；
-                           ② Windows 上打开的句柄会让临时目录删不掉（测试 @TempDir 清理偶发
-                              "Failed to delete temp directory"，曾把一次发布卡掉）。
-                           下一条到达时会重新打开（APPEND，不丢内容）。 */
-                        if (System.nanoTime() - lastWriteNanos.get() > IDLE_CLOSE_NANOS) {
-                            closeQuietly(writer);
-                            writer = null;
-                        }
-                    }
                     continue;
                 }
-                if (writer == null) {
-                    String target = file;
-                    if (target == null) {
-                        continue;
-                    }
-                    Path p = Path.of(target);
-                    if (p.getParent() != null) {
-                        Files.createDirectories(p.getParent());
-                    }
-                    writer = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
-                            StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                String target = file;
+                if (target == null) {
+                    continue;
                 }
-                writer.write(line);
-                writer.newLine();
-                // 每条都 flush：审计的价值在"出事时确实有"，而这里一天最多几百条
-                writer.flush();
-                lastWriteNanos.set(System.nanoTime());
+                Path p = Path.of(target);
+                /* ★不创建父目录：父目录不存在就说明「这条日志该落的地方已经没了」
+                   （测试里 @TempDir 已清理、或运维改过路径）。此时重建目录会让清理永远失败
+                   （DirectoryNotEmptyException），所以直接丢这一行 —— 审计允许丢，不允许把
+                   一个已经删掉的目录重新变非空。 */
+                if (p.getParent() != null && !Files.isDirectory(p.getParent())) {
+                    continue;
+                }
+                /* ★每行「打开→写→flush→关闭」：审计一天最多几百条，这点系统调用可以忽略，
+                   换来的是**任何时刻都不持有已打开的文件句柄**。
+                   为什么必须这样：Windows 上残留句柄会让 JUnit @TempDir 清理失败
+                   （"Failed to delete temp directory"），曾两次把后端发版卡在 mvn package。 */
+                try (BufferedWriter w = Files.newBufferedWriter(p, StandardCharsets.UTF_8,
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+                    w.write(line);
+                    w.newLine();
+                    w.flush();
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
             } catch (Exception e) {
                 logger.warn("自用登录面审计写入失败（继续运行，不阻断请求）：{}", e.getMessage());
-                closeQuietly(writer);
-                writer = null;
                 try {
                     Thread.sleep(1000L);
                 } catch (InterruptedException ie) {
@@ -203,14 +189,4 @@ public class UserTokenAuditWriter {
         }
     }
 
-    private static void closeQuietly(BufferedWriter writer) {
-        if (writer == null) {
-            return;
-        }
-        try {
-            writer.close();
-        } catch (Exception ignored) {
-            // 关闭失败无需处理：下一次写入会重新打开
-        }
-    }
 }
