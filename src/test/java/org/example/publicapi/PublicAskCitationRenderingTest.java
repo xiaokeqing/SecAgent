@@ -171,8 +171,10 @@ class PublicAskCitationRenderingTest {
     @DisplayName("编排给出直答时：正文就是她的原话 + 一行依据，没有报告外壳")
     void publicAnswerIsWhatTheVisitorSees() {
         twoHits();
-        orchestration.publicAnswer = "A07 讲的是身份认证和会话管理失效，多半栽在弱口令上。\n"
-                + "补上多因素认证和登录失败锁定，这类问题就堵掉大半。";
+        // 首句合规（可见 8 个字）⇒ 这一条同时钉住「已合规就一个字符都不动」：
+        // 后处理只在首句超长时才动刀（见 PublicAnswerShaperTest）
+        orchestration.publicAnswer = "A07 是认证失效。多半栽在弱口令上，要补多因素认证和登录失败锁定。\n"
+                + "补上这两样，这类问题就堵掉大半。";
         orchestration.state = "model";
         orchestration.answer = "## 公开知识库研判（公开演示）\n> state=model\n\n**攻击类型**：身份认证失效　**严重度**：INFO\n";
 
@@ -181,8 +183,9 @@ class PublicAskCitationRenderingTest {
 
         assertEquals("model", r.get("state"));
         assertEquals(true, r.get("generated"));
-        assertTrue(answer.contains("A07 讲的是身份认证和会话管理失效"), "上屏的必须是她的直答：" + answer);
-        assertTrue(answer.contains("多因素认证和登录失败锁定"), "直答正文要完整保留：" + answer);
+        assertTrue(answer.startsWith("A07 是认证失效。"), "首句本来就合规，必须原样上屏：" + answer);
+        assertTrue(answer.contains("要补多因素认证和登录失败锁定"), "直答正文要完整保留：" + answer);
+        assertEquals(null, r.get("openingCapped"), "没截断就不该打截断标记：" + answer);
         assertTrue(answer.contains("依据：2 条 ›"), "正文末尾只附一行依据：" + answer);
         assertFalse(answer.contains("**攻击类型**"), "研报字段不该上屏：" + answer);
         assertFalse(answer.contains("**严重度**"), "研报字段不该上屏：" + answer);

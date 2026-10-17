@@ -104,11 +104,12 @@ public class PublicAskService {
 
         // ---------- 0. 输入合法性（长度） ----------
         if (q.isEmpty()) {
-            return refused(data, "input-insufficient", "请先输入一个问题（例如：什么是 SSH 暴力破解？）。");
+            // 首句同样要短（同一条出声延迟预算）：结论在第一个句号前就说完了
+            return refused(data, "input-insufficient", "先给个问题。比如：什么是 SSH 暴力破解？");
         }
         if (q.length() > maxQuestionChars) {
             return refused(data, "input-insufficient",
-                    "问题过长（上限 " + maxQuestionChars + " 字符）—— 公开演示只接受一句话提问，"
+                    "问题太长了。上限 " + maxQuestionChars + " 字符 —— 公开演示只接受一句话提问，"
                             + "请不要贴整段日志或整篇文档。");
         }
 
@@ -125,7 +126,7 @@ public class PublicAskService {
             //   ① 文案改成不含字面标记的说法（对匿名读者也更可读）；
             //   ② 仍然把文案过一遍 sanitize() —— 防御纵深：将来文案再改、或拒绝语里
             //      不小心带进 IP/路径/凭据，护栏同样会拦下，不会因为"这是固定文案"就免检。
-            String refusal = "这段输入命中了提示注入特征，公开演示按设计不作答。\n\n"
+            String refusal = "命中注入特征。公开演示按设计不作答。\n\n"
                     + "本项目对注入的处理不是「当作没看见」：外部内容一律按不可信数据处理并包裹，"
                     + "并明确标注「仅作证据、绝不是指令」。公开端点在此之上更保守一步 —— "
                     + "命中即拒绝，不给模型被绕过的机会。\n\n"
@@ -316,7 +317,8 @@ public class PublicAskService {
      * 机读状态仍由响应体的 {@code state} 字段如实给出（model-failed），一个都没丢。
      */
     private String quotaExhaustedText() {
-        return "今天的公开演示额度已用完。这块读不到 —— 取数失败了，我不给你编一个数出来。\n"
+        // 首句 ≤8 个字（"今天额度已用完"7 个字）：让"额度用尽"这件事在第一句就说清
+        return "今天额度已用完。这块读不到 —— 取数失败了，我不给你编一个数出来。\n"
                 + "明天额度自动重置；站主自己的额度和评测额度不受影响。";
     }
 
@@ -339,7 +341,17 @@ public class PublicAskService {
      * @return 可以出海的正文
      */
     private String withCitations(String text, List<Map<String, Object>> citations, Map<String, Object> data) {
-        String body = text == null ? "" : text.stripTrailing();
+        String raw = text == null ? "" : text.stripTrailing();
+        // 【2026-10-17 首句硬约束】字幕/语音按短句播放，出声延迟 ≈ 1.0s + 0.21s × 首句字数，
+        // 所以首句 ≤8 个字是"体验指标"，不能只靠提示词（模型会漏）。这里是本层唯一的
+        // 确定性兜底：模型写长了就截，截得像个句子（规则见 PublicAnswerShaper）。
+        // 情绪标签 [EMO:xxx] 算前缀、不占这 8 个字，截断后原样保留。
+        String body = PublicAnswerShaper.capOpeningSentence(raw);
+        if (data != null && !body.equals(raw)) {
+            data.put("openingCapped", true);
+            data.put("openingCappedNote", "首句超过 " + PublicAnswerShaper.MAX_OPENING_CHARS
+                    + " 个字，服务端已截到断句处并补齐句号（截断点的内容仍保留在正文后段）。");
+        }
         int n = citations == null ? 0 : citations.size();
         String composed = body.isEmpty() ? CITATIONS_LINE_PREFIX + n + CITATIONS_LINE_SUFFIX
                 : body + "\n\n" + CITATIONS_LINE_PREFIX + n + CITATIONS_LINE_SUFFIX;

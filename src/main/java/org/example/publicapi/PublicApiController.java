@@ -1980,6 +1980,10 @@ public class PublicApiController {
         m.put("endTime", src.get("endTime"));
         m.put("title", src.get("title"));
         m.put("ruleName", src.get("ruleName"));
+        // ATT&CK 技术编号（只新增字段，既有键一个不动）：由规则名查 AttackTechniqueMapper 的
+        // 有序映射表。映射不到时明确给 null —— 前端据此显示"未归类"，而不是拿 type/source
+        // 再猜一次（AlertType 本身就是关键词粗分类，二次猜测只会把没把握包装成有把握）。
+        m.put("attck", AttackTechniqueMapper.toMap(asString(src.get("ruleName"))));
         m.put("srcIp", policy().display(asString(src.get("srcIp"))));
         // 公开面【刻意】恒为 null：srcGeo 的内部形状是「国家|省|城市|ASN|机构」（GeoIpInfo.describe()），
         // 逐条输出它等于把"某个攻击者属于哪个机构"搬上公网页面；公开面的地理口径只有聚合

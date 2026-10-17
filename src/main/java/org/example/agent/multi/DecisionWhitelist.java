@@ -47,6 +47,17 @@ public class DecisionWhitelist {
     /** 契约里"只出字幕不出声"的合法值：空串不是错误 */
     public static final String NO_LINE = "";
 
+    /**
+     * 情绪标签协议（{@code [EMO:xxx]}）的唯一词表 —— 与白名单 JSON 的 {@code emotions} 同源同值。
+     *
+     * <p>提示词里写"标签只能取这几个值"时引用这里，而不是各写一份字面量：写死在提示词里的
+     * 词表会与资源漂移，而漂移的表现是"她演错情绪"，很难从日志看出来。
+     * 反查来源：{@link #isEmotion(String)} 校验的就是资源里的 {@code emotions} 数组，
+     * 两份一致性由 {@code PersonaPromptTest} 钉住。
+     */
+    public static final List<String> EMOTION_VALUES = List.of(
+            "angry", "blush", "disappointed", "happy", "normal", "sad", "sided_surprised", "sided_thinking");
+
     @Value("${app.decision.whitelist:classpath:kurisu/decision-whitelist.json}")
     private Resource resource;
 
