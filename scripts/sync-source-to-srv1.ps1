@@ -47,6 +47,20 @@ $targetFull = $targetFull.Trim()
 $sha = (git rev-parse --short $targetFull).Trim()
 Step "0/4" ("目标提交 = " + $sha + " / HEAD = " + $headShort)
 
+# ---- 0.5) 快路径：srv1 直连 GitHub（2026-10-17 实测 1.4s，比 bundle 省 5MB 上传）----
+$direct = $false
+$probeCmd = "timeout 25 sudo env GIT_TERMINAL_PROMPT=0 git -C " + $RemoteDir + " fetch origin main >/dev/null 2>&1; sudo git -C " + $RemoteDir + " rev-parse --short FETCH_HEAD"
+$pout = @(ssh -o BatchMode=yes $SshHost $probeCmd 2>$null)
+$pf = if ($pout.Count -gt 0) { ([string]$pout[$pout.Count - 1]).Trim() } else { "" }
+if ($pf.Length -ge 7 -and $targetFull.StartsWith($pf)) {
+    $direct = $true
+    Step "1-3/4" ("srv1 直连 GitHub 已拿到 " + $pf + "（跳过 bundle 中转）")
+} else {
+    Warn ("srv1 直连 GitHub 未拿到目标提交（" + $pf + "），退化走 bundle")
+}
+
+if (-not $direct) {
+
 # ---- 1) 打 bundle ----
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $bundle = Join-Path $env:TEMP ("secagent-" + $stamp + ".bundle")
@@ -71,6 +85,9 @@ if ($fetched.Length -lt 7) { Fail ("没能确认服务器侧提交（输出：" 
 if (-not $targetFull.StartsWith($fetched)) {
     Warn ("服务器 FETCH_HEAD(" + $fetched + ") 与目标(" + $sha + ") 不一致 —— main 可能落后，请核对")
 }
+}  # end if (-not $direct)
+
+
 
 # ---- 4) 可选：对齐 HEAD（只移动指针，工作区不动）----
 if ($AlignHead) {
