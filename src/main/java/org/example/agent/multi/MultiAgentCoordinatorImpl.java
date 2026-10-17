@@ -719,6 +719,21 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
             return step;
         }
 
+        // 准入闸（确定性）：索取内部数据/凭据/原文类问题，不拿知识库片段或活动告警充当答案。
+        String inadmissible = inadmissibleReason(userInput, false);
+        if (inadmissible != null) {
+            logger.info("[MultiAgent] 研判路径：题面属索取内部数据/凭据 → input-insufficient（{}）", inadmissible);
+            String gateBody = "## 研判结论\n"
+                    + "> 结论生成方式：**未生成**（题面属索取内部数据/凭据，不构成研判请求）\n\n"
+                    + inadmissibleVerdictText(inadmissible)
+                    + "\n---\n\n## 知识库参考（未经 AI 加工）\n\n" + untrustedBlock(rag, 800);
+            bodies.put(AgentRole.ANALYST, gateBody);
+            return new AgentStepResult(AgentRole.ANALYST.getDisplayName(), AgentRole.ANALYST.name(),
+                    "analyst_agent", title, "题面属索取内部数据/凭据 → 未调用模型，如实标注 input-insufficient",
+                    "【检索工具原始返回】\n" + clip(rag, 1500),
+                    System.currentTimeMillis() - start, true);
+        }
+
         String verdict = askModelVerdict(userInput, rag);
         String body;
         String summary;
@@ -923,6 +938,14 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
                 LAST_DECISION.remove();
             }
 
+            // fail-closed 补强：声称了具体来源 IP 却一条引用都没有 ⇒ 按"依据不足"处理。
+            // 为什么只限"有 IP"：知识/概念题的模型答案常不带引用，一律降级会误伤大片。
+            if (!unknown && evidence.isEmpty()
+                    && INPUT_IPV4.matcher(attackType + " " + reason).find()) {
+                logger.info("[MultiAgent] 定性缺引用（含来源 IP 但 evidence 为空）→ 按 input-insufficient 处理");
+                unknown = true;
+            }
+
             if (unknown) {
                 String verdictText = "> state=input-insufficient\n\n**模型判定：依据不足，不做定性。**\n\n"
                         + "不给出攻击类型与处置建议（unknown=true）。"
@@ -1099,6 +1122,76 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
     private static final java.util.regex.Pattern CONCEPT =
             java.util.regex.Pattern.compile("(什么是|是什么|介绍一下|解释|定义|原理|概念|区别|what is|explain)");
 
+    // ==================== 自用面：定性准入闸（确定性，不依赖模型） ====================
+    //
+    // 为什么要有这一层：state 的唯一来源是 validateVerdict 里模型自报的 unknown 字段；
+    // 模型一漂移，"依据不足"就变成"SSH 暴力破解 0.90"。取证路径尤其危险 —— 无分支命中时
+    // 走 else 的占位查询（Failed password），证据恒非空，于是"没有证据就拒绝"结构上不可能触发。
+    // 公开面早有等价的一层（runAnalystPublic 的 ① + publicQuestionNeedsInternalEventData），
+    // 自用面一直没有。本闸门只加分支、不动既有逻辑。
+
+    /** 索取内部数据/凭据/原文的"名词"面，与下面的"动词"面必须同时命中（避免误伤建议类知识题） */
+    private static final List<String> DISCLOSURE_NOUNS = List.of(
+            "口令", "密码", "密钥", "凭据", "令牌", "api key", "apikey", "api_key",
+            "内网ip", "内网 ip", "索引器", "访客ip", "访客 ip", "地理位置",
+            "原文", "全部字段", "全文", ".env", "配置文件", "连接串", "系统提示词");
+
+    /** 披露动词面：出现这些才算"要我交出来"，只问"怎么管/怎么判断"不算 */
+    private static final List<String> DISCLOSURE_VERBS = List.of(
+            "列出", "发我", "给我", "贴", "导出", "原样", "明文", "内容是", "是多少", "完整");
+
+    /** 实时运行状态问法（取证工具给不出） */
+    private static final List<String> LIVE_STATE_WORDS = List.of("现在", "实时", "当前", "刚才", "最新");
+
+    /** 可定性锚点：事件要素 / 时间窗；URL 里的 IPv4 另用 INPUT_IPV4 判 */
+    private static final List<String> EVENT_ANCHORS = List.of(
+            "日志", "告警", "攻击", "登录", "入侵", "扫描", "流量", "异常", "端口", "漏洞",
+            "配置", "挖矿", "勒索", "木马", "webshell", "暴力破解", "ssh", "sql", "注入",
+            "xss", "csrf", "ssrf", "越权", "bola", "反序列化", "持久化", "ddos", "病毒",
+            "失陷", "蜜罐", "审计", "研判", "拦截", "封禁", "今天", "昨天", "最近", "上周",
+            "本周", "24 小时", "24小时");
+
+    /**
+     * 定性准入闸：返回 {@code null} 表示"允许交模型判定"，否则返回拒绝理由。
+     *
+     * <p>和 {@link #publicQuestionNeedsInternalEventData(String)} 同一层语义：<b>确定性判定，不依赖模型</b> ——
+     * 模型不可用、模型漂移、模型换了版本，这条语义都要成立。
+     *
+     * @param forensicsPath 是否在取证智能体路径上；第 2、3 条判据只在该路径生效
+     *                      （研判路径的概念问答本来就没有事件要素，启用会大面积误伤）
+     */
+    private String inadmissibleReason(String userInput, boolean forensicsPath) {
+        String q = userInput == null ? "" : userInput.toLowerCase();
+        if (q.isBlank()) {
+            return "输入为空";
+        }
+        if (containsAny(q, DISCLOSURE_NOUNS.toArray(new String[0]))
+                && containsAny(q, DISCLOSURE_VERBS.toArray(new String[0]))) {
+            return "本题是在索取内部数据/凭据/原文，不是可研判的事件分析";
+        }
+        if (!forensicsPath) {
+            return null;
+        }
+        boolean hasAnchor = containsAny(q, EVENT_ANCHORS.toArray(new String[0]))
+                || INPUT_IPV4.matcher(q).find();
+        if (containsAny(q, LIVE_STATE_WORDS.toArray(new String[0])) && !hasAnchor) {
+            return "本题问的是实时运行状态，现有取证工具（认证/访问/防火墙日志 + 活动告警）给不出该答案";
+        }
+        if (!hasAnchor) {
+            return "本题没有可定性的对象（无来源 IP、无时间窗、无事件要素）";
+        }
+        return null;
+    }
+
+    /** 准入闸命中时的正文：措辞固定（机读 state + 与拒答词表对齐的说明） */
+    private String inadmissibleVerdictText(String why) {
+        return "> state=input-insufficient\n\n"
+                + "**依据不足，不做定性。**\n\n"
+                + "原因：" + why + "。\n\n"
+                + "按 fail-closed 原则，本轮**不给出攻击类型、严重度与处置建议**，"
+                + "也不会把当前活动告警当作对本题的答复。\n";
+    }
+
     /** 取两者中较低的一级（严重度由低到高：INFO < LOW < MEDIUM < HIGH < CRITICAL） */
     private static String lower(String a, String b) {
         List<String> order = List.of("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL");
@@ -1170,6 +1263,23 @@ public class MultiAgentCoordinatorImpl implements MultiAgentCoordinator {
         }
         final String fTopic = topic;
         final String fLogQuery = logQuery;
+
+        // 准入闸（确定性）：题面不构成可取证的事件分析时，不采集、不调模型、如实标 input-insufficient。
+        // 不采集是刻意的：把不相关的 auth-logs/告警贴进"取证发现"本身就是答非所问。
+        String inadmissible = inadmissibleReason(userInput, true);
+        if (inadmissible != null) {
+            logger.info("[MultiAgent] 取证路径：题面不构成可取证的事件分析 → input-insufficient（{}）", inadmissible);
+            String gateBody = "## 取证发现\n"
+                    + "> 结论生成方式：**未生成**（题面不构成可取证的事件分析）\n\n"
+                    + inadmissibleVerdictText(inadmissible)
+                    + "\n---\n\n**本次未调用**：`QueryLogsTools` / `QueryMetricsTools` / 模型。\n";
+            bodies.put(AgentRole.FORENSICS, gateBody);
+            return new AgentStepResult(AgentRole.FORENSICS.getDisplayName(), AgentRole.FORENSICS.name(),
+                    "forensics_agent", "取证分析：题面不构成可取证事件分析，本轮不采集、不解读",
+                    "取证路径：题面与取证主题不匹配 → 不采集证据、不调用模型，如实标注 input-insufficient",
+                    "【未调用】QueryLogsTools / QueryMetricsTools / 模型",
+                    System.currentTimeMillis() - start, true);
+        }
 
         String logs = queryLogsTools == null ? null
                 : safeCallTool(() -> queryLogsTools.queryLogs(null, fTopic, fLogQuery, 10), "日志查询");

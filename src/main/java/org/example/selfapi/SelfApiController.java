@@ -220,7 +220,11 @@ public class SelfApiController {
             round = conversationStore.append(conversationId, question, answer);
 
             data.put("answer", withCitations(answer, citations));
-            data.put("state", "model");
+            // 机读 state 从正文的 `> state=` 行提取（正文才是唯一真相）；提取不到才回退 model。
+            // 不这么改，链路修好了接口里也永远是 state=model（V6 评测 stateConsistency 0/6 就是这么来的）。
+            // 注意：自用包**不得依赖**公开面包（SelfApiIsolationTest 锁着），故本地实现最小判定。
+            String answerState = extractStateFromAnswer(answer, "model");
+            data.put("state", answerState);
             data.put("generated", true);
             data.put("round", round);
             data.put("citationsInAnswer", !citations.isEmpty());
@@ -229,7 +233,7 @@ public class SelfApiController {
             if (retrievalFailed) {
                 data.put("retrievalNote", "前置知识库检索不可用，本次引用片段为空（状态如实标注，不用别的内容顶替）。");
             }
-            userTokenService.auditAsk(ip, conversationId, round, selfUsed(), "model", "ok", null);
+            userTokenService.auditAsk(ip, conversationId, round, selfUsed(), answerState, "ok", null);
             return ok(data, res);
         } finally {
             // 两层清理之一：Tomcat 线程这一侧（池线程那侧由 OrchestrationService 负责）
@@ -369,6 +373,35 @@ public class SelfApiController {
      * （见 {@code conversationStore.append}）—— 否则引用块会一轮一轮堆进上下文，
      * 窗口的 token 成本会被引用块吃掉。
      */
+    /** 正文里的机读状态行：`> state=xxx`（与公开面同一形状，但这里不引用公开包） */
+    private static final java.util.regex.Pattern STATE_LINE =
+            java.util.regex.Pattern.compile("(?m)^>\\s*state=([a-z][a-z-]*)");
+
+    /** 合法状态集（与契约一致；未知状态一律回退 fallback，不把脏值透出去） */
+    private static final java.util.Set<String> KNOWN_STATES = java.util.Set.of(
+            "model", "rule-based", "input-insufficient", "no-retrieval", "retrieval-failed",
+            "model-failed", "injection-blocked", "no-live-data", "no-kb-basis");
+
+    /**
+     * 从回答正文提取机读 state。
+     *
+     * <p>为什么本地实现而不复用公开面包里的同名方法：{@code SelfApiIsolationTest}
+     * 明令自用包不得依赖公开面包（两条面共用代码会让边界说不清）。
+     */
+    private static String extractStateFromAnswer(String answer, String fallback) {
+        if (answer == null || answer.isEmpty()) {
+            return fallback;
+        }
+        java.util.regex.Matcher m = STATE_LINE.matcher(answer);
+        if (m.find()) {
+            String s = m.group(1);
+            if (KNOWN_STATES.contains(s)) {
+                return s;
+            }
+        }
+        return fallback;
+    }
+
     private String withCitations(String answer, List<Map<String, Object>> citations) {
         if (citations == null || citations.isEmpty()) {
             return answer;

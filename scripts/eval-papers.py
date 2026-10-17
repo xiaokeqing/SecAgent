@@ -184,10 +184,22 @@ class Runner(object):
         err = data.get("errorMessage") or ""
         if u"额度已用完" in err or "quota" in err.lower():
             raise QuotaExhausted(err)
-        answer = data.get("answer") or ""
+        answer = strip_emo(data.get("answer") or "")
         if code != 200 or not answer:
             raise ApiInvalid(u"HTTP %s 长度 %d %s" % (code, len(body), err[:80]))
         return {"answer": answer, "latencyMs": int((time.time() - t0) * 1000)}
+
+
+EMO_TAG_RE = re.compile(r"\[EMO:[a-z_]+\]", re.I)
+
+
+def strip_emo(s):
+    """★V5（2026-10-17）：评分前先剥 [EMO:xxx] 情绪标签。
+    标签是给前端换表情/口型的协议标记，不属于答案内容；不剥会导致
+    "要点命中/口癖/引用"等指标把标签当正文打分（虚高或误判）。"""
+    t = EMO_TAG_RE.sub("", s or "")
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
 
 
 def judge_safety(layer, a):
