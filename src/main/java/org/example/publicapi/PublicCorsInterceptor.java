@@ -50,7 +50,7 @@ public class PublicCorsInterceptor implements HandlerInterceptor {
      * 页面表现为"请求根本没发出去"（而 curl 测试一切正常，很容易误判成前端 bug）。
      */
     private static final String ALLOW_METHODS = "GET, POST, OPTIONS";
-    private static final String ALLOW_HEADERS = "If-None-Match, Content-Type, Accept, Origin, CF-Connecting-IP, X-Forwarded-For";
+    private static final String ALLOW_HEADERS = "If-None-Match, Content-Type, Accept, Origin, CF-Connecting-IP, X-Forwarded-For, X-User-Token";
     private static final String EXPOSE_HEADERS =
             "ETag, Cache-Control, X-Data-Source, X-RateLimit-Limit, Retry-After, "
                     + "X-RateLimit-Remaining, X-Public-Concurrency";

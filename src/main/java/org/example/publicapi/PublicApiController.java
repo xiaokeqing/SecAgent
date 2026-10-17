@@ -309,6 +309,33 @@ public class PublicApiController {
         return policy().displayText(CredentialStructure.hidePasswords(assets().scrub(s)));
     }
 
+    /**
+     * 这次公开问答是不是站主本人发的（决定要不要走「每 IP 每分钟 N 次」那道闸）。
+     *
+     * <p>判据只有一条：请求头 {@code X-User-Token} 通过自用面令牌校验。
+     * 其余一切情况（没带、带错、服务未配置、校验抛异常）都判成<b>不是</b> ——
+     * 宁可把站主当访客限一次流，也不能因为校验出问题把匿名限流整条打开。
+     */
+    private boolean isOwnerAsk(HttpServletRequest req, String ip) {
+        if (req == null) {
+            return false;
+        }
+        String token = req.getHeader("X-User-Token");
+        if (token == null || token.isBlank()) {
+            return false;
+        }
+        if (ownerTokenService == null || !ownerTokenService.configured()) {
+            return false;
+        }
+        try {
+            org.example.selfapi.UserTokenService.Result r = ownerTokenService.check(ip, token);
+            return r != null && r.ok();
+        } catch (RuntimeException e) {
+            logger.debug("站主令牌校验失败，按匿名处理：{}", e.toString());
+            return false;
+        }
+    }
+
     /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
     @Autowired
     private PublicAuditReader auditReader;
@@ -327,6 +354,19 @@ public class PublicApiController {
     @Autowired
     @Qualifier("publicAskRateLimiter")
     private PublicAskRateLimiter publicAskRateLimiter;
+
+    /**
+     * 站主令牌校验器（用于「登录后问答不限次」）。
+     *
+     * <p>为什么公开面要认识自用面的令牌：站主登录后问的是<b>同一个公开问答端点</b>
+     * （响应结构与访客完全一致，展示层不用分叉），只要求"别把站主当匿名访客限流"。
+     * 换一条自用端点会让前端多一套响应契约，而这条需求只值一个头部判断。
+     *
+     * <p>失败一律回落匿名路径（{@code false}），<b>不在这里拒绝请求</b> —— 令牌坏了就是访客，
+     * 该走限额就走限额；这条路径上任何异常都不得让问答本身不可用。
+     */
+    @Autowired(required = false)
+    private org.example.selfapi.UserTokenService ownerTokenService;
 
     /**
      * 公开知识库检索的限流器。
@@ -380,7 +420,9 @@ public class PublicApiController {
         String ip = clientIp(req);
 
         // ① 限流（每 IP 每分钟 N 次）—— 先于一切上游动作，包括并发登记
-        if (!publicAskRateLimiter.allow(ip)) {
+        //    站主带有效 X-User-Token ⇒ 跳过这一道（他不限次），其余访客照旧。
+        boolean owner = isOwnerAsk(req, ip);
+        if (!owner && !publicAskRateLimiter.allow(ip)) {
             return tooMany(res, publicAskRateLimiter, "公开问答请求过于频繁（每 IP 每分钟 "
                     + publicAskRateLimiter.limitPerMinute() + " 次），请稍后再试");
         }
@@ -414,9 +456,16 @@ public class PublicApiController {
             // 一次性返回：公开问答的响应永不被边缘缓存（它是"这一次提问"的结果）
             res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
             res.setHeader("X-Data-Source", "PUBLIC_ASK");
-            res.setHeader("X-RateLimit-Limit", String.valueOf(publicAskRateLimiter.limitPerMinute()));
-            res.setHeader("X-RateLimit-Remaining",
-                    String.valueOf(Math.max(0, publicAskRateLimiter.remaining(ip))));
+            if (owner) {
+                // 说清楚：这次没记限额。数字别写成假的"6"，否则日志里会以为被限过。
+                res.setHeader("X-RateLimit-Limit", "owner-unlimited");
+                res.setHeader("X-RateLimit-Remaining", "owner-unlimited");
+                res.setHeader("X-Owner-Ask", "1");
+            } else {
+                res.setHeader("X-RateLimit-Limit", String.valueOf(publicAskRateLimiter.limitPerMinute()));
+                res.setHeader("X-RateLimit-Remaining",
+                        String.valueOf(Math.max(0, publicAskRateLimiter.remaining(ip))));
+            }
 
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("code", 200);
