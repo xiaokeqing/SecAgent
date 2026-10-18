@@ -104,7 +104,7 @@ public class PublicApiController {
      * <p>取两倍 TTL。max-age 本身**不再单独硬编码** —— 它必须与 {@code app.public-api.cache-seconds}
      * （快照 TTL）一致，否则会出现"快照已经 45 秒旧、却告诉缓存 15 秒"这种自相矛盾。
      */
-    private static final int CACHE_ALIAS_SWR_SECONDS = 90;
+    private static final int CACHE_ALIAS_SWR_SECONDS = 300;
 
     /**
      * 别名 ETag 的序列化器：把 Map 键排序 ⇒ ETag 只取决于内容、与插入顺序无关。
@@ -740,7 +740,7 @@ public class PublicApiController {
     // ==================== ① 聚合端点：一次请求拿三块（弱网收益最大的一处） ====================
 
     /**
-     * <b>内容页聚合端点</b>：一次请求拿回 {@code alerts + geo + honeypot} 三块。
+     * <b>内容页聚合端点</b>：一次请求拿回 {@code alerts + geo + honeypot + audit + health} 五块。
      *
      * <h3>为什么要有它（2026-10-16 站主弱网实测的直接产物）</h3>
      * 手机热点（无代理）下首屏 TTFB ≈ 6s，而首屏要发 3 个公开请求
@@ -760,7 +760,15 @@ public class PublicApiController {
      * （{@link Snapshot#load} 在 loader 返回后打点），所以"这份聚合数据有多旧"是如实值。
      *
      * <p>缓存 / ETag / 429 / CORS 与其它端点走**同一条通路**：同一个 {@code ok(...)}、
-     * 同一个别名口径（{@code max-age=45, stale-while-revalidate=90} + 按数据内容算的稳定 ETag）。
+     * 同一个别名口径（{@code max-age=45, stale-while-revalidate=300} + 按数据内容算的稳定 ETag）。
+     *
+     * <h3>2026-10-18 扩到五块的原因（站主实测）</h3>
+     * 首屏英雄数字里最有说服力的两个数（「累计封禁」「护栏拦截」）来自 {@code /audit}，
+     * {@code /status/} 页要的构建 SHA / 运行时长来自 {@code /health} —— 这两块原先都不在聚合里，
+     * 于是弱网下首屏仍然要多付两次「客户端 → CF → 源站」的路程（实测每次 0.9~8 秒）。
+     * 并进来后首屏只剩「HTML + 一个聚合请求」，且仍只消耗一份限流额度。
+     * {@code audit} 与单端点 {@code /audit} 的 data **逐字段相同**（同一个 Snapshot、同一个 ship）；
+     * {@code health} 是本控制器内可自证的那部分（构建自述 + 运行时长），不跨控制器取数。
      */
     @GetMapping({"/home", "/home.js"})
     public ResponseEntity<Map<String, Object>> home(HttpServletRequest req, HttpServletResponse res) {
@@ -781,7 +789,43 @@ public class PublicApiController {
         out.put("alerts", ship(alertsCache.get(cacheSeconds, this::buildAlerts)));
         out.put("geo", ship(geoCache.get(cacheSeconds, this::buildGeo)));
         out.put("honeypot", ship(honeypotCache.get(cacheSeconds, this::buildHoneypot)));
+        /* audit 是**可选块**：它的上游是处置审计日志，坏了也只该少这一块。
+           理由（2026-10-18 实测）：聚合端点的全部价值是"一次请求把首屏填满"，
+           所以任何单个子块失败都**不许**把整次请求变成 500——否则一个封禁库读不到，
+           连告警列表和地图一起黑屏，比没有聚合更糟。取不到就不放这个键，
+           前端发现 `home.data.audit` 缺失会自己补拉一次 /api/public/audit（它有自己的错误态文案）。 */
+        try {
+            out.put("audit", ship(auditCache.get(cacheSeconds, this::buildAudit)));
+        } catch (RuntimeException e) {
+            logger.warn("聚合里的 audit 块取不到（首屏降级为四块，前端会补拉 /audit）：{}", e.getMessage());
+        }
+        out.put("health", buildHealthBlock());
         return out;
+    }
+
+    /**
+     * 聚合里的 {@code health} 块：只放**本控制器能自证**的事实，不跨控制器调 {@code /api/health}。
+     *
+     * <p>口径与 {@code /api/health}、{@code /api/public/deploy} 一致：{@code build.*} 是
+     * <b>容器自述</b>（{@code selfReported=true}），不是独立证据；{@code runtime.*} 来自进程内
+     * {@code STARTED_AT_MS}，是真实的进程启动时刻。这样首屏/状态页不必再为一个版本号多打一次请求。
+     */
+    private Map<String, Object> buildHealthBlock() {
+        Map<String, Object> h = new LinkedHashMap<>();
+        h.put("status", source.available() ? "ok" : "degraded");
+        h.put("buildSha", buildSha);
+        h.put("sourceSha", buildSourceSha);
+        h.put("artifactMd5", buildArtifactMd5);
+        h.put("buildTime", buildTime);
+        h.put("selfReported", true);
+        Map<String, Object> rt = new LinkedHashMap<>();
+        rt.put("startedAt", Instant.ofEpochMilli(STARTED_AT_MS)
+                .atZone(ZoneId.systemDefault()).truncatedTo(ChronoUnit.SECONDS)
+                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+        rt.put("uptimeSeconds", Math.max(0, (System.currentTimeMillis() - STARTED_AT_MS) / 1000));
+        h.put("runtime", rt);
+        h.put("dataSource", source.available() ? "WAZUH_REAL" : "UNAVAILABLE");
+        return h;
     }
 
     // ==================== ①b 给 C2 面板线的两个只读端点 ====================

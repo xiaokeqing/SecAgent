@@ -99,8 +99,10 @@ class PublicApiCacheAliasTest {
                 .andExpect(jsonPath("$.cacheAgeSeconds").exists())
                 .andExpect(jsonPath("$.snapshotTtlSeconds").value(45))
                 // TTL 与快照同源（45s，> 站点 40s 轮询间隔）+ stale-while-revalidate
+                // 2026-10-18：SWR 90→300。理由：首屏数据"旧 5 分钟仍然可用"远好过"空屏等 8 秒"，
+                // 而 SWR 只影响**浏览器/边缘**在后台刷新期间用旧值的窗口，不改变服务端快照 TTL(45s)。
                 .andExpect(header().string("Cache-Control",
-                        "public, max-age=45, stale-while-revalidate=90"))
+                        "public, max-age=45, stale-while-revalidate=300"))
                 .andExpect(header().string("Access-Control-Allow-Origin", "*"))
                 .andExpect(header().doesNotExist("Vary"))
                 .andExpect(header().string("X-Content-Type-Options", "nosniff"))

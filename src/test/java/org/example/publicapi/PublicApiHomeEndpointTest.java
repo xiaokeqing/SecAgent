@@ -37,8 +37,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *   <li><b>逐字段一致</b>：{@code home.data.alerts} 与 {@code alerts.data} 必须<b>深度相等</b>
  *       （geo / honeypot 同理）—— 聚合端点不许"顺手改一个字段名"或漏一个字段；
  *       漏字段不会报错，只会让前端某个字段永远读不到，所以这条只能用断言钉住；</li>
- *   <li><b>一次请求拿三块</b>：一个 HTTP 请求返回三块 + 各自可用性；</li>
- *   <li><b>别名缓存口径不变</b>：{@code max-age=45, stale-while-revalidate=90} + 稳定 ETag +
+ *   <li><b>一次请求拿五块</b>：一个 HTTP 请求返回 alerts/geo/honeypot/audit/health 五块 + 各自可用性；</li>
+ *   <li><b>别名缓存口径不变</b>：{@code max-age=45, stale-while-revalidate=300} + 稳定 ETag +
  *       {@code nosniff} + {@code ACAO:*}（无 {@code Vary}）+ {@code snapshotAt} 三件套；</li>
  *   <li><b>取不到就如实说</b>：{@code deploy.release.available=false}（未配置发布文件）与
  *       {@code eval.available=false}（未配置评测报告）各有 reason，绝不用 0/启动时刻冒充；</li>
@@ -51,6 +51,10 @@ class PublicApiHomeEndpointTest {
 
     private PublicApiController controller;
     private PublicCorsInterceptor cors;
+
+    /** 审计块的数据目录（空目录 = 零封禁、零动作；不建任何假文件，避免污染其它断言） */
+    @org.junit.jupiter.api.io.TempDir
+    Path auditDir;
 
     @BeforeEach
     void setUp() {
@@ -79,6 +83,14 @@ class PublicApiHomeEndpointTest {
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
         ReflectionTestUtils.setField(controller, "source", source);
+
+        /* 2026-10-18：审计块进了聚合（home.data.audit）。这里必须给它一个**真实**的 reader，
+           不能留 null —— 留 null 会让 buildAudit 抛 NPE，而聚合的降级逻辑会把 audit 整块吞掉，
+           于是"逐字段一致"和"五块齐全"两条断言就变成在测一个没有 audit 的聚合。
+           dataDir 指向空目录：summary 全 0、blocks/actions 空列表 —— 既不抛也不编造。 */
+        PublicAuditReader audit = new PublicAuditReader();
+        ReflectionTestUtils.setField(audit, "dataDir", auditDir.toString());
+        ReflectionTestUtils.setField(controller, "auditReader", audit);
 
         cors = new PublicCorsInterceptor();
         ReflectionTestUtils.setField(cors, "allowedOriginsConfig",
@@ -110,6 +122,7 @@ class PublicApiHomeEndpointTest {
         JsonNode alerts = data("/api/public/alerts");
         JsonNode geo = data("/api/public/geo");
         JsonNode honeypot = data("/api/public/honeypot");
+        JsonNode audit = data("/api/public/audit");
         JsonNode home = data("/api/public/home");
 
         assertTrue(alerts.size() > 0, "单端点 alerts 不该是空对象（否则这条断言没有意义）");
@@ -121,6 +134,11 @@ class PublicApiHomeEndpointTest {
         assertEquals(honeypot, home.get("honeypot"),
                 "home.data.honeypot 必须与 honeypot.data 逐字段相同；差异="
                         + diff(honeypot, home.get("honeypot")));
+        // 2026-10-18：英雄数字里的「累计封禁 / 护栏拦截」来自 /audit，并进聚合后必须逐字段一致，
+        // 否则首屏会出现"聚合里有封禁数、点进处置页又变成另一套数"的两套口径。
+        assertEquals(audit, home.get("audit"),
+                "home.data.audit 必须与 audit.data 逐字段相同；差异="
+                        + diff(audit, home.get("audit")));
     }
 
     /** 逐字段差异定位（断言失败时要能一眼看出是哪个字段，不然只看到"两个大 JSON 不相等"） */
@@ -145,7 +163,7 @@ class PublicApiHomeEndpointTest {
     }
 
     @Test
-    @DisplayName("① 一次请求拿三块：三块齐全且各有 available 语义")
+    @DisplayName("① 一次请求拿五块：alerts/geo/honeypot/audit/health 齐全")
     void oneRequestReturnsAllThreeBlocks() throws Exception {
         String body = mvc().perform(get("/api/public/home.js"))
                 .andExpect(status().isOk())
@@ -156,17 +174,24 @@ class PublicApiHomeEndpointTest {
                 .andExpect(jsonPath("$.data.alerts.ipDisclosure").exists())
                 .andExpect(jsonPath("$.data.geo.ipDisclosure").exists())
                 .andExpect(jsonPath("$.data.honeypot.ipDisclosure").exists())
+                .andExpect(jsonPath("$.data.audit.ipDisclosure").exists())
+                .andExpect(jsonPath("$.data.audit.summary.blockTotal").exists())
+                .andExpect(jsonPath("$.data.health.status").exists())
+                .andExpect(jsonPath("$.data.health.selfReported").value(true))
+                .andExpect(jsonPath("$.data.health.buildSha").value("testsha"))
+                .andExpect(jsonPath("$.data.health.runtime.uptimeSeconds").exists())
                 .andReturn().getResponse().getContentAsString();
-        // 三块都必须在同一个响应体里（这就是"只付一次路程"的物证）
-        assertTrue(body.contains("\"alerts\"") && body.contains("\"geo\"") && body.contains("\"honeypot\""),
-                "聚合响应体必须同时含三块");
+        // 五块都必须在同一个响应体里（这就是"只付一次路程"的物证）
+        assertTrue(body.contains("\"alerts\"") && body.contains("\"geo\"") && body.contains("\"honeypot\"")
+                        && body.contains("\"audit\"") && body.contains("\"health\""),
+                "聚合响应体必须同时含五块");
     }
 
     @Test
     @DisplayName("① 别名口径与单端点一致：max-age=45 + SWR=90 + 稳定 ETag + nosniff + snapshotAt 三件套")
     void aggregateAliasKeepsCacheContract() throws Exception {
         String etag1 = mvc().perform(get("/api/public/home.js"))
-                .andExpect(header().string("Cache-Control", "public, max-age=45, stale-while-revalidate=90"))
+                .andExpect(header().string("Cache-Control", "public, max-age=45, stale-while-revalidate=300"))
                 .andExpect(header().string("Access-Control-Allow-Origin", "*"))
                 .andExpect(header().doesNotExist("Vary"))
                 .andExpect(header().string("X-Content-Type-Options", "nosniff"))
