@@ -445,10 +445,17 @@ public class TtsService {
      * 当长期资源用会过期；而且给前端链等于把计费账单与缓存控制权一并交出去。
      */
     private byte[] callCosyVoice(String text) {
-        String url = config.getBaseUrl() == null ? "" : config.getBaseUrl().trim();
-        if (url.isEmpty()) {
+        String base = config.getBaseUrl() == null ? "" : config.getBaseUrl().trim();
+        if (base.isEmpty()) {
             throw new TtsException(503, "CONFIG_INVALID", "未配置 CosyVoice 端点（APP_TTS_BASE_URL）");
         }
+        /* ★COSY-PATH：APP_TTS_BASE_URL 只填域名（https://dashscope.aliyuncs.com），
+           路径必须在这里拼；之前直接 POST 到根路径，上游回 404。
+           若以后把完整地址写进配置，不重复拼。 */
+        String url = base.endsWith("/api/v1/services/audio/tts/SpeechSynthesizer")
+                ? base
+                : (base.endsWith("/") ? base.substring(0, base.length() - 1) : base)
+                  + "/api/v1/services/audio/tts/SpeechSynthesizer";
         ObjectNode body = MAPPER.createObjectNode();
         body.put("model", config.getModel());
         ObjectNode input = body.putObject("input");
