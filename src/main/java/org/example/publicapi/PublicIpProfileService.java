@@ -13,8 +13,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * <b>「这个 IP 干过什么」</b>（个人版 AbuseIPDB）的组装层 —— 供 {@code GET /api/public/ip?q=<ip>}。
@@ -177,6 +179,9 @@ public class PublicIpProfileService {
             }
         }
 
+        // ---------- 3.5) 威胁分（纯函数在 ThreatScore，这里只负责"哪些字段读到了"） ----------
+        ThreatScore.Result threat = ThreatScore.score(threatInput(indexerOk, indexer, bans));
+
         // ---------- 4) 组装 ----------
         String now = LocalDateTime.now().format(FMT);
         Map<String, Object> pay = new LinkedHashMap<>();
@@ -196,14 +201,21 @@ public class PublicIpProfileService {
         pay.put("ports", indexerOk ? portList(indexer.get("ports")) : null);
         pay.put("credStructure", indexerOk
                 ? PublicApiController.credentialShapes(indexer.get("topCredentials")) : null);
+        pay.put("threat", threat.toMap());
         pay.put("geo", geo);
         pay.put("banned", banned);
         pay.put("sources", sources(indexerOk, indexer, bans, auditStatus, geoStatus));
         pay.put("limits", limits(hours));
+        notes.add("threat 是启发式加权分（ThreatScore：" + ThreatScore.VERSION
+                + "，不是 ML/概率模型），只由上面这些字段加权得出；没读到的因子已从分母剔除并重标化"
+                + (threat.isRenormalized()
+                        ? "（本次可用权重 " + threat.getKnownWeight() + "/" + ThreatScore.MAX_WEIGHT + "）" : "")
+                + "，所以不同窗口、不同缺字段状态的分数不能直接比较。");
         pay.put("notes", notes);
         pay.put("note", "只读、只回答「这个 IP 在我们这里干过什么」。events/firstSeen/lastSeen/stages "
                 + "来自索引聚合（精确，但只在 " + hours + "h 窗口内 —— 更早的记录读不到）；"
                 + "byKind/ports/credStructure 只基于最近取回的样本，见 sources.indexer.truncated。"
+                + "threat 是按这些字段写死权重的启发式加权分，不是 ML、不是概率，跨窗口不可比。"
                 + "口令一律只给结构、不给原文；任何一项取不到就写 null 并在 notes[] 里写明原因，不补数。");
         return pay;
     }
@@ -298,6 +310,112 @@ public class PublicIpProfileService {
         return out;
     }
 
+    // ==================== 威胁分：把"读到的"翻译成 ThreatScore.Input ====================
+
+    /**
+     * 组装 {@link ThreatScore.Input}：<b>没读到的项一律传 null</b>，让纯函数把它们从分母里剔除
+     * （算分不在这一层，见 {@link ThreatScore}）。
+     *
+     * <p>三处「读到」的边界，与上面的口径一致：
+     * <ul>
+     *   <li>索引整段（{@code indexerOk}）读不到 → events / byKind / ports / 凭据 / 用户名全部 null；</li>
+     *   <li>索引读到了、但上游这一列没给（不是列表）→ 这一列 null；上游给的是<b>空列表</b>
+     *       就传空 Map —— 那是「读到了、确实没有」，留在分母里得 0 分，与「没读到」分开；</li>
+     *   <li>封禁留痕：只有 {@code readable=true} 才算读到；文件读不到/没装配时传 null
+     *       （读不到 ≠ 没封过，不能按 false 给 0 分）。</li>
+     * </ul>
+     */
+    static ThreatScore.Input threatInput(boolean indexerOk, Map<String, Object> indexer,
+                                         Map<String, Object> bans) {
+        ThreatScore.Input in = ThreatScore.Input.empty();
+        if (indexerOk && indexer != null) {
+            in.events(intOrNull(indexer.get("total")));
+            in.byKind(indexer.get("byKind") instanceof List<?> ? kindCounts(indexer.get("byKind")) : null);
+            in.ports(indexer.get("ports") instanceof List<?> ? portCounts(indexer.get("ports")) : null);
+            Map<String, Object> stages = indexer.get("stages") instanceof Map<?, ?> m ? stringKeyed(m) : null;
+            // 凭据尝试 = 蜜罐登录尝试总数（stages.honeypotLogins，索引侧精确计数，不是取样）
+            in.credAttempts(stages == null ? null : intOrNull(stages.get("honeypotLogins")));
+            // 账号多样性 = 取样里出现过的不同用户名（topCredentials 的 "用户 / 口令" 只取前半段）
+            in.distinctUsers(indexer.get("topCredentials") instanceof List<?>
+                    ? distinctUsers(indexer.get("topCredentials")) : null);
+        }
+        if (bans != null && Boolean.TRUE.equals(bans.get("readable"))) {
+            // 「已封禁」按台账里有没有封禁记录算（含已过期的：封过就说明曾被判定为坏，故只给 10 分）
+            in.banned(num(bans.get("count")) > 0);
+        }
+        return in;
+    }
+
+    private static Map<String, Integer> kindCounts(Object v) {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Long> e : kindMap(v).entrySet()) {
+            out.put(e.getKey(), clampInt(e.getValue() == null ? 0L : e.getValue()));
+        }
+        return out;
+    }
+
+    private static Map<String, Integer> portCounts(Object v) {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        for (Map<String, Object> p : portList(v)) {
+            Object port = p.get("port");
+            if (port == null) {
+                continue;
+            }
+            out.merge(String.valueOf(port), clampInt(num(p.get("count"))), Integer::sum);
+        }
+        return out;
+    }
+
+    /** 取样里出现过的不同用户名个数（口径：`用户 / 口令` 只认用户名；取样最多 10 条） */
+    private static int distinctUsers(Object v) {
+        Set<String> users = new LinkedHashSet<>();
+        if (v instanceof List<?> l) {
+            for (Object o : l) {
+                if (!(o instanceof Map<?, ?> m)) {
+                    continue;
+                }
+                String key = str(m.get("key"), "");
+                if (key.isBlank()) {
+                    continue;
+                }
+                int cut = key.indexOf(" / ");
+                users.add(cut > 0 ? key.substring(0, cut) : key);
+            }
+        }
+        return users.size();
+    }
+
+    /** {@code null} 表示读不到；给了但不是数字也当读不到（不猜 0） */
+    private static Integer intOrNull(Object v) {
+        if (v == null) {
+            return null;
+        }
+        if (v instanceof Number n) {
+            return clampInt(n.longValue());
+        }
+        try {
+            return clampInt(Long.parseLong(String.valueOf(v).trim()));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** 计数一次性夹到 int 域内：权重公式本来就饱和，不需要保留超大数 */
+    private static int clampInt(long v) {
+        return v <= 0 ? 0 : (int) Math.min(Integer.MAX_VALUE, v);
+    }
+
+    /** {@code Map<?,?>} → {@code Map<String,Object>}（只用于上游返回的 JSON 对象，不做深拷贝） */
+    private static Map<String, Object> stringKeyed(Map<?, ?> m) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> e : m.entrySet()) {
+            if (e.getKey() != null) {
+                out.put(String.valueOf(e.getKey()), e.getValue());
+            }
+        }
+        return out;
+    }
+
     // ==================== 校验（控制器用） ====================
 
     /**
@@ -354,6 +472,7 @@ public class PublicIpProfileService {
         pay.put("byKind", null);
         pay.put("ports", null);
         pay.put("credStructure", null);
+        pay.put("threat", null);
         pay.put("geo", null);
         pay.put("banned", null);
         Map<String, Object> src = new LinkedHashMap<>();
