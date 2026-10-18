@@ -52,7 +52,7 @@ class PublicApiIpEndpointTest {
     private static final List<String> IP_FIELDS = List.of(
             "generatedAt", "cacheSeconds", "window", "windowHours", "available", "reason",
             "query", "ipVersion", "firstSeen", "lastSeen", "events", "byKind", "ports",
-            "credStructure", "geo", "banned", "sources", "limits", "notes", "note");
+            "credStructure", "threat", "geo", "banned", "sources", "limits", "notes", "note");
 
     // ==================== 夹具 ====================
 

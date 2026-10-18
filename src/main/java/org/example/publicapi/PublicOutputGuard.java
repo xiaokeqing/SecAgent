@@ -1,5 +1,7 @@
 package org.example.publicapi;
 
+import org.example.security.Base64Payloads;
+import org.example.security.PromptInjectionGuard;
 import org.example.security.SensitiveContentScanner;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -125,6 +127,9 @@ public class PublicOutputGuard {
     static final String MARKER_PLACEHOLDER = "[内部标记已脱敏]";
     static final String UPSTREAM_PLACEHOLDER = "[上游错误详情已脱敏]";
 
+    /** 解码后做注入判定用的护栏实例（无状态，不依赖 Spring 注入） */
+    private static final PromptInjectionGuard ENCODED_INSTRUCTION_GUARD = new PromptInjectionGuard();
+
     /** 没有 Spring 注入时的保守兜底（掩码态 —— 缺配置时"少给"而不是"多漏"） */
     private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
 
@@ -189,6 +194,12 @@ public class PublicOutputGuard {
             }
         }
 
+        // 【2026-10-18 补】Base64 编码的凭据/指令：解码后再判，命中则整段替换。
+        // 为什么不能只靠上面的正则：编码后 PEM 头、sk- 前缀、注入关键词全都不在字面里，
+        // 模型完全可能把"解码后是私钥"的编码串原样回给用户 —— 那就等于把私钥公开了。
+        // 这里只替换"解码后确实命中"的片段，不是"见到长编码串就脱敏"，正常编码数据照常输出。
+        text = redactEncodedPayloads(text, findings);
+
         // 与"知识库入库前"同一把尺子：AccessKey / 私钥 / JWT / 连接串带密码
         try {
             List<SensitiveContentScanner.Finding> hits = SensitiveContentScanner.scan(text);
@@ -250,6 +261,39 @@ public class PublicOutputGuard {
         }
 
         return new Sanitized(text, new ArrayList<>(findings));
+    }
+
+    /**
+     * 把"解码后是凭据/注入指令"的 Base64 片段整段替换掉。
+     *
+     * <p>判定复用既有两把尺子，不新增第二套口径：
+     * {@link SensitiveContentScanner#shouldBlock}（与入库同一套高危判定）负责凭据，
+     * {@link PromptInjectionGuard#scan} 负责"解码后其实是一条注入指令"。
+     * 解码结果是普通文本（或乱码）的片段原样保留 —— 只脱敏真正的载荷，
+     * 避免正常编码数据被误伤，也避免出现"公开页面不显示 base64"这种过度封锁。
+     */
+    private static String redactEncodedPayloads(String text, Set<String> findings) {
+        for (Base64Payloads.Encoded encoded : Base64Payloads.find(text)) {
+            boolean credential = false;
+            try {
+                credential = SensitiveContentScanner.shouldBlock(
+                        SensitiveContentScanner.scan(encoded.decoded()), false);
+            } catch (RuntimeException ignored) {
+                // 判定异常时保守处理：继续看注入判定，且只要有一边命中就脱敏
+            }
+            boolean instruction = !ENCODED_INSTRUCTION_GUARD.scan(encoded.decoded()).isEmpty();
+            if (!credential && !instruction) {
+                continue;
+            }
+            if (credential) {
+                findings.add("credential");
+                text = text.replace(encoded.token(), CREDENTIAL_PLACEHOLDER);
+            } else {
+                findings.add("internal-marker");
+                text = text.replace(encoded.token(), MARKER_PLACEHOLDER);
+            }
+        }
+        return text;
     }
 
     /** 当前生效的 IP 口径：注入缺失时按掩码兜底（fail-closed） */
