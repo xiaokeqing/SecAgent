@@ -312,6 +312,39 @@ app:
     say:
       per-ip-daily: ${APP_TTS_SAY_PER_IP_DAILY:30}              # 单 IP 每日自由文本合成次数（访客每问一句要念一次，所以比短语表松）
       global-daily: ${APP_TTS_SAY_GLOBAL_DAILY:300}             # 全局每日自由文本合成次数（成本闸；同一天里短语表仍可用到自己的 500）
+  # ===== 每日安全日报（A 生成器 / B 语音 / C 邮件）=====
+  # 【默认关】enabled=false：测试期不让定时任务乱跑；手动验证时把 APP_REPORT_ENABLED 设 true。
+  # 【产物】md/html/json/音频写到 dir（默认 data/reports，落在 .gitignore 的 data/* 下，不进版本库）。
+  #   每个数字都带出处（哪个服务方法 / 哪个窗口）；取不到写 null 并在「缺数据」一节点名，绝不补数。
+  # 【语音】音频走 TtsService.synthesize(String)：不经短语表、不吃公开日额度、只认 cosyvoice；
+  #   合成失败只记日志，日报本身照样生成（没有音频 ≠ 没有日报）。
+  # ⚠️ 与 APP_TTS_* 同一个坑：docker-compose.yml 的 environment 段必须显式透传这些键。
+  report:
+    enabled: ${APP_REPORT_ENABLED:false}
+    daily-cron: ${APP_REPORT_DAILY_CRON:0 10 8 * * *}          # 默认每天 08:10（本地时区见下方 zone）
+    dir: ${APP_REPORT_DIR:data/reports}                        # 产物目录（md/html/json/音频）
+    audio-enabled: ${APP_REPORT_AUDIO_ENABLED:true}            # 关掉只影响 mp3/wav，不影响文字日报
+    speech-max-chars: ${APP_REPORT_SPEECH_MAX_CHARS:120}       # 日语口语稿上限（与 app.tts.max-chars 同口径）
+    zone: ${APP_REPORT_ZONE:Asia/Shanghai}                     # cron 与"今天"的时区
+  # ===== 日报邮件订阅（可选，默认关）=====
+  # 【只在配置齐全时真发】enabled=true 且 host/port/username/password/from/to 全部非空；
+  #   否则一律走"落盘 .eml"分支（outbox-dir/daily-YYYY-MM-DD.eml，可手工发送），
+  #   并在 Result.note 里点名缺了哪几项 —— 不静默假装已发。
+  # 【凭据】只从环境变量读，绝不写默认值（写了等于把邮箱口令放进仓库）。
+  # 【to】逗号分隔多个收件人。JDK 自带 SMTP 会话（无第三方依赖；pom 里没有 jakarta.mail）。
+  mail:
+    enabled: ${APP_MAIL_ENABLED:false}
+    host: ${APP_MAIL_HOST:}
+    port: ${APP_MAIL_PORT:0}
+    username: ${APP_MAIL_USERNAME:}
+    password: ${APP_MAIL_PASSWORD:}
+    from: ${APP_MAIL_FROM:}
+    to: ${APP_MAIL_TO:}
+    ssl: ${APP_MAIL_SSL:false}                                 # 465 隐式 TLS 置 true
+    starttls: ${APP_MAIL_STARTTLS:true}                        # 587 端口 STARTTLS
+    timeout-seconds: ${APP_MAIL_TIMEOUT_SECONDS:15}
+    outbox-dir: ${APP_MAIL_OUTBOX_DIR:data/reports/outbox}
+    subject-prefix: "${APP_MAIL_SUBJECT_PREFIX:[安全日报] }"
   # ===== 公开面 IP 显示口径 + "永不公开"清单（站主 2026-10-14 拍板）=====
   # 【唯一开关】mask-ips 只被 PublicIpPolicy 读一次，再由它作用到【所有】公开端点 ——
   #   一处控制、一个口径来源，不会出现"某个端点自己判断掩不掩码"的第三种口径
