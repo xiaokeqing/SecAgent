@@ -836,6 +836,173 @@ public class WazuhService implements WazuhGateway {
         };
     }
 
+    // ==================== IP 画像（/api/public/ip；个人版 AbuseIPDB） ====================
+
+    /** IP 画像的样本上限：聚合口径在样本上做，样本大小如实写进 {@code sampled}/{@code truncated} */
+    static final int IP_ACTIVITY_SAMPLE = 300;
+
+    /**
+     * <b>IP 画像</b>（跨数据源汇总）—— 见 {@link org.example.integration.WazuhGateway#ipActivity(String, int)}。
+     *
+     * <h3>一条查询 + 一组聚合，而不是三段各查一次</h3>
+     * 与 {@link #storyEvents} 的取舍相反：那边要"每段各自限量"，是因为某段刷屏会让别段从时间轴上消失；
+     * 这里要的是<b>同一个来源的总量与分布</b>，三段共用一次查询反而不会割裂。
+     * 精确值（总条数、首末时间、各阶段条数）全部由聚合给出，<b>不受样本上限影响</b>；
+     * 只有"按行为分类 / 端口 / 口令"这三项在样本上统计，并在 {@code note} 里写清是样本口径 ——
+     * 不把样本数当总量（那正是最容易编数的地方）。
+     *
+     * <h3>三个刻意的边界</h3>
+     * <ol>
+     *   <li>{@code _source} 仍是 {@link #STORY_EVENT_FIELDS} 白名单：{@code data.password} /
+     *       {@code data.message} / {@code full_log} <b>不进本进程</b>。口令只从
+     *       {@code rule.description} 里按既有正则抽（与 {@link #honeypotSummary} 同一条路），
+     *       且只在 {@code topCredentials} 里给 publicapi 侧转成<b>结构</b>；</li>
+     *   <li>IP 条件与故事线<b>完全同一组</b>（{@code data.srcip} / {@code data.src_ip} 二者其一），
+     *       否则同一个 IP 在两个端点上会得到不同条数；</li>
+     *   <li>失败一律 {@code available=false} + 原因，<b>不返回 0</b>：「查不到」与「没有行为」
+     *       在公开页面上必须是两件事。</li>
+     * </ol>
+     */
+    @Override
+    public Map<String, Object> ipActivity(String srcIp, int windowHours) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        if (client == null) {
+            out.put("reason", "CLIENT_NOT_READY");
+            out.put("note", "Wazuh 客户端未初始化（未启用或初始化失败）");
+            return out;
+        }
+        String ip = srcIp == null ? "" : srcIp.trim();
+        if (ip.isEmpty()) {
+            out.put("reason", "INVALID_SRC");
+            out.put("note", "来源地址为空，未执行任何查询（不拿空条件去查全库）");
+            return out;
+        }
+        int hours = Math.max(1, Math.min(windowHours, 168));
+        int cap = IP_ACTIVITY_SAMPLE;
+        try {
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("size", cap);
+            body.put("track_total_hits", true);
+            body.put("sort", List.of(Map.of("@timestamp", "desc")));
+            body.put("_source", STORY_EVENT_FIELDS);
+            body.put("query", Map.of("bool", Map.of("filter", List.of(
+                    Map.of("range", Map.of("@timestamp", Map.of("gte", "now-" + hours + "h"))),
+                    Map.of("bool", Map.of("should", List.of(
+                                    Map.of("term", Map.of("data.srcip", ip)),
+                                    Map.of("term", Map.of("data.src_ip", ip))),
+                            "minimum_should_match", 1))))));
+            Map<String, Object> aggs = new LinkedHashMap<>();
+            aggs.put("first_ts", Map.of("min", Map.of("field", "@timestamp")));
+            aggs.put("last_ts", Map.of("max", Map.of("field", "@timestamp")));
+            // 三段精确计数：与 storyEvents 用同一组过滤条件（否则两个端点会自相矛盾）
+            Map<String, Object> notHoneypot = Map.of("bool", Map.of("must_not",
+                    List.of(Map.of("terms", Map.of("rule.groups", List.of("cowrie", "dionaea"))))));
+            aggs.put("st_alerts", Map.of("filter", notHoneypot));
+            aggs.put("st_decoy", Map.of("filter", Map.of("term", Map.of("rule.groups", "dionaea"))));
+            aggs.put("st_logins", Map.of("filter", Map.of("terms", Map.of("rule.id", List.of("100101", "100102")))));
+            aggs.put("st_login_ok", Map.of("filter", Map.of("term", Map.of("rule.id", "100102"))));
+            body.put("aggs", aggs);
+
+            JsonNode root = client.search("wazuh-alerts-*", MAPPER.writeValueAsString(body));
+            JsonNode ag = root.path("aggregations");
+            long total = root.path("hits").path("total").path("value").asLong(0);
+
+            Map<String, Long> kinds = new LinkedHashMap<>();
+            Map<String, Long> ports = new LinkedHashMap<>();
+            Map<String, Long> creds = new LinkedHashMap<>();
+            int sampled = 0;
+            for (JsonNode h : root.path("hits").path("hits")) {
+                JsonNode s = h.path("_source");
+                sampled++;
+                String desc = s.path("rule").path("description").asText("");
+                String ruleId = s.path("rule").path("id").asText("");
+                String port = s.path("data").path("dst_port").asText("");
+
+                String kind;
+                if ("100102".equals(ruleId)) {
+                    kind = "蜜罐登录成功";
+                } else if ("100101".equals(ruleId)) {
+                    kind = "蜜罐登录失败";
+                } else if ("100100".equals(ruleId)) {
+                    kind = "蜜罐新连接";
+                } else if ("100104".equals(ruleId)) {
+                    kind = "蜜罐客户端指纹";
+                } else {
+                    // 与 /alerts、故事线同一套归类（不另起一套"看起来更细"的分类）
+                    kind = AlertType.guess(desc).getLabel();
+                }
+                kinds.merge(kind, 1L, Long::sum);
+                if (isPortNumber(port)) {
+                    ports.merge(port, 1L, Long::sum);
+                }
+                java.util.regex.Matcher mCred = RE_CRED.matcher(desc);
+                if (mCred.find()) {
+                    // 密钥串（"用户 / 口令"）只在服务端流转：publicapi 侧必须先转成结构再出海
+                    creds.merge(mCred.group(1) + " / " + mCred.group(2), 1L, Long::sum);
+                }
+            }
+
+            out.put("available", true);
+            out.put("reason", "OK");
+            out.put("windowHours", hours);
+            out.put("total", total);
+            out.put("firstSeen", tsOf(ag.path("first_ts")));
+            out.put("lastSeen", tsOf(ag.path("last_ts")));
+            Map<String, Object> stages = new LinkedHashMap<>();
+            long logins = docCount(ag.path("st_logins"));
+            long loginOk = docCount(ag.path("st_login_ok"));
+            stages.put("alerts", docCount(ag.path("st_alerts")));
+            stages.put("decoyPorts", docCount(ag.path("st_decoy")));
+            stages.put("honeypotLogins", logins);
+            stages.put("honeypotSuccess", loginOk);
+            stages.put("honeypotFailed", Math.max(0, logins - loginOk));
+            out.put("stages", stages);
+            out.put("byKind", topN(kinds, 12));
+            out.put("ports", topN(ports, 20));
+            out.put("topCredentials", topN(creds, 10));
+            out.put("sampled", sampled);
+            out.put("truncated", total > sampled);
+            out.put("note", total > sampled
+                    ? "总条数、首末时间、各阶段计数是精确值；按行为分类/端口/口令只基于最近 " + sampled
+                            + " 条（该来源在窗口内共 " + total + " 条），属于样本口径"
+                    : "窗口内该来源的全部记录都已取回（" + total + " 条），各项计数均为精确值");
+            return out;
+        } catch (Exception e) {
+            logger.warn("IP 画像查询失败（公开端点会如实降级）：{}", e.getMessage());
+            out.put("reason", "QUERY_FAILED");
+            out.put("note", "IP 画像查询失败（" + e.getMessage() + "）；这不是'这个来源没有行为'");
+            return out;
+        }
+    }
+
+    /** min/max 聚合的时间戳（value_as_string → 本地 {@code yyyy-MM-dd HH:mm:ss}；取不到给 null，不猜） */
+    private static String tsOf(JsonNode agg) {
+        String v = agg.path("value_as_string").asText("");
+        if (v.isBlank()) {
+            return null;
+        }
+        String t = normalizeTime(v);
+        return (t == null || t.isBlank()) ? null : t;
+    }
+
+    private static long docCount(JsonNode agg) {
+        return agg.path("doc_count").asLong(0);
+    }
+
+    /** 只接受纯数字端口（{@code data.dst_port} 可能是协议名，那不是端口） */
+    private static boolean isPortNumber(String s) {
+        if (s == null || s.isEmpty() || s.length() > 5) {
+            return false;
+        }
+        for (int i = 0; i < s.length(); i++) {
+            if (!Character.isDigit(s.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /**
      * 处置通道是否可用 —— 与 {@link #isAvailable()} 语义不同，不要混用。
      *

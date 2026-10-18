@@ -71,6 +71,8 @@ public class TtsConfig {
     public static final int MAX_CHARS_CEILING = 600;
 
     private final boolean enabled;
+    /** 上游厂商：{@code fish}（默认）或 {@code cosyvoice}。不同厂商的请求形状、响应形状、媒体类型都不同。 */
+    private final String provider;
     private final String voiceId;
     private final String model;
     private final String baseUrl;
@@ -111,8 +113,10 @@ public class TtsConfig {
                      int maxCacheMb,
                      String quotaFile,
                      int historySize,
-                     Map<String, String> phrases) {
+                     Map<String, String> phrases,
+                     String provider) {
         this.enabled = enabled;
+        this.provider = text(provider, "fish");
         this.voiceId = text(voiceId, "");
         this.model = text(model, DEFAULT_MODEL);
         this.baseUrl = text(baseUrl, DEFAULT_BASE_URL);
@@ -131,7 +135,7 @@ public class TtsConfig {
     public static TtsConfig defaults() {
         return new TtsConfig(DEFAULT_ENABLED, "", DEFAULT_MODEL, DEFAULT_BASE_URL, "", DEFAULT_MAX_CHARS,
                 DEFAULT_PER_IP_DAILY, DEFAULT_GLOBAL_DAILY, DEFAULT_CACHE_DIR, DEFAULT_MAX_CACHE_MB,
-                DEFAULT_QUOTA_FILE, DEFAULT_HISTORY_SIZE, Map.of());
+                DEFAULT_QUOTA_FILE, DEFAULT_HISTORY_SIZE, Map.of(), "fish");
     }
 
     private static String text(String value, String fallback) {
@@ -156,6 +160,15 @@ public class TtsConfig {
             }
         });
         return Collections.unmodifiableMap(out);
+    }
+
+    public String getProvider() {
+        return provider;
+    }
+
+    /** 是否 CosyVoice（DashScope）上游：请求体与响应体都不同，见 TtsService */
+    public boolean isCosyVoice() {
+        return "cosyvoice".equalsIgnoreCase(provider);
     }
 
     public boolean isEnabled() {

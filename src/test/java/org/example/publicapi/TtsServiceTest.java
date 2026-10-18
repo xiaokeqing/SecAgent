@@ -125,7 +125,7 @@ class TtsServiceTest {
                              Map<String, String> phrases, int maxCacheMb, int historySize) {
         return new TtsConfig(enabled, "voice-test", "s1", baseUrl, apiKey, maxChars, perIpDaily, globalDaily,
                 tmp.resolve("cache").toString(), maxCacheMb, tmp.resolve("tts-quota.json").toString(),
-                historySize, phrases);
+                historySize, phrases, "fish");
     }
 
     private TtsConfig enabled() {

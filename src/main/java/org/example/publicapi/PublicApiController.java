@@ -76,6 +76,8 @@ public class PublicApiController {
 
     /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link #tts}） */
     private static final MediaType TTS_AUDIO = MediaType.parseMediaType("audio/mpeg");
+    /** CosyVoice 返回 wav（24 kHz / mono / 16-bit）：媒体类型不能报 mpeg */
+    private static final MediaType TTS_AUDIO_WAV = MediaType.parseMediaType("audio/wav");
 
     @Autowired
     private PublicAlertSource source;
@@ -606,7 +608,8 @@ public class PublicApiController {
             res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
             res.setHeader("X-Tts-Cache", result.cacheHit() ? "HIT" : "MISS");
             res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-            return ResponseEntity.ok().contentType(TTS_AUDIO).body(result.audio());
+            MediaType media = (ttsService != null && ttsService.config().isCosyVoice()) ? TTS_AUDIO_WAV : TTS_AUDIO;
+            return ResponseEntity.ok().contentType(media).body(result.audio());
         } catch (TtsService.TtsException e) {
             // 归一化的 reason 码：前端按它决定"隐藏 🔊 / 提示额度用完 / 提示稍后再试"。
             // message 是人话，绝不含 Key、上游原文或 URL 细节。
@@ -1209,6 +1212,15 @@ public class PublicApiController {
     private AttackStoryService attackStoryService;
 
     /**
+     * 「这个 IP 干过什么」的组装层（<b>可为空</b>：单测直接 new 控制器、裁剪过的部署里就是 null）。
+     *
+     * <p>空 → 端点如实返回 {@code available=false + IP_PROFILE_DISABLED} 且所有计数项为 null，
+     * 绝不用"0 条"冒充"这个 IP 什么都没干"。
+     */
+    @Autowired(required = false)
+    private PublicIpProfileService ipProfileService;
+
+    /**
      * <b>值得看的来源</b>：把同一个来源的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」四段
      * 各自的条数与首末时间列出来，并给出 <b>{@code gaps[]}</b>（哪几段确实没有数据）。
      *
@@ -1334,6 +1346,58 @@ public class PublicApiController {
             data.put("eventCount", 0);
         }
         return data;
+    }
+
+    /**
+     * <b>「这个 IP 干过什么」</b>：一个来源 IP 的画像（个人版 AbuseIPDB）。
+     *
+     * <p>跨三个源聚合：索引里的告警 + 蜜罐会话（{@link PublicAlertSource#ipActivity}）、
+     * 应用侧处置留痕（{@link PublicAuditReader#bansFor}）、GeoIP 库。字段：
+     * {@code firstSeen/lastSeen/events/byKind/ports/credStructure/geo/banned}
+     * （外加 {@code sources} 说明每个源接没接上、{@code notes[]} 逐项说明为什么是 null）。
+     *
+     * <h3>口径（与 /stories 同一套壳）</h3>
+     * <ol>
+     *   <li><b>不许编</b>：任何一项取不到就写 {@code null} 并在 {@code notes[]} 里写原因 ——
+     *       "读不到"与"没有数据"必须能分开读；</li>
+     *   <li><b>不混数据</b>：只按 {@code q} 这一个字面量查，不按网段、不按 ASN、不按"相近的地址"
+     *       扩张，也不把别人的记录并进来；</li>
+     *   <li><b>IP 严格校验</b>：只要 IPv4 字面量（非法 → 400）；内网/保留地址也 400
+     *       （理由见 {@link PublicIpProfileService#isQueryable}）；</li>
+     *   <li><b>口令只给结构</b>：{@link PublicApiController#credentialShapes} 把
+     *       {@code root / 123456} 换成 {@code root / 6 位·纯数字·弱口令}，原文字符不出现。</li>
+     * </ol>
+     *
+     * <p>复用既有外壳：同一个限流器（20 次/分钟）、同一个 CORS 白名单、同一个 ETag 过滤器、
+     * 同一个 {@code cache-seconds} TTL（按 IP 分开存）、同一个 {@code ok(...)}
+     * （因此自动带 {@code ipDisclosure} 与内部资产名过滤）。
+     */
+    @GetMapping({"/ip", "/ip.js"})
+    public ResponseEntity<Map<String, Object>> ipProfile(
+            @RequestParam(value = "q", required = false) String q,
+            HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        String ip = q == null ? "" : q.trim();
+        if (ip.isEmpty()) {
+            return badRequest(res, "MISSING_Q",
+                    "缺少 q 参数：要查的 IPv4 地址，例如 /api/public/ip?q=45.155.205.233");
+        }
+        if (!PublicIpProfileService.isIpv4Literal(ip)) {
+            return badRequest(res, "INVALID_IP",
+                    "q 必须是 IPv4 字面量（四段十进制、每段 0-255）；IPv6 / 域名 / 带端口 / 网段写法"
+                            + "一律不接受，也不做任何猜测性解析");
+        }
+        if (!PublicIpProfileService.isQueryable(ip)) {
+            return badRequest(res, "NOT_PUBLIC_IP",
+                    "内网/保留/链路地址不在公开查询口径内：它们在公开面上统一写作「内网/未知」，"
+                            + "而多个不同的内网地址会共用同一个输入，按 IP 查只会给出误导性的答案");
+        }
+        if (ipProfileService == null) {
+            return ok(PublicIpProfileService.disabled(policy().display(ip), cacheSeconds), res);
+        }
+        return ok(ipProfileService.profile(ip), res);
     }
 
     /** 400：参数不合法（只回机读 reason + 人话，不回任何内部细节） */

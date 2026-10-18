@@ -105,7 +105,8 @@ class TtsEndpointTest {
 
     private TtsConfig config(boolean enabled, String apiKey, int perIpDaily) {
         return new TtsConfig(enabled, "voice-test", "s1", baseUrl, apiKey, 120, perIpDaily, 500,
-                tmp.resolve("cache").toString(), 64, tmp.resolve("tts-quota.json").toString(), 200, PHRASES);
+                tmp.resolve("cache").toString(), 64, tmp.resolve("tts-quota.json").toString(), 200, PHRASES,
+                "fish");
     }
 
     private TtsService service(TtsConfig config) {

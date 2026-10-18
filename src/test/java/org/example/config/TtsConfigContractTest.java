@@ -153,7 +153,8 @@ class TtsConfigContractTest {
     @Test
     @DisplayName("TtsConfig：非法值取默认、超上限夹回（不许放大成本闸），且 describe() 绝不打印 Key")
     void valueObjectClampsAndNeverPrintsKey() {
-        TtsConfig defaults = new TtsConfig(true, "  ", "", "", "  ", 0, -5, 0, "", 0, "", 0, null);
+        TtsConfig defaults = new TtsConfig(true, "  ", "", "", "  ", 0, -5, 0, "", 0, "", 0, null, "");
+        assertEquals("fish", defaults.getProvider(), "空 provider = 缺省厂商 fish");
         assertEquals(TtsConfig.DEFAULT_MODEL, defaults.getModel());
         assertEquals(TtsConfig.DEFAULT_BASE_URL, defaults.getBaseUrl());
         assertEquals(TtsConfig.DEFAULT_MAX_CHARS, defaults.getMaxChars());
@@ -167,7 +168,7 @@ class TtsConfigContractTest {
         assertTrue(defaults.getPhrases().isEmpty(), "null 短语表 = 空表");
 
         TtsConfig huge = new TtsConfig(true, "v", "s1", "https://api.fish.audio", "sk-secret",
-                99999, 20, 500, "data/tts-cache", 64, "data/tts-quota.json", 200, Map.of("a", "b"));
+                99999, 20, 500, "data/tts-cache", 64, "data/tts-quota.json", 200, Map.of("a", "b"), "fish");
         assertEquals(TtsConfig.MAX_CHARS_CEILING, huge.getMaxChars(), "超上限必须夹回（只许收紧不许放大）");
         assertTrue(huge.apiKeyConfigured());
         assertTrue(huge.describe().contains("key=SET"));

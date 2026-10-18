@@ -217,6 +217,30 @@ public class PublicAlertSource {
         }
     }
 
+    /**
+     * <b>IP 画像</b>：单个来源在窗口内「告警 + 蜜罐」两侧的汇总（供 {@code /api/public/ip}）。
+     *
+     * <p>fail-closed 同上：非 REAL 时返回"不可用"，绝不返回 0 条冒充
+     * "这个 IP 什么都没干"（那是完全相反的两个结论）。
+     */
+    public Map<String, Object> ipActivity(String srcIp, int windowHours) {
+        if (!available()) {
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("available", false);
+            m.put("reason", "DATA_SOURCE_UNAVAILABLE");
+            m.put("note", "告警数据源不是 REAL（当前 " + mode() + "）：不返回任何计数，"
+                    + "也不以内置样本顶替");
+            return m;
+        }
+        try {
+            Map<String, Object> m = wazuhGateway.ipActivity(srcIp, windowHours);
+            return m == null ? unavailable("DATA_SOURCE_UNAVAILABLE", "网关未返回 IP 画像") : m;
+        } catch (Exception e) {
+            logger.warn("公网只读端点读取 IP 画像失败：{}", e.getMessage());
+            return unavailable("QUERY_FAILED", "IP 画像查询异常：" + e.getMessage());
+        }
+    }
+
     private static Map<String, Object> unavailable(String reason, String note) {
         Map<String, Object> m = new java.util.LinkedHashMap<>();
         m.put("available", false);

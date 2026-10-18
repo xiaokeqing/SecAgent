@@ -259,6 +259,81 @@ public class PublicAuditReader {
         return m;
     }
 
+    /**
+     * <b>单个来源的封禁情况</b>（供 {@code GET /api/public/ip} 的 {@code banned}）。
+     *
+     * <h3>为什么不能复用 {@link #blocks(int)}</h3>
+     * 那个方法返回的是<b>口径化之后的显示值</b>（掩码态形如 {@code 45.205.***.***}），
+     * 拿它去和用户输入的原始 IP 比，一个都匹配不上 —— 于是"这个 IP 被封过 3 次"会静静地变成 0。
+     * 所以匹配必须发生在<b>原始值</b>上（与 {@link #eventsByTargetSince} 把原始地址放在
+     * Map 的 key 上是同一类理由）：入参是原始 IP，<b>返回值里一个 IP 都不含</b>。
+     *
+     * <h3>三项语义必须能分开读</h3>
+     * <ul>
+     *   <li>{@code count}：留痕里属于这个 IP 的封禁记录条数（<b>含</b>已解封的）；</li>
+     *   <li>{@code lastBannedAt}：最近一条的 {@code createdAt}（没有记录就是 null）；</li>
+     *   <li>{@code active}：<b>能不能证明现在还封着</b>。只有"未解封 + expiresAt 可解析 + 在未来"
+     *       才算 {@code true}；存在未解封记录但 expiresAt 解析不出来 → {@code null}（不猜，
+     *       因为把"证明不了"说成 {@code false} 等于告诉访客"早就解封了"）。</li>
+     * </ul>
+     *
+     * <p>{@code readable=false} 表示封禁留痕文件读不到：此时 {@code count=0} <b>不表示没封过</b>，
+     * 调用方要把整个 {@code banned} 写成 null 并在 notes 里说明（见
+     * {@code PublicIpProfileService}）。
+     */
+    public Map<String, Object> bansFor(String rawIp) {
+        String ip = rawIp == null ? "" : rawIp.trim();
+        boolean readable = !ip.isEmpty() && Files.isReadable(Path.of(dataDir, "blocked-ips.json"));
+        int count = 0;
+        int unblockedCount = 0;
+        String lastBannedAt = null;
+        boolean activeTrue = false;
+        boolean activeUnknown = false;
+        if (readable) {
+            java.time.LocalDateTime now = java.time.LocalDateTime.now();
+            for (JsonNode n : readArray("blocked-ips.json")) {
+                if (isEvalRecord(n)) {
+                    continue;
+                }
+                String recIp = text(n, "ip");
+                if (recIp == null || !ip.equalsIgnoreCase(recIp.trim())) {
+                    continue;
+                }
+                count++;
+                // lastBannedAt = 「最后一次被封的时间」→ 已解封的记录同样算
+                // （它当年确实被封过），所以这一步必须在 unblocked 分支之前做，
+                // 否则「只被封过一次、后来解封了」会返回 lastBannedAt=null，读起来像没封过。
+                String created = text(n, "createdAt");
+                if (created != null && (lastBannedAt == null || created.compareTo(lastBannedAt) > 0)) {
+                    lastBannedAt = created;
+                }
+                boolean unblocked = n.path("unblocked").asBoolean(false);
+                if (unblocked) {
+                    unblockedCount++;
+                    continue;
+                }
+                String exp = text(n, "expiresAt");
+                java.time.LocalDateTime expires = exp == null ? null : parseLocal(exp);
+                if (expires == null) {
+                    activeUnknown = true;
+                } else if (expires.isAfter(now)) {
+                    activeTrue = true;
+                }
+            }
+            // 全部已解封 ⇒ 现在肯定不封着（这是能证明的，不是猜的）
+            if (count > 0 && unblockedCount == count) {
+                activeUnknown = false;
+            }
+        }
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("readable", readable);
+        m.put("count", count);
+        m.put("unblockedCount", unblockedCount);
+        m.put("lastBannedAt", lastBannedAt);
+        m.put("active", activeTrue ? Boolean.TRUE : (activeUnknown ? null : Boolean.FALSE));
+        return m;
+    }
+
     // ==================== 工具 ====================
 
     /**

@@ -117,6 +117,32 @@ public interface WazuhGateway {
     }
 
     /**
+     * <b>IP 画像</b>：单个来源在窗口内「告警 + 蜜罐会话」两侧的聚合（<b>未脱敏</b>）。
+     *
+     * <p>与 {@link #storyEvents} 的区别是"要一份能直接回答『这个 IP 干过什么』的汇总"，
+     * 而不是逐条事件流：page 只需要 首末时间 / 总条数 / 按行为分类的计数 /
+     * 触及过的端口 / 猜过的口令<b>结构</b> / 每次登录成功失败多少条。
+     *
+     * <p>返回形状（<b>未脱敏</b>；IP 与口令的处理一律在 publicapi 侧）：
+     * <pre>
+     * {available, reason, note, windowHours,
+     *  total,                      // 精确值（track_total_hits），不是样本条数
+     *  firstSeen, lastSeen,        // 索引里该来源最早/最晚一条（本地时间 yyyy-MM-dd HH:mm:ss）
+     *  stages:{alerts, decoyPorts, honeypotLogins, honeypotSuccess, honeypotFailed},  // 均为精确值
+     *  byKind:[{kind, count}],     // 样本口径（最近 sample 条），kind 由 rule.description 归类
+     *  ports:[{port, count}],      // 样本口径：蜜罐/诱饵端口的 data.dst_port
+     *  topCredentials:[{key, count}],  // 形如 "root / 123456"，<b>只允许</b>经
+     *                                  // CredentialStructure 转成结构后再出海
+     *  sampled, truncated}
+     * </pre>
+     * 默认实现返回"不可用"：接口新增方法不会让既有替身静默变成"空数据"。
+     */
+    default Map<String, Object> ipActivity(String srcIp, int windowHours) {
+        return Map.of("available", false, "reason", "DATA_SOURCE_UNAVAILABLE",
+                "note", "网关未实现 ipActivity");
+    }
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）

@@ -249,6 +249,9 @@ public class TtsService {
      * 调上游。异常一律归一化（见类注释），且绝不把上游原文/Key 带进异常消息。
      */
     private byte[] callUpstream(String text) {
+        if (config.isCosyVoice()) {
+            return callCosyVoice(text);
+        }
         String url = endpoint(config.getBaseUrl());
         String payload = buildPayload(text);
         try {
@@ -311,6 +314,105 @@ public class TtsService {
                     DEP_TTS, guard.cooldownRemainingMs(DEP_TTS), e.getMessage());
             throw new TtsException(504, "UPSTREAM_TIMEOUT", "上游暂时不可用（超时或熔断冷却中），请稍后再试");
         }
+    }
+
+    /**
+     * CosyVoice（DashScope）合成：两步 —— 先 POST 拿签名 OSS 短链，再 GET 那个链拿 wav 字节。
+     *
+     * <p>为什么不把签名链直接给前端：签名有 {@code Expires}（实测一小时量级），
+     * 当长期资源用会过期；而且给前端链等于把计费账单与缓存控制权一并交出去。
+     */
+    private byte[] callCosyVoice(String text) {
+        String url = config.getBaseUrl() == null ? "" : config.getBaseUrl().trim();
+        if (url.isEmpty()) {
+            throw new TtsException(503, "CONFIG_INVALID", "未配置 CosyVoice 端点（APP_TTS_BASE_URL）");
+        }
+        ObjectNode body = MAPPER.createObjectNode();
+        body.put("model", config.getModel());
+        ObjectNode input = body.putObject("input");
+        input.put("text", text);
+        input.put("voice", config.getVoiceId());
+        input.put("format", "wav");
+        input.put("sample_rate", 24000);
+        String payload = body.toString();
+
+        try {
+            return guard.call(DEP_TTS, timeouts.getCallTimeoutMs(), () -> {
+            Request request = new Request.Builder()
+                    .url(url)
+                    .header("Authorization", "Bearer " + config.getApiKey())
+                    .header("Content-Type", "application/json")
+                    .post(RequestBody.create(payload, JSON))
+                    .build();
+            upstreamCalls.incrementAndGet();
+            Response response;
+            try {
+                response = client.newCall(request).execute();
+            } catch (IOException transportError) {
+                guard.openCircuit(DEP_TTS);
+                throw new TtsException(isTimeout(transportError) ? 504 : 502,
+                        isTimeout(transportError) ? "UPSTREAM_TIMEOUT" : "UPSTREAM_IO",
+                        isTimeout(transportError) ? "上游超时，请稍后再试" : "上游连接失败，请稍后再试");
+            }
+            String audioUrl;
+            try (response) {
+                String raw = response.body() == null ? "" : response.body().string();
+                if (!response.isSuccessful()) {
+                    int code = response.code();
+                    if (code != 401 && code != 403) {
+                        logger.warn("CosyVoice 上游返回 HTTP {}（片段已截断，仅服务端日志）：{}", code, truncate(raw));
+                    } else {
+                        guard.openCircuit(DEP_TTS);
+                        logger.warn("CosyVoice 上游鉴权失败 HTTP {}（按纪律不打印响应体）", code);
+                    }
+                    throw new TtsException(502, "UPSTREAM_HTTP_" + code, "上游返回 " + code);
+                }
+                try {
+                    audioUrl = MAPPER.readTree(raw).path("output").path("audio").path("url").asText("");
+                } catch (IOException parseError) {
+                    throw new TtsException(502, "UPSTREAM_BAD_BODY", "上游返回了非 JSON");
+                }
+                if (audioUrl.isBlank()) {
+                    throw new TtsException(502, "UPSTREAM_BAD_BODY", "上游没给音频地址");
+                }
+            }
+            return fetchAudio(audioUrl);
+            });
+        } catch (TtsException e) {
+            throw e;
+        } catch (Exception e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof TtsException inner) {
+                throw inner;
+            }
+            logger.warn("CosyVoice 出站调用未完成（冷却剩余 {} ms）：{}",
+                    guard.cooldownRemainingMs(DEP_TTS), e.getMessage());
+            throw new TtsException(504, "UPSTREAM_TIMEOUT", "上游暂时不可用（超时或熔断冷却中），请稍后再试");
+        }
+    }
+
+    /** 拿签名 OSS 短链下载音频（不带 Authorization：签名已在 URL 里） */
+    private byte[] fetchAudio(String audioUrl) {
+        Request request = new Request.Builder().url(audioUrl).get().build();
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new TtsException(502, "UPSTREAM_HTTP_" + response.code(), "音频下载失败 " + response.code());
+            }
+            byte[] audio = readAudioBounded(response);
+            if (audio.length == 0) {
+                throw new TtsException(502, "UPSTREAM_BAD_BODY", "上游返回了空音频");
+            }
+            return audio;
+        } catch (IOException io) {
+            throw new TtsException(502, "UPSTREAM_IO", "音频下载失败");
+        }
+    }
+
+    private static String truncate(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        return raw.length() <= 300 ? raw : raw.substring(0, 300) + "…";
     }
 
     /** 请求地址：base-url 末尾斜杠归一化后拼 {@code /v1/tts}；已写到 /v1 的也接受 */

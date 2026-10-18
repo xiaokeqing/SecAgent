@@ -52,10 +52,11 @@ public class TtsOutboundConfig {
             @Value("${app.tts.max-cache-mb:64}") int maxCacheMb,
             @Value("${app.tts.quota-file:data/tts-quota.json}") String quotaFile,
             @Value("${app.tts.history-size:200}") int historySize,
-            @Value("${app.tts.phrases-file:" + TtsPhrases.DEFAULT_LOCATION + "}") String phrasesFile) {
+            @Value("${app.tts.phrases-file:" + TtsPhrases.DEFAULT_LOCATION + "}") String phrasesFile,
+            @Value("${app.tts.provider:fish}") String provider) {
         Map<String, String> phrases = TtsPhrases.load(phrasesFile);
         TtsConfig config = new TtsConfig(enabled, voiceId, model, baseUrl, apiKey, maxChars, perIpDaily,
-                globalDaily, cacheDir, maxCacheMb, quotaFile, historySize, phrases);
+                globalDaily, cacheDir, maxCacheMb, quotaFile, historySize, phrases, provider);
         logger.info("TTS-SELFCHECK {}", config.describe());
         return config;
     }
