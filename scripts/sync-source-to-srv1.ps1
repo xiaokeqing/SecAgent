@@ -13,10 +13,15 @@
 #   ③ srv1: git fetch <bundle> main        —— 只 fetch，不 checkout
 #      （绝不覆盖服务器上被手工改过的 docker-compose.yml / .env）
 #   ④ 加 -AlignHead 时才 git reset --soft：只移动 HEAD，工作区与配置原样保留
+#      -HardReset 会 git reset --hard（工作区回到仓库版本）—— 仓库里的
+#      docker-compose.yml 与 srv1 上被手工改过的那份【不同】（真实事故 A），
+#      所以 reset 之前先备份到 /root/docker-compose.yml.syncbak-<时间戳>，
+#      reset 之后原子恢复并核对 md5；输出固定打印「已备份 / 已恢复」两行。
 #
 # 用法：
 #   powershell -File scripts\sync-source-to-srv1.ps1               # 只把对象送到位
-#   powershell -File scripts\sync-source-to-srv1.ps1 -AlignHead    # 并把 HEAD 指到该提交
+#   powershell -File scripts\sync-source-to-srv1.ps1 -AlignHead    # 并把 HEAD 指到该提交（reset --soft）
+#   powershell -File scripts\sync-source-to-srv1.ps1 -HardReset    # 连工作区一起回到仓库版本（reset --hard）
 #   powershell -File scripts\sync-source-to-srv1.ps1 -Target <sha>
 #
 # 之后照常跑：scripts\deploy-remote-build.ps1 -AllowDirty
@@ -25,7 +30,10 @@ param(
     [string]$SshHost = 'secagent-srv1',
     [string]$RemoteDir = '/opt/secagent',
     [string]$Target = '',
-    [switch]$AlignHead
+    [switch]$AlignHead,
+    # 工作区也回到仓库版本（git reset --hard）。会给线上 compose 带来真实风险，
+    # 因此脚本内置「先备份、再 reset、再原子恢复」的保护（见 Backup-ComposeIfDirty）。
+    [switch]$HardReset
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +44,52 @@ function Step($n, $msg) { Write-Host ("==> " + $n + " " + $msg) }
 function Fail($msg) { Write-Host ("[X] " + $msg) -ForegroundColor Red; exit 1 }
 function Ok($msg) { Write-Host ("    [OK] " + $msg) -ForegroundColor Green }
 function Warn($msg) { Write-Host ("    [!] " + $msg) -ForegroundColor Yellow }
+
+# ---- compose 保护（真实事故 A 的防线，2026-10-18 固化进脚本）----
+# 事故形状：srv1 上的 docker-compose.yml 被站主手工改过（TTS / quota 段，
+#   image 指向本地镜像），而仓库里的版本指向 ACR :stable。`git reset --hard`
+#   会把这份【线上真配置】直接覆盖成仓库版本 —— 之后 up -d 就按仓库版重建容器，
+#   看着"发布成功"、其实配置丢了（当时靠 /root/docker-compose.yml.srv1-.bak 手工救回）。
+# 判据命令（远端）：git -C /opt/secagent diff --quiet HEAD -- docker-compose.yml; echo $?
+#   0 = 一致（reset 不会改它，无需备份）；1 = 被改过（必须先备份）。
+# 恢复用「同目录 install 出临时文件 + mv」：同一文件系统内 rename 是原子的，
+#   不会留下半截配置；恢复后核对 md5，防止"备份成功、恢复失败"被忽略。
+function Backup-ComposeIfDirty {
+    $composeRel = 'docker-compose.yml'
+    $composePath = $RemoteDir + '/' + $composeRel
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $bak = '/root/docker-compose.yml.syncbak-' + $stamp
+    $checkCmd = 'sudo git -C ' + $RemoteDir + ' diff --quiet HEAD -- ' + $composeRel + '; echo "compose_diff_exit=$?"'
+    $chk = @(ssh -o BatchMode=yes $SshHost $checkCmd 2>&1)
+    $hit = @($chk | Where-Object { ([string]$_).Trim() -match '^compose_diff_exit=[0-9]+$' })
+    if ($hit.Count -eq 0) { Fail ("无法判断远端 compose 是否被改（输出：" + ($chk -join ' / ') + "）") }
+    $code = [int]((([string]$hit[$hit.Count - 1]).Trim()) -replace 'compose_diff_exit=', '')
+    if ($code -eq 0) {
+        Ok ("远端 compose 与仓库 HEAD 一致（diff_exit=0）—— 无需备份/恢复")
+        return @{ Needed = $false }
+    }
+    if ($code -ne 1) { Fail ("git diff 返回 " + $code + "（非 0/1）—— 无法判断 compose 状态，中止（宁可不 reset）") }
+    $bakCmd = 'sudo cp -a ' + $composePath + ' ' + $bak + ' && sudo chmod 644 ' + $bak + ' && sudo md5sum ' + $bak
+    $bout = @(ssh -o BatchMode=yes $SshHost $bakCmd 2>&1)
+    $bmd5 = ''
+    if ($LASTEXITCODE -eq 0 -and $bout.Count -gt 0) { $bmd5 = ((([string]$bout[$bout.Count - 1]).Trim()) -split '\s+')[0] }
+    if ($bmd5 -notmatch '^[0-9a-f]{32}$') { Fail ("备份远端 compose 失败（输出：" + ($bout -join ' / ') + "）") }
+    Write-Host ("    [OK] 已备份 " + $composePath + " -> " + $bak + "（md5=" + $bmd5 + "）") -ForegroundColor Green
+    return @{ Needed = $true; Path = $bak; Md5 = $bmd5; Target = $composePath }
+}
+
+function Restore-Compose($state) {
+    if (-not $state.Needed) { return }
+    $tmp = $state.Target + '.sync-restore'
+    $cmd = 'sudo install -m 644 ' + $state.Path + ' ' + $tmp + ' && sudo mv -f ' + $tmp + ' ' + $state.Target + ' && sudo md5sum ' + $state.Target
+    $out = @(ssh -o BatchMode=yes $SshHost $cmd 2>&1)
+    $md5 = ''
+    if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) { $md5 = ((([string]$out[$out.Count - 1]).Trim()) -split '\s+')[0] }
+    if ($md5 -ne $state.Md5) {
+        Fail ("已备份但未恢复成功：预期 md5=" + $state.Md5 + "，实际 md5=" + $md5 + "，备份仍在 " + $state.Path + " —— 请人工恢复")
+    }
+    Write-Host ("    [OK] 已恢复 " + $state.Target + "（md5=" + $md5 + "，与备份一致）") -ForegroundColor Green
+}
 
 # ---- 0) 目标提交 ----
 $head = (git rev-parse HEAD).Trim()
@@ -89,15 +143,28 @@ if (-not $targetFull.StartsWith($fetched)) {
 
 
 
-# ---- 4) 可选：对齐 HEAD（只移动指针，工作区不动）----
-if ($AlignHead) {
-    $align = "sudo git -C " + $RemoteDir + " reset --soft " + $targetFull + " 2>&1 | tail -1; sudo git -C " + $RemoteDir + " log --oneline -1"
-    $out2 = ssh -o BatchMode=yes $SshHost $align
-    if ($LASTEXITCODE -ne 0) { Fail ("reset --soft 失败：" + $out2) }
-    Step "4/4" ("服务器 HEAD 已指到 " + $sha + "（工作区与 docker-compose.yml 原样保留）")
-    Ok (($out2 | Select-Object -Last 1))
+# ---- 4) 可选：对齐 HEAD ----
+# -AlignHead → reset --soft（只移动指针，工作区与配置原样保留）
+# -HardReset → reset --hard（工作区也回到仓库版本 —— 会覆盖 srv1 手工改过的
+#              docker-compose.yml，所以必须"先备份、再 reset、再原子恢复"）
+if ($AlignHead -or $HardReset) {
+    if ($AlignHead -and $HardReset) { Fail " -AlignHead 与 -HardReset 不能同时给（二者都是对齐 HEAD，语义冲突）" }
+    $resetMode = if ($HardReset) { '--hard' } else { '--soft' }
+    # ① 必须在 reset 之前判断+备份：reset --hard 会当场覆盖掉线上真配置
+    $composeState = Backup-ComposeIfDirty
+    $align = 'sudo git -C ' + $RemoteDir + ' reset ' + $resetMode + ' ' + $targetFull + ' 2>&1 | tail -1; sudo git -C ' + $RemoteDir + ' log --oneline -1'
+    $out2 = @(ssh -o BatchMode=yes $SshHost $align 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        # reset 失败也要把配置放回去（否则备份只是躺在 /root 里，线上配置还是丢的）
+        Restore-Compose $composeState
+        Fail ("reset " + $resetMode + " 失败：" + ($out2 -join ' / '))
+    }
+    # ② reset 之后原子恢复，并核对 md5 与备份一致
+    Restore-Compose $composeState
+    Step "4/4" ("服务器 HEAD 已指到 " + $sha + "（reset " + $resetMode + "）")
+    Ok ([string]($out2 | Select-Object -Last 1))
 } else {
-    Step "4/4" "未对齐 HEAD（需要时加 -AlignHead）"
+    Step "4/4" "未对齐 HEAD（需要时加 -AlignHead 或 -HardReset）"
 }
 
 Remove-Item -LiteralPath $bundle -ErrorAction SilentlyContinue

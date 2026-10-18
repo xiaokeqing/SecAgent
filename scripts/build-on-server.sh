@@ -20,6 +20,11 @@
 #   ② 工作区 HEAD 必须正好等于目标 commit（不等 → 就是用旧源码构建）
 #   ③ 工作区必须干净（有未提交改动 → 源码无法用 commit 唯一定位）
 #   任一不满足 → 非零退出，且【不产生镜像、不重启容器】。
+#
+# 【部署后硬校验】容器起来之后还要证明「它跑的就是本次构建的镜像」：
+#   容器 .Image == docker image inspect secagent:local 的 .Id，不等就 exit 7。
+#   原因：真实事故里 build 是成功的，但 compose 起的是 ACR 旧镜像（4ecf4741…），
+#   一切"看起来都成功"。这条校验让那种情况当场失败。
 # ============================================================
 set -euo pipefail
 
@@ -134,6 +139,42 @@ export ARTIFACT_MD5
 export SOURCE_SHA
 docker compose up -d --force-recreate secagent 2>&1 | tail -3
 # 这里不盲目 sleep：下面 4/4 会轮询 health，一直到容器真的报出目标 commit 为止
+
+# ============================================================
+# 3.5/4 【硬校验】容器实际跑的镜像 == 本次构建的 secagent:local
+# ------------------------------------------------------------
+# 真实事故 B（2026-10-18）：build 明明产出了 secagent:local，`docker compose up -d`
+# 起来的却是 ACR 旧镜像（digest 4ecf4741…）—— 原因是 compose 里 image: 指向别处、
+# 或已有容器没被真正重建。当时是靠人肉 `md5sum /app/app.jar` 才发现"线上是旧代码"。
+# 这里的判据不可反驳：容器 .Image（它真正使用的镜像 ID）必须等于
+# `docker image inspect secagent:local` 的 .Id。不等就当场 exit 7。
+# 为什么用 if ! 形式取命令替换：set -e **不会**捕获 $(...) 内部的失败，
+# 直接 `X="$(docker ...)"` 在取不到值时只会得到空串继续往下跑 —— 于是校验变成
+# 永远通过的空比较。if ! 显式判断退出码，取不到也算失败。
+# ============================================================
+EXPECT_IMAGE_ID=""
+if ! EXPECT_IMAGE_ID="$(docker image inspect secagent:local --format '{{.Id}}' 2>/dev/null)"; then
+  echo "  [X] 取不到 secagent:local 的镜像 ID（镜像不存在或 inspect 失败）—— 中止"
+  exit 7
+fi
+ACTUAL_IMAGE_ID=""
+if ! ACTUAL_IMAGE_ID="$(docker inspect "$(docker compose ps -q secagent)" --format '{{.Image}}' 2>/dev/null)"; then
+  echo "  [X] 取不到容器 secagent 的实际镜像 ID（容器没起来？）—— 中止"
+  exit 7
+fi
+if [ -z "$EXPECT_IMAGE_ID" ] || [ -z "$ACTUAL_IMAGE_ID" ]; then
+  echo "  [X] 镜像 ID 为空（期望='$EXPECT_IMAGE_ID' 实际='$ACTUAL_IMAGE_ID'）—— 检索失败，中止"
+  exit 7
+fi
+echo "  期望镜像ID(secagent:local) = $EXPECT_IMAGE_ID"
+echo "  实际镜像ID(容器)           = $ACTUAL_IMAGE_ID"
+if [ "$EXPECT_IMAGE_ID" != "$ACTUAL_IMAGE_ID" ]; then
+  echo "  [X] 容器跑的不是本次构建的镜像 —— 起了旧镜像，中止（不再靠人肉发现）"
+  echo "      期望（secagent:local）: $EXPECT_IMAGE_ID"
+  echo "      实际（容器 .Image）   : $ACTUAL_IMAGE_ID"
+  exit 7
+fi
+echo "  [OK] 镜像一致：容器实际镜像 == 本次构建的 secagent:local"
 
 echo "==> 4/4 双指纹落盘 + 健康检查"
 # SOURCE_SHA 已在步骤 2 算好并 export（必须在 compose up 之前，否则容器里是 unknown）
