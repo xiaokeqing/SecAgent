@@ -331,6 +331,12 @@ app:
     # 作用面是整棵响应树（含 F5-B 直出到回答正文的知识库引用片段）。
     # 默认值 = 实测泄露过的那些名字（不是想象的清单）。改动前先想清楚会不会误伤正常内容。
     asset-blocklist: ${APP_PUBLIC_ASSET_BLOCKLIST:web-01,web-02,web-03,db-01,auth.log,/api/order/detail,/upload/files/}
+    # 攻击者口令字典的<b>只读索引</b>（只含 SHA-256 前 5 位桶 + 计数 + 桶内后缀，绝不含明文）。
+    # 【谁生成】离线脚本 scripts/password-dict-build.py 在蜜罐日志所在机器上跑：明文只在那一次
+    #   进程内存里出现，落盘的就只有 hash —— 所以运行时不需要（也不允许）去读大日志。
+    # 【读不到时】文件缺失/格式错 ⇒ /api/public/password 返回 available:false + 原因；
+    #   服务照常启动、不 500。宁可少一个功能，也不许把"读不到"渲染成"没被尝试过"。
+    password-dict-file: ${APP_PUBLIC_PASSWORD_DICT_FILE:data/password-hashes.json}
   # 公网只读端点（博客工作台）专用配置。
   # 【刻意与业务限流/配额分开】：否则"为了本地调试把上限调大"会顺手把公网端点一起放宽，
   # 而这件事不会有任何报错。
@@ -365,6 +371,13 @@ app:
       deadline-ms: 25000
     kb:
       requests-per-minute: 20     # 检索比问答便宜（只调 embedding），给到与只读端点同量级
+    # ===== 密码自查 /api/public/password =====
+    # 不花钱（纯内存查索引），但**单响应最多 200 条 59 位 hex**，带宽比其它只读端点大一截；
+    # 单独一套限流：改它时不该顺手动到问答（6）与只读端点（20）。
+    password:
+      requests-per-minute: 30     # 每 IP 每分钟；"检查自己的口令"是手动低频动作，30 够用
+      cache-seconds: 300          # 字典按天重建 ⇒ public, max-age=300 足够挡掉重复查询
+      max-hashes: 200             # 单桶最多下发多少条 suffix；超出置 truncated:true（上限 200，见类注释）
     # 公开知识库检索的【可见性口径】：不是"标记为内部的才隐藏"，而是"命中白名单才放行"。
     # 依据是向量库元数据里的 _source / _file_name / _source_type（没有文档分类字段，这是最小实现）。
     public-kb:

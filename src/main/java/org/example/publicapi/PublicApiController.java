@@ -85,6 +85,43 @@ public class PublicApiController {
     @Autowired
     private PublicRateLimiter rateLimiter;
 
+    // ==================== 密码自查（/api/public/password）====================
+    //
+    // 【数据从哪来】不是运行时读蜜罐日志：离线脚本 scripts/password-dict-build.py 在日志所在的机器上
+    // 把 password 字段就地 SHA-256、按前 5 位分桶，只把「hash + 计数」写进索引文件；
+    // 本服务只加载那个索引（格式与取舍见 PasswordDictionaryService 类注释）。
+    // 【读不到时】文件缺失/格式错 ⇒ available:false + reason，服务照常启动、端点不 500 ——
+    // 这条是硬要求：字典是"可选的富化数据"，它坏了不该让整页 500。
+
+    /** 口令字典索引（可为空：裁剪过的部署 / 单测直接 new 控制器时就没有） */
+    @Autowired(required = false)
+    private PasswordDictionaryService passwordDict;
+
+    /**
+     * 密码自查的独立限流器：默认 30 次/分钟（见 {@link PublicRateLimitersConfig}）。
+     *
+     * <p>为什么不复用 {@code rateLimiter}（20 次/分钟）：这个端点一次响应最多带 200 条 suffix，
+     * 带宽比其它只读端点大一截；同时它又是"手动试一次"的低频动作 —— 30 次/分钟够用，
+     * 但绝不跟着 README 里"把 20 调到 60"的调试习惯一起放宽。
+     */
+    @Autowired(required = false)
+    @Qualifier("publicPasswordRateLimiter")
+    private PublicAskRateLimiter passwordRateLimiter;
+
+    /** 兜底上限：没有 Spring 注入时（单测/裁剪部署）使用，仍然限流，不变成"不限" */
+    @Value("${app.public-api.password.requests-per-minute:30}")
+    private int passwordRequestsPerMinute = 30;
+
+    /** 密码自查的 Cache-Control max-age：字典按天重建，5 分钟缓存足够且能挡掉重复查询（默认 300） */
+    @Value("${app.public-api.password.cache-seconds:300}")
+    private int passwordCacheSeconds = 300;
+
+    /** 单桶最多下发多少条 suffix（超过就 truncated:true；默认 200） */
+    @Value("${app.public-api.password.max-hashes:200}")
+    private int passwordMaxHashes = 200;
+
+    private volatile PublicAskRateLimiter fallbackPasswordRateLimiter;
+
     /** 应用内快照有效期；同时作为 Cache-Control 的 max-age 下发给浏览器/边缘（默认 45s，见 application.yml 注释） */
     @Value("${app.public-api.cache-seconds:45}")
     private int cacheSeconds;
@@ -1400,6 +1437,155 @@ public class PublicApiController {
             return ok(PublicIpProfileService.disabled(policy().display(ip), cacheSeconds), res);
         }
         return ok(ipProfileService.profile(ip), res);
+    }
+
+    // ==================== 密码自查（/api/public/password；别名 /password.js）====================
+
+    /**
+     * 【你的密码在攻击者字典里吗】只读投影：{@code p} = 口令 SHA-256 的<b>前 5 位</b>（小写 hex）。
+     *
+     * <h3>为什么是"桶内 hash 的后 59 位"而不是只回一个 {@code bucketCount}</h3>
+     * <ol>
+     *   <li><b>只回计数，前端判不了"命中"</b>：{@code bucketCount} 是这 5 位前缀下
+     *       <b>所有</b>口令的尝试次数合计 —— 1,048,576 个桶里撞前缀时它天然虚高，
+     *       拿它当"你的口令被尝试过 N 次"是错的（页面文案必须写"同前缀桶合计"）。</li>
+     *   <li><b>所以按公开 k-匿名查询的通行做法</b>：后端把桶内 hash 的<b>后 59 位</b>发出去，
+     *       前端用 {@code crypto.subtle} 自己算完整 hash、自己比对末尾 59 位。
+     *       后端全程<b>拿不到</b>口令，也拿不到"这个人查的是哪个 hash" —— 也就无法记录。</li>
+     *   <li><b>取舍写在明处</b>：知道前缀的人能拿到该桶的 suffix 清单，但那需要先猜到
+     *       口令的 SHA-256 前缀，与直接猜口令等价；且每桶最多 {@value PasswordDictionaryService#MAX_SUFFIXES_PER_BUCKET}
+     *       条，超出置 {@code truncated:true}（前端遇到截断必须说"可能被截断，不代表不在字典里"）。</li>
+     *   <li>{@code match} 恒为 {@code null}：后端没有口令，就不该假装能替你判定。字段保留是为了
+     *       前端契约稳定 —— "谁判定"始终是前端。</li>
+     * </ol>
+     *
+     * <h3>读不到时</h3>
+     * 字典文件缺失/格式错 ⇒ 200 + {@code available:false} + {@code notes} 写清原因（{@code DICT_FILE_MISSING}
+     * / {@code DICT_INVALID_FORMAT: …}），<b>不抛异常、不 500、不补数</b>。这是本端点最重要的诚实性要求：
+     * "读不到"绝不能被渲染成"没查到"。
+     */
+    @GetMapping({"/password", "/password.js"})
+    public ResponseEntity<Map<String, Object>> password(
+            @RequestParam(value = "p", required = false) String p,
+            HttpServletRequest req, HttpServletResponse res) {
+        PublicAskRateLimiter limiter = passwordLimiter();
+        String ip = clientIp(req);
+        if (!limiter.allow(ip)) {
+            return tooMany(res, limiter, "密码自查请求过于频繁（每 IP 每分钟 "
+                    + limiter.limitPerMinute() + " 次），请稍后再试；这是防刷，不是限制你检查自己的口令");
+        }
+        if (!PasswordDictionaryService.isLowerHex(p, PasswordDictionaryService.PREFIX_HEX_CHARS)) {
+            return badRequest(res, "INVALID_PREFIX",
+                    "p 必须是口令 SHA-256 的前 " + PasswordDictionaryService.PREFIX_HEX_CHARS
+                            + " 位小写十六进制（例如 /api/public/password?p=a1b2c）；本端点只收前缀，"
+                            + "不收口令原文、不收大写 hex、也不收前 6 位以上的部分 hash");
+        }
+
+        PasswordDictionaryService.Snapshot snap = passwordDict == null
+                ? PasswordDictionaryService.unavailable("DICT_NOT_WIRED")
+                : passwordDict.snapshot();
+
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("prefix", p);
+        data.put("match", null);
+        data.put("available", snap.available());
+        data.put("limits", passwordLimits());
+
+        if (!snap.available()) {
+            // 读不到：只写原因，不写"0 次"（0 会被读成"没被尝试过"，正是最危险的假阴性）
+            data.put("bucketCount", null);
+            data.put("bucketLastSeen", null);
+            data.put("hashes", List.of());
+            data.put("listed", List.of());
+            data.put("truncated", false);
+            data.put("notes", "读不到攻击者口令字典（" + snap.reason() + "）—— 不补数：这里没有记录，"
+                    + "不代表这个口令不在攻击者字典里；请不要把这句读成\"安全\"");
+        } else {
+            PasswordDictionaryService.Bucket bucket = snap.bucket(p);
+            int cap = Math.max(1, Math.min(passwordMaxHashes, PasswordDictionaryService.MAX_SUFFIXES_PER_BUCKET));
+            if (bucket == null) {
+                data.put("bucketCount", 0L);
+                data.put("bucketLastSeen", null);
+                data.put("hashes", List.of());
+                data.put("listed", List.of());
+                data.put("truncated", false);
+                data.put("notes", "这个前缀下没有任何记录（字典生成于 " + nz(snap.generatedAt())
+                        + "）—— 不代表绝对安全：攻击者字典不是全集，我们只统计自己蜜罐与公开弱口令榜里出现过的口令");
+            } else {
+                List<String> suffixes = bucket.suffixes();
+                List<String> listed = bucket.listed();
+                boolean truncated = suffixes.size() > cap || listed.size() > cap;
+                data.put("bucketCount", bucket.count());
+                data.put("bucketLastSeen", bucket.lastSeen());
+                data.put("hashes", suffixes.size() > cap ? suffixes.subList(0, cap) : suffixes);
+                data.put("listed", listed.size() > cap ? listed.subList(0, cap) : listed);
+                data.put("truncated", truncated);
+                data.put("notes", "bucketCount 是这 5 位前缀下**所有**口令的尝试次数合计（不是你这一个的次数）："
+                        + "命中与否由页面用完整 hash 的后 " + PasswordDictionaryService.SUFFIX_HEX_CHARS
+                        + " 位自行比对。hashes = 蜜罐里真实出现过的口令；listed = 只在公开弱口令榜里、"
+                        + "蜜罐还没抓到过的口令 —— 两者文案必须分开，别把\"榜上有名\"写成\"被攻击者试过 N 次\"。"
+                        + (truncated
+                        ? "该桶有 " + suffixes.size() + " 条（榜单 " + listed.size() + " 条），只下发前 " + cap
+                                + " 条（truncated:true）—— 你的口令不在这 " + cap
+                                + " 条里时页面会显示\"未命中\"，那可能只是被截断了，不代表不在字典里。"
+                        : ""));
+            }
+            data.put("generatedAt", snap.generatedAt());
+            data.put("totalAttempts", snap.totalAttempts());
+            data.put("unique", snap.unique());
+        }
+
+        return respondPassword(data, snap.available(), limiter, ip, res);
+    }
+
+    /** 密码自查的出口：自带 Cache-Control（public, max-age=5 分钟）与数据源标记，不复用 {@code ok(...)} */
+    private ResponseEntity<Map<String, Object>> respondPassword(
+            Map<String, Object> data, boolean available, PublicAskRateLimiter limiter,
+            String clientIp, HttpServletResponse res) {
+        res.setHeader("Cache-Control", "public, max-age=" + Math.max(0, passwordCacheSeconds));
+        res.setHeader("X-Data-Source", available ? "PASSWORD_DICT" : "PASSWORD_DICT_UNAVAILABLE");
+        res.setHeader("X-RateLimit-Limit", String.valueOf(limiter.limitPerMinute()));
+        res.setHeader("X-RateLimit-Remaining", String.valueOf(limiter.remaining(clientIp)));
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("code", 200);
+        body.put("message", "success");
+        body.put("data", data);
+        return ResponseEntity.ok(body);
+    }
+
+    /** 公开的限额口径：让页面能把"为什么只有 200 条"与"多久能再查一次"如实写出来 */
+    private Map<String, Object> passwordLimits() {
+        Map<String, Object> limits = new LinkedHashMap<>();
+        limits.put("perMinute", passwordLimiter().limitPerMinute());
+        limits.put("maxHashesPerBucket", Math.max(1,
+                Math.min(passwordMaxHashes, PasswordDictionaryService.MAX_SUFFIXES_PER_BUCKET)));
+        limits.put("cacheSeconds", Math.max(0, passwordCacheSeconds));
+        limits.put("prefixHexChars", PasswordDictionaryService.PREFIX_HEX_CHARS);
+        limits.put("suffixHexChars", PasswordDictionaryService.SUFFIX_HEX_CHARS);
+        return limits;
+    }
+
+    private static String nz(String s) {
+        return s == null || s.isBlank() ? "未知时间" : s;
+    }
+
+    /** 注入的限流器优先；没有 Spring 注入时用同口径的本地实例（仍然限流，不退化为不限） */
+    private PublicAskRateLimiter passwordLimiter() {
+        PublicAskRateLimiter l = passwordRateLimiter;
+        if (l != null) {
+            return l;
+        }
+        PublicAskRateLimiter f = fallbackPasswordRateLimiter;
+        if (f == null) {
+            synchronized (this) {
+                f = fallbackPasswordRateLimiter;
+                if (f == null) {
+                    f = new PublicAskRateLimiter(Math.max(1, passwordRequestsPerMinute));
+                    fallbackPasswordRateLimiter = f;
+                }
+            }
+        }
+        return f;
     }
 
     /** 400：参数不合法（只回机读 reason + 人话，不回任何内部细节） */

@@ -123,6 +123,10 @@ services:
       APP_PUBLIC_MASK_IPS: "${APP_PUBLIC_MASK_IPS:-false}"
       APP_PUBLIC_REMOVAL_CONTACT: "${APP_PUBLIC_REMOVAL_CONTACT:-https://xiaokeqing.cn/}"
       APP_PUBLIC_ASSET_BLOCKLIST: "${APP_PUBLIC_ASSET_BLOCKLIST:-web-01,web-02,web-03,db-01,auth.log,/api/order/detail,/upload/files/}"
+      # 攻击者口令字典索引（只含 SHA-256 前 5 位桶 + 计数 + 桶内后缀，**绝不存明文**）。
+      # 由离线脚本 scripts/password-dict-build.py 生成（明文只在该进程内存里出现，不落盘）；
+      # 运行时只读这个文件：缺失/格式错 ⇒ /api/public/password 回 available:false，服务照常启动。
+      APP_PUBLIC_PASSWORD_DICT_FILE: "${APP_PUBLIC_PASSWORD_DICT_FILE:-data/password-hashes.json}"
 
       # ===== 离线地理富化（DB-IP Lite，CC BY 4.0；RUNBOOK §26）=====
       # 与额度/检索同一个教训：**必须在 environment 段显式透传**，否则"在 .env 里加一行"不生效且不报错。

@@ -41,6 +41,20 @@ public class PublicRateLimitersConfig {
     }
 
     /**
+     * 密码自查限流器：默认 <b>30 次/分钟</b>。
+     *
+     * <p>为什么是 30（既不是 6 也不是 20）：它不花钱（纯内存查表），但一次响应最多带 200 条
+     * 59 位 hex，带宽比其它只读端点大一截；而"检查自己的口令"又是手动、低频的动作。
+     * 单独一个 Bean 是因为改上限时不该顺手动到问答（6）与只读端点（20）——
+     * 这条教训已经写进本类的类注释。
+     */
+    @Bean("publicPasswordRateLimiter")
+    public PublicAskRateLimiter publicPasswordRateLimiter(Environment env) {
+        return new PublicAskRateLimiter(
+                env.getProperty("app.public-api.password.requests-per-minute", Integer.class, 30));
+    }
+
+    /**
      * 每 IP 并发 1 守卫。
      *
      * <p>做成 Bean 而不是给类加 {@code @Component}：它<b>必须有状态</b>（在飞计数），
