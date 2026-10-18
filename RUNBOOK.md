@@ -1056,7 +1056,7 @@ deploy/secagent-capacity-srv{1,2}.{service,timer}→ 各自机 : 每 15 分钟�
 ```
 ① 应用健康：GET https://demo.xiaokeqing.cn/api/health（公网路径，等价于"外部可达性"）
              要求 HTTP 2xx 且 status=ok；顺带把 commit 记进通知正文
-② SSH 连通：ssh -i /etc/secagent/heartbeat/srv1_ed25519 root@47.96.106.187:22
+② SSH 连通：ssh -i /etc/secagent/heartbeat/srv1_ed25519 root@{公网IP-阿里云}:22
              私钥在 srv1 侧被 restrict,command=... 钉死为"只能读一份心跳"
 ③ 关键单元：从 ② 拿回的心跳 JSON 里核对
              secagent-redeploy.timer / secagent-healthwatch.timer 是否 active
@@ -1141,7 +1141,7 @@ failed_faces/三个面的原始 detail + 心跳原文）。一次故障只报一
 authorized_keys 条目：restrict,command="/opt/secagent/scripts/srv1-heartbeat.sh" ssh-ed25519 …
   restrict 关掉 pty/agent/X11/端口转发/~/.ssh/rc；command= 把能力钉死在"读一份只读心跳"。
   未加 from=（来源 IP）：srv2 出口 IP 一旦变动，dead man switch 会【静默失效】—— 悄悄不报警的报警器比没有更坏。
-  要加就 HEARTBEAT_FROM_IP=43.143.114.79 重跑 srv1-authorize-heartbeat-key.sh（脚本会备份 + 读回校验 + 失败回滚）。
+  要加就 HEARTBEAT_FROM_IP={公网IP-腾讯云} 重跑 srv1-authorize-heartbeat-key.sh（脚本会备份 + 读回校验 + 失败回滚）。
 实测（2026-10-13，从 srv2 发起）：
   ssh … secagent-heartbeat → 心跳 JSON                        ✔
   ssh … id                 → 同样只得到心跳 JSON（拿不到 uid=0）✔ 强制命令生效
@@ -1168,7 +1168,7 @@ authorized_keys 条目：restrict,command="/opt/secagent/scripts/srv1-heartbeat.
   连续 3 次探测失败（≥阈值 3，约 9 分钟），判定：整机不可用。
   失败面：health ssh units
   ① 应用健康：curl 失败(rc=7)：http://127.0.0.1:9/api/health
-  ② SSH 连通：ssh rc=255 root@47.96.106.187:9 | ssh: connect to host 47.96.106.187 port 9: Connection timed out
+  ② SSH 连通：ssh rc=255 root@{公网IP-阿里云}:9 | ssh: connect to host {公网IP-阿里云} port 9: Connection timed out
   ③ 关键单元：SSH 不可达，无法核对单元（顺带失败）
   不可用起点：2026-10-13 11:47:02（已持续 0 分 20 秒）
   --- srv1 已恢复 ---
@@ -2928,9 +2928,9 @@ bash /opt/secagent/scripts/srv1-data-backup.sh --drill     # 让 srv2 对最新�
 # ① 在 srv2 上先自证能解开（不通过就别往下走）
 sudo /usr/local/sbin/secagent-backup-drill.sh /opt/secagent-backup/<stamp>
 # ② 取回本机（由运维自己的 SSH 通道；备份通道是单向只写的）
-scp root@43.143.114.79:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc .
+scp root@{公网IP-腾讯云}:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc .
 # ③ 在 srv1 上：先验外层没坏
-sha256sum -c <(scp root@43.143.114.79:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc.sha256 - | sed "s|data-<stamp>|$PWD/data-<stamp>|")   # 或手工比对哈希
+sha256sum -c <(scp root@{公网IP-腾讯云}:/opt/secagent-backup/<stamp>/data-<stamp>.tar.gz.enc.sha256 - | sed "s|data-<stamp>|$PWD/data-<stamp>|")   # 或手工比对哈希
 # ④ 解密 + 解包（cwd 必须是 data 的父目录：manifest 里是 data/xxx 相对路径）
 openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in data-<stamp>.tar.gz.enc \
   -pass file:/opt/secagent-backup.key | tar -xzf - -C /opt/secagent
@@ -3446,7 +3446,7 @@ srv2 上原来只有 Cowrie（SSH/Telnet）和 `secagent-decoy`（8 个端口的
       └──────────────────────────────────────────────────┘
                         │
       ┌──────────────────────────────────────────────────┐
-      │ srv2   10.0.0.10（公网 43.143.114.79）            │
+      │ srv2   10.0.0.10（公网 {公网IP-腾讯云}）            │
       │                                                  │
       │  ① ufw（INPUT）        allow 445/tcp 等           │
       │  ② iptables FORWARD → DOCKER-USER  ← 顺序即安全   │
@@ -3540,12 +3540,12 @@ srv2 上原来只有 Cowrie（SSH/Telnet）和 `secagent-decoy`（8 个端口的
 - 实测告警（`alerts.json`，2026-10-14 01:0x）：
 
 ```
-2026-10-13T17:06:13.579+0000  sid=100301 lvl=6  蜜罐(Dionaea): MSSQL 连接尝试 来源=47.96.106.187:36310
-2026-10-13T17:06:13.580+0000  sid=100302 lvl=6  蜜罐(Dionaea): MySQL 连接尝试 来源=47.96.106.187:36296
-2026-10-13T17:06:13.578+0000  sid=100310 lvl=12 蜜罐(Dionaea): 同一来源 60 秒内多次协议连接（扫描/爆破）来源=47.96.106.187
+2026-10-13T17:06:13.579+0000  sid=100301 lvl=6  蜜罐(Dionaea): MSSQL 连接尝试 来源={公网IP-阿里云}:36310
+2026-10-13T17:06:13.580+0000  sid=100302 lvl=6  蜜罐(Dionaea): MySQL 连接尝试 来源={公网IP-阿里云}:36296
+2026-10-13T17:06:13.578+0000  sid=100310 lvl=12 蜜罐(Dionaea): 同一来源 60 秒内多次协议连接（扫描/爆破）来源={公网IP-阿里云}
 ```
 
-（`47.96.106.187` 是 srv1 的公网 IP —— 也就是"从另一台机器打过来"的受控验证。
+（`{公网IP-阿里云}` 是 srv1 的公网 IP —— 也就是"从另一台机器打过来"的受控验证。
 另外还有真实公网扫描器 **77.90.185.21** 自己打进来，累计触发 100310 多条，
 说明这几条规则不是纸面上的。）
 MySQL 侧还真的把登录串记下来了：
@@ -3730,7 +3730,7 @@ sudo tail -20 /opt/secagent/logs/honeypot-egress-check.log   # 每天 09:40 的�
    （备份在 `/var/backups/secagent/wazuh-rules/cowrie-rules-<时间戳>/`）。
 4. **实测（2026-10-14）**：受控登录（srv1 → Cowrie:2222）后，
    `alerts.json` 里该条描述为
-   `蜜罐: 攻击者"登录成功" 用户=secagent_probe 口令=[口令已隐藏] 来源=47.96.106.187`；
+   `蜜罐: 攻击者"登录成功" 用户=secagent_probe 口令=[口令已隐藏] 来源={公网IP-阿里云}`；
    `/api/public/alerts` 本机入口与公网域名各采样 20 次：**明文命中 0**，隐藏形态 80 次/轮。
 
 **如实记录的三条残留**：
@@ -3853,7 +3853,7 @@ GET /api/public/story
 APP_PUBLIC_STORY_TOP_SOURCES=10                 # 候选池收小（同时收窄 /story 可查来源）
 APP_PUBLIC_STORY_MAX_EVENTS_PER_STAGE=10        # 明细更小
 APP_PUBLIC_STORY_MAX_LIMIT=5                    # /stories 最多 5 条
-APP_GEOIP_SELF_IPS=43.143.114.79,47.96.106.187  # ★ 不配就会把自己服务器排上"值得看的攻击来源"
+APP_GEOIP_SELF_IPS={公网IP-腾讯云},{公网IP-阿里云}  # ★ 不配就会把自己服务器排上"值得看的攻击来源"
 # 改完按发布链重建容器（★不要用 docker compose up 手工重建，会丢 digest 引用）
 # 核对（两个端点都要看）：
 curl -s "https://demo.xiaokeqing.cn/api/public/stories?limit=3&window=24h" | jq '.data.available,.data.reason,.data.candidates'
