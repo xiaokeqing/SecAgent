@@ -205,6 +205,8 @@ app:
     #   /api/health           —— 健康检查，监控与容器 healthcheck 要用
     #   /api/playground/check —— 「试着攻击我」的公开检测接口
     #   /api/public/**        —— 博客工作台的公开只读端点（包 org.example.publicapi）
+    #   /api/openapi.json     —— 公开面的机器可读清单（手写 spec，见 OpenApiSpec）；
+    #                            同样精确匹配、只读、不调模型，不登记就会 401
     #
     # 敢把后面两个公开，是因为同时满足三条：
     #   1. 只读 —— 不写库、不改状态、不执行任何动作
@@ -213,7 +215,7 @@ app:
     #   3. 不回显原文 —— 告警的源 IP 掩码到网段、字段按白名单挑，
     #      避免变成"反射型 XSS 跳板"或"内网拓扑查询接口"
     # 处置类接口一律要求管理员角色 + 人工审批，和这条路径是两条完全分开的路。
-    white-list: /api/health,/api/playground/check,/api/public/**
+    white-list: /api/health,/api/playground/check,/api/public/**,/api/openapi.json
   # 登录账号配置（生产环境请通过环境变量 SECAGENT_PASSWORD 注入密码）
   security:
     login:
@@ -305,6 +307,11 @@ app:
     quota-file: ${APP_TTS_QUOTA_FILE:data/tts-quota.json}       # 每日额度落盘文件（重启不丢）
     history-size: ${APP_TTS_HISTORY_SIZE:200}                   # "最近生成过的回答"LRU 容量
     phrases-file: ${APP_TTS_PHRASES_FILE:classpath:tts-phrases.yml}  # 服务端短语表（app.tts.phrases.*）
+    # 自由文本出口 /api/public/tts/say 的两道日额度。与上面的短语表额度【共用同一本落盘账】，
+    # 但闸门数字各自独立：短语表认"服务端给过的文本"，这条路吃自由文本，风险不同。
+    say:
+      per-ip-daily: ${APP_TTS_SAY_PER_IP_DAILY:30}              # 单 IP 每日自由文本合成次数（访客每问一句要念一次，所以比短语表松）
+      global-daily: ${APP_TTS_SAY_GLOBAL_DAILY:300}             # 全局每日自由文本合成次数（成本闸；同一天里短语表仍可用到自己的 500）
   # ===== 公开面 IP 显示口径 + "永不公开"清单（站主 2026-10-14 拍板）=====
   # 【唯一开关】mask-ips 只被 PublicIpPolicy 读一次，再由它作用到【所有】公开端点 ——
   #   一处控制、一个口径来源，不会出现"某个端点自己判断掩不掩码"的第三种口径

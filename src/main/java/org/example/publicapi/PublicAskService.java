@@ -82,6 +82,15 @@ public class PublicAskService {
     @Autowired(required = false)
     private PublicIpPolicy ipPolicy;
 
+    /**
+     * 日语改写器（{@code speakJa}）：<b>可选</b>依赖。
+     *
+     * <p>{@code required = false}：单测里直接 {@code new PublicAskService()}、或者部署时没配模型，
+     * 这条线就如实"没有声音"，公开问答本身照旧 200 —— 语音永远是锦上添花，不是前置条件。
+     */
+    @Autowired(required = false)
+    private PublicSpeakJaWriter speakJaWriter;
+
     private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
 
     private PublicIpPolicy policy() {
@@ -90,13 +99,67 @@ public class PublicAskService {
     }
 
     /**
-     * 回答一次公开提问。
+     * 回答一次公开提问（不出声版本）。
+     *
+     * <p>等价于 {@code ask(question, clientIp, false)}：响应里 {@code speakJa} 恒为 {@code null}，
+     * 并且<b>一次模型调用都不会多花</b>。保留这个重载是因为既有调用方（与测试）只需要回答本体。
      *
      * @param question 访客问题（未脱敏、未校验）
      * @param clientIp 调用方 IP（仅用于日志与状态说明，不参与身份判定）
      * @return 结构化结果：answer / state / stateLabel / citations / quota / notes
      */
     public Map<String, Object> ask(String question, String clientIp) {
+        return ask(question, clientIp, false);
+    }
+
+    /**
+     * 回答一次公开提问，可选地附一句日语口语（{@code speakJa}）。
+     *
+     * <h3>{@code speakJa} 与回答本体的关系：单向依赖，只有它坏，没有它拖坏别人</h3>
+     * 顺序是"先把回答做完，再追加改写"。所以：
+     * <ul>
+     *   <li>改写超时（3s）/ 失败 / 产出不合规 ⇒ {@code speakJa = null}，{@code answer}/{@code state}
+     *       与不带这个开关时<b>逐字相同</b>；</li>
+     *   <li>{@code wantSpeakJa = false} ⇒ 连模型都不调（见 {@code askBody.speakJa} 的取舍）；</li>
+     *   <li>字段<b>总是存在</b>（没请求/失败都是 {@code null}）：前端只要判断真假，
+     *       不必区分"字段缺失"和"没有声音"这两种情况 —— 那两种情况的处理是一样的。</li>
+     * </ul>
+     *
+     * @param question     访客问题
+     * @param clientIp     调用方 IP
+     * @param wantSpeakJa  调用方是否显式要日语语音（前端仅在"声音已开"时才置 true）
+     * @return 结构化结果（含 speakJa）
+     */
+    public Map<String, Object> ask(String question, String clientIp, boolean wantSpeakJa) {
+        Map<String, Object> data = doAsk(question, clientIp);
+        data.put("speakJa", wantSpeakJa ? speakJa(data.get("answer")) : null);
+        return data;
+    }
+
+    /**
+     * 拿回答正文换一句日语；任何异常都在这里收口成 {@code null}。
+     *
+     * <p>为什么再包一层 try/catch：{@link PublicSpeakJaWriter#rewrite} 自己已经把所有失败
+     * 收成 null 了，但"它自己也不该有的异常"（比如自定义线程池在关闭过程中抛的
+     * {@code RejectedExecutionException}）一旦漏到这层，会把一次本来成功的问答变成 500。
+     * 语音出问题绝不配得上那个代价。
+     */
+    private String speakJa(Object answer) {
+        if (!(answer instanceof String text) || text.isBlank() || speakJaWriter == null) {
+            return null;
+        }
+        try {
+            return speakJaWriter.rewrite(text);
+        } catch (RuntimeException e) {
+            logger.info("日语改写异常收口（不影响回答本体）：{}", e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * 回答本体（改造前的 {@code ask(...)} 原样搬进来，只改了名字）。
+     */
+    private Map<String, Object> doAsk(String question, String clientIp) {
         String q = question == null ? "" : question.trim();
 
         Map<String, Object> data = baseEnvelope(clientIp);

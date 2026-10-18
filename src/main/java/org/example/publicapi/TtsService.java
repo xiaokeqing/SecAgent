@@ -160,6 +160,128 @@ public class TtsService {
     }
 
     /**
+     * 合成一段<b>服务端自己写的</b>文本（定时任务 / 日报专用），不经过短语表闸。
+     *
+     * <h3>它和上面两个入口的关系</h3>
+     * <ul>
+     *   <li>{@link #synthesize(String, String, String)}：公开端点，只认服务端给过的文本（短语表 / 最近回答）；</li>
+     *   <li>{@link #say(String, String, int, int)}：公开端点，只认一段<b>字符集受限</b>的日语；</li>
+     *   <li>本方法：<b>没有公开路由</b>，只由 {@code org.example.report.TtsSpeechSynthesizer} 调用，
+     *       文本由日报服务自己生成（不是用户输入，也就没有"被当免费朗读 API"的面）。</li>
+     * </ul>
+     *
+     * <h3>为什么不吃每日额度</h3>
+     * {@code app.tts.per-ip-daily / global-daily} 是给<b>公开面</b>抗滥用的账：用完了页面上的 🔊 就哑了。
+     * 定时任务每天固定一次、没有任何外部触发面，把它记进同一本账只会让公众额度被自己人吃掉。
+     * 但它<b>仍然受总开关与 Key 判定约束</b>：没启用 / 没 Key 就明确失败，绝不静默产出空音频。
+     *
+     * <h3>为什么固定走 CosyVoice</h3>
+     * 日报语音要的是"日语口语播报"，CosyVoice 的返回格式（24kHz wav）与它的语言能力是配套的。
+     * provider 不是 cosyvoice 时直接拒绝，而不是悄悄换成另一个供应商 —— 换供应商是配置变更，
+     * 不该由一次日报生成顺手做掉。
+     *
+     * @param text 服务端生成的播报文本（≤ {@code app.tts.max-chars}）
+     * @return 音频字节（CosyVoice：wav）
+     * @throws TtsException 未启用 / 没 Key / 超长 / 非 CosyVoice / 上游失败
+     */
+    public byte[] synthesize(String text) {
+        if (!config.isEnabled()) {
+            throw new TtsException(503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
+        }
+        String t = text == null ? "" : text.strip();
+        if (t.isEmpty()) {
+            throw new TtsException(400, "TEXT_EMPTY", "text 不能为空");
+        }
+        if (!config.isCosyVoice()) {
+            throw new TtsException(503, "PROVIDER_NOT_COSYVOICE",
+                    "日报语音需要 app.tts.provider=cosyvoice（当前 " + config.getProvider() + "）");
+        }
+        if (t.length() > config.getMaxChars()) {
+            throw new TtsException(400, "TEXT_TOO_LONG",
+                    "文本长度 " + t.length() + " 超过上限 " + config.getMaxChars() + " 字符");
+        }
+        if (!config.apiKeyConfigured()) {
+            throw new TtsException(503, "KEY_MISSING", "上游 Key 未配置（APP_TTS_API_KEY）");
+        }
+        byte[] audio = callCosyVoice(t);
+        if (audio == null || audio.length == 0) {
+            throw new TtsException(502, "UPSTREAM_EMPTY", "上游返回空音频");
+        }
+        return audio;
+    }
+
+    /**
+     * 合成一段<b>自由文本</b>（{@code /api/public/tts/say} 专用）。
+     *
+     * <h3>它和 {@link #synthesize} 的关系：同一条管道，只换了<em>入口闸</em></h3>
+     * 短语表那条线（{@code /api/public/tts}）的红线是"只认服务端给过的文本"。
+     * 那条线<b>不动</b>：这个方法是<b>另一个</b>方法，闸 1 从"查表"换成了
+     * {@link JapaneseSpeakText#isSpeakableJa}（日语字符集白名单）+ 更短的长度上限。
+     *
+     * <p>换句话说：自由文本这条路能说出来的东西，是<b>一段有限长度、字符集受限的日语</b>；
+     * 它不能代理任意文本 —— 而"任意文本"正是滥用者想要的东西（拿它当免费翻译/朗读 API、
+     * 或者把整篇英文文档念出来）。所以长度与字符集不是体验参数，是防滥用的一部分。
+     * 后面几道闸（磁盘缓存、Key 判定、每日额度、上游调用）与短语表那条<b>逐字相同，
+     * 且共用同一本额度账</b> —— 真实的钱是同一笔，账就该是同一本。
+     *
+     * @param text        要念的日语（≤ {@link JapaneseSpeakText#SAY_MAX_CHARS} 码点）
+     * @param clientIp    调用方 IP（额度按它分桶）
+     * @param perIpDaily  本端点每 IP 每日上限（{@code app.tts.say.per-ip-daily}）
+     * @param globalDaily 本端点全局每日上限（{@code app.tts.say.global-daily}）
+     * @return 音频字节 + 是否缓存命中
+     * @throws TtsException 400 文本不合规 / 429 额度 / 503 未启用或缺 Key / 502 上游失败
+     */
+    public Result say(String text, String clientIp, int perIpDaily, int globalDaily) {
+        // 闸 0：总开关（与短语表同一条口径）
+        if (!config.isEnabled()) {
+            throw new TtsException(503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
+        }
+
+        // 闸 1：自由文本的入口检查 —— 长度 + 字符集。
+        // 注意这里【不做】任何"修正"：不做繁简转换、不删非法字符、不截断。
+        // 静默改写输入会让调用方以为它念的是自己给的那句话。
+        String t = text == null ? "" : text.strip();
+        if (t.isEmpty()) {
+            throw new TtsException(400, "TEXT_EMPTY", "text 不能为空");
+        }
+        int chars = JapaneseSpeakText.length(t);
+        if (chars > JapaneseSpeakText.SAY_MAX_CHARS) {
+            throw new TtsException(400, "TEXT_TOO_LONG",
+                    "自由文本语音上限 " + JapaneseSpeakText.SAY_MAX_CHARS + " 字符（本次 " + chars + " 字符）");
+        }
+        if (!JapaneseSpeakText.isSpeakableJa(t)) {
+            throw new TtsException(400, "TEXT_CHARSET_NOT_ALLOWED",
+                    "只接受日语：平假名 / 片假名 / 汉字 / 数字 / 标点");
+        }
+
+        // 缓存：同 voiceId + 同文本只合成一次（内容寻址，和短语表那条共用一个缓存目录）
+        String key = TtsCache.keyOf(config.getVoiceId(), t);
+        byte[] cached = cache.get(key);
+        if (cached != null) {
+            logger.debug("TTS(say) 缓存命中（{} 字节）：本轮未调上游", cached.length);
+            return new Result(cached, true);
+        }
+
+        // Key 缺失：在扣额度之前判定（没 Key 就不该记这笔账）
+        if (!config.apiKeyConfigured()) {
+            throw new TtsException(503, "KEY_MISSING", "上游 Key 未配置（APP_TTS_API_KEY）");
+        }
+
+        // 闸 2：每日额度（与短语表共用同一本落盘账；上限用本端点自己的两个数）
+        TtsQuotaStore.Decision decision = quota.tryConsume(clientIp, perIpDaily, globalDaily);
+        if (!decision.allowed()) {
+            String message = TtsQuotaStore.REASON_PER_IP.equals(decision.reason())
+                    ? "本来源今日自由语音额度已用完（上限 " + decision.perIpLimit() + " 次/天），明日恢复"
+                    : "本站今日自由语音额度已用完（全局上限 " + decision.globalLimit() + " 次/天），明日恢复";
+            throw new TtsException(429, decision.reason(), message);
+        }
+
+        byte[] audio = callUpstream(t);
+        cache.put(key, audio);
+        return new Result(audio, false);
+    }
+
+    /**
      * 记录一条"刚生成过的回答"，返回它的 textHash（sha512 前 32 位）。
      *
      * <p>这是 textHash 闸的<b>唯一</b>文本来源：只有服务端自己产出过、并且刚被记录的回答

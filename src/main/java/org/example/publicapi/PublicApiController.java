@@ -435,6 +435,20 @@ public class PublicApiController {
     @Autowired(required = false)
     private TtsService ttsService;
 
+    /**
+     * 自由文本语音（{@code POST /api/public/tts/say}）的两道日额度。
+     *
+     * <p>为什么比短语表那条（默认 20 / 500）更紧、更松各一半：访客每问一句都要念一次，
+     * 每 IP 放 30 次才够正常读几轮答案；而全局 300 是<b>成本闸</b> ——
+     * 一次自由文本合成和一次短语合成花的是同一笔上游的钱，但自由文本没有短语表那种
+     * "文本已定"的可预测性，所以全局只给 300。这两个数与短语表共用同一本落盘额度账。
+     */
+    @Value("${app.tts.say.per-ip-daily:30}")
+    private int ttsSayPerIpDaily;
+
+    @Value("${app.tts.say.global-daily:300}")
+    private int ttsSayGlobalDaily;
+
     /** 单次公开问答的请求体长度上限（比服务内的字符上限略宽，挡住超大 body） */
     @Value("${app.public-api.ask.max-body-chars:4000}")
     private int maxBodyChars;
@@ -481,7 +495,9 @@ public class PublicApiController {
 
         try {
             String question = extractQuestion(body);
-            Map<String, Object> data = publicAskService.ask(question, ip);
+            // 要不要顺带一句日语语音（speakJa）：只有调用方显式要才做 ——
+            // 那是一次额外的模型调用，关着声音的访客不该替别人付这笔钱。
+            Map<String, Object> data = publicAskService.ask(question, ip, wantSpeakJa(body));
 
             // 记一条"刚生成过的回答"，并把它的 textHash 一并发给前端 ——
             // 这是 /api/public/tts 的 textHash 闸【唯一】的文本来源：只有服务端
@@ -658,6 +674,64 @@ public class PublicApiController {
     }
 
     /**
+     * 自由文本语音：{@code POST /api/public/tts/say}，body {@code {"text":"…"}}。
+     *
+     * <h3>它为什么必须存在</h3>
+     * 短语表那条线（{@link #tts}）只认服务端给过的文本。但"把 AI 回答念出来"这句话里的
+     * 回答是<b>每次都不一样</b>的 —— 短语表天生覆盖不到。所以需要一个吃自由文本的出口。
+     *
+     * <h3>它凭什么敢吃自由文本</h3>
+     * 把"滥用者想要的东西"逐项拿掉，剩下的就是安全的那个子集：
+     * <ul>
+     *   <li><b>长度 ≤60 字</b>：一次合成的成本有上界，也念不了整篇文档；</li>
+     *   <li><b>字符集 = 日语（平假名/片假名/汉字/数字/标点）</b>：当不了通用朗读/翻译 API ——
+     *       它连英文都念不出来（音色是日语复刻音色，念英文本来也听不出是什么）；</li>
+     *   <li><b>每 IP 每天 30 次 + 全局每天 300 次</b>：与短语表共用同一本落盘额度账；</li>
+     *   <li><b>磁盘缓存</b>：同一句只合成一次（内容寻址 {@code sha256(voiceId+text)}），
+     *       热门台词重复请求不重复花钱；</li>
+     *   <li><b>上游失败 502</b>：与短语表同一条归一化路径，<b>不打印上游响应体</b>
+     *       （401/403 连片段都不打）。</li>
+     * </ul>
+     *
+     * <p><b>与 {@code /tts} 不冲突</b>：那条路径的鉴权闸（短语表 / textHash）一行都没改；
+     * 这是新增的第二个入口，不是对第一个入口的放宽。
+     */
+    @PostMapping("/tts/say")
+    public ResponseEntity<?> ttsSay(@RequestBody(required = false) Map<String, Object> body,
+                                    HttpServletRequest req,
+                                    HttpServletResponse res) {
+        String ip = clientIp(req);
+
+        // ① 频率闸：与其它公开端点共用同一个限流器（同一本账，不另开一个桶）
+        if (!rateLimiter.allow(ip)) {
+            res.setHeader(HttpHeaders.RETRY_AFTER, "60");
+            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
+            res.setHeader("X-RateLimit-Remaining", "0");
+            return ttsError(res, 429, "RATE_LIMITED",
+                    "语音请求过于频繁（每 IP 每分钟 " + rateLimiter.limitPerMinute() + " 次），请稍后再试");
+        }
+
+        if (ttsService == null) {
+            return ttsError(res, 503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
+        }
+
+        try {
+            TtsService.Result result = ttsService.say(
+                    bodyString(body, "text"), ip, ttsSayPerIpDaily, ttsSayGlobalDaily);
+            res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
+            res.setHeader("X-Tts-Cache", result.cacheHit() ? "HIT" : "MISS");
+            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
+            MediaType media = ttsService.config().isCosyVoice() ? TTS_AUDIO_WAV : TTS_AUDIO;
+            return ResponseEntity.ok().contentType(media).body(result.audio());
+        } catch (TtsService.TtsException e) {
+            // 归一化的 reason 码（TEXT_TOO_LONG / TEXT_CHARSET_NOT_ALLOWED / PER_IP_DAILY_LIMIT …）
+            // message 是人话，绝不含 Key、上游原文或 URL 细节。
+            logger.warn("公开 TTS(say) 未完成：reason={} status={}", e.reason(), e.httpStatus());
+            return ttsError(res, e.httpStatus(), e.reason(), e.userMessage());
+        }
+    }
+
+    /**
      * 语音端点的失败响应：既有 JSON 信封 + {@code reason} 码（零 IP、零上游细节）。
      *
      * <p>{@code Cache-Control: no-store}：错误不该被边缘或浏览器缓存住 ——
@@ -680,6 +754,29 @@ public class PublicApiController {
         }
         Object value = body.get(key);
         return value == null ? null : String.valueOf(value);
+    }
+
+    /**
+     * 请求体里的「要日语语音」开关：只认 {@code speakJa} 一个键。
+     *
+     * <p>为什么做成<b>显式 opt-in</b> 而不是无条件生成：{@code speakJa} 是一次真实的模型调用
+     * （走公开池额度）。绝大多数访客是静音浏览的，替他们每次问答多花一份钱、多等最多 3 秒，
+     * 换来的东西他们根本不会打开。所以"要不要"由调用方说 —— 前端只在
+     * {@code __xkSound.on} 为真时才带这个字段。
+     *
+     * <p>接受的形态：布尔 {@code true}、数字 {@code 1}、字符串 {@code "true"/"1"/"yes"}（大小写不敏感）。
+     * 其余一律当作"不要"——宁可少说一句，也不要解析出一个意外的 {@code true}。
+     */
+    private static boolean wantSpeakJa(Map<String, Object> body) {
+        if (body == null) {
+            return false;
+        }
+        Object v = body.get("speakJa");
+        if (v instanceof Boolean b) {
+            return b;
+        }
+        String s = v == null ? "" : String.valueOf(v).trim();
+        return s.equalsIgnoreCase("true") || s.equals("1") || s.equalsIgnoreCase("yes");
     }
 
     /** 请求体取问题：只认 {@code question} / {@code q} 两个键，其余一律忽略 */
