@@ -1131,6 +1131,9 @@ public class WazuhService implements WazuhGateway {
         long withIp = present.path("doc_count").asLong(0);
 
         Map<String, Long> byIp = new LinkedHashMap<>();
+        // 每个 IP 的"按小时分布"（稀疏桶：只有有数据的整点）。取不到就整套为空 ——
+        // GeoAggregator 据此把 byCountryHour 如实标成 available:false，而不是摊分合计。
+        Map<String, Map<String, Long>> hourByIp = new LinkedHashMap<>();
         boolean truncated = false;
         for (int i = 0; i < fieldCount; i++) {
             JsonNode buckets = aggs.path("by_ip_" + i).path("buckets");
@@ -1146,6 +1149,17 @@ public class WazuhService implements WazuhGateway {
                     continue;
                 }
                 byIp.merge(ip, b.path("doc_count").asLong(0), Long::sum);
+                JsonNode hourBuckets = b.path("by_hour").path("buckets");
+                if (hourBuckets.isArray()) {
+                    Map<String, Long> hm = hourByIp.computeIfAbsent(ip, k -> new LinkedHashMap<>());
+                    for (JsonNode hb : hourBuckets) {
+                        String hl = hourLabel(hb);
+                        long c = hb.path("doc_count").asLong(0);
+                        if (!hl.isEmpty() && c > 0) {
+                            hm.merge(hl, c, Long::sum);
+                        }
+                    }
+                }
             }
         }
         List<org.example.geoip.GeoAggregator.IpCount> counts = new ArrayList<>();
@@ -1153,19 +1167,24 @@ public class WazuhService implements WazuhGateway {
                 .sorted(java.util.Comparator
                         .comparingLong((Map.Entry<String, Long> e) -> e.getValue()).reversed()
                         .thenComparing(Map.Entry::getKey))
-                .forEach(e -> counts.add(new org.example.geoip.GeoAggregator.IpCount(e.getKey(), e.getValue())));
+                .forEach(e -> counts.add(new org.example.geoip.GeoAggregator.IpCount(
+                        e.getKey(), e.getValue(), hourByIp.getOrDefault(e.getKey(), Map.of()))));
 
         List<org.example.geoip.GeoAggregator.TrendPoint> trend = new ArrayList<>();
         for (JsonNode b : present.path("by_hour").path("buckets")) {
-            String local = WazuhTime.toLocal(b.path("key_as_string").asText(""));
-            // date_histogram 的 key 就是整点，取到分钟即可（"2026-10-13 20:00:00" → "2026-10-13T20:00"）
-            String ts = local.length() >= 16 ? local.substring(0, 16).replace(' ', 'T') : local;
-            trend.add(new org.example.geoip.GeoAggregator.TrendPoint(ts, b.path("doc_count").asLong(0)));
+            trend.add(new org.example.geoip.GeoAggregator.TrendPoint(hourLabel(b), b.path("doc_count").asLong(0)));
         }
         if (counts.isEmpty()) {
             return org.example.geoip.GeoWindow.empty(total);
         }
         return new org.example.geoip.GeoWindow(true, "OK", null, total, withIp, truncated, counts, trend);
+    }
+
+    /** date_histogram 桶 → 本地整点标签（{@code yyyy-MM-dd'T'HH:mm}，与 trend 同一个格式，可对齐） */
+    private static String hourLabel(JsonNode bucket) {
+        String local = WazuhTime.toLocal(bucket.path("key_as_string").asText(""));
+        // date_histogram 的 key 就是整点，取到分钟即可（"2026-10-13 20:00:00" → "2026-10-13T20:00"）
+        return local.length() >= 16 ? local.substring(0, 16).replace(' ', 'T') : local;
     }
 
     /**

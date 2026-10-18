@@ -1284,6 +1284,13 @@ public class PublicApiController {
         data.put("byProvinceCN", List.of());
         data.put("byAsnTop", List.of());
         data.put("trend", List.of());
+        // 小时 × 国家 这一块即便端点整体不可用也保持同形（前端只判 available 一个开关）
+        Map<String, Object> byCountryHour = new LinkedHashMap<>();
+        byCountryHour.put("available", false);
+        byCountryHour.put("reason", "HOUR_CROSS_MISSING");
+        byCountryHour.put("hours", List.of());
+        byCountryHour.put("series", List.of());
+        data.put("byCountryHour", byCountryHour);
         data.put("note", note + " " + org.example.geoip.GeoIpService.ATTRIBUTION);
         return data;
     }

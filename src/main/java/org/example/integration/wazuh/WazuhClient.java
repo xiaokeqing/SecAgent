@@ -510,8 +510,15 @@ public class WazuhClient {
         java.util.Map<String, Object> aggs = new java.util.LinkedHashMap<>();
         int i = 0;
         for (String f : srcFields) {
-            aggs.put("by_ip_" + (i++), java.util.Map.of("terms",
-                    java.util.Map.of("field", f, "size", size)));
+            // 每个 IP 桶再挂一层按小时的子聚合：这是"小时 × 国家"交叉的**唯一**来源。
+            // 国家只有应用侧（离线库）认得，所以交叉只能在拿到"每个 IP 每小时多少条"之后做。
+            // 子聚合用默认 min_doc_count（稀疏桶，只回有数据的整点），
+            // 不带 extended_bounds —— 否则 1000 个 IP × 24 个空桶会把响应撑大十倍。
+            aggs.put("by_ip_" + (i++), java.util.Map.of(
+                    "terms", java.util.Map.of("field", f, "size", size),
+                    "aggs", java.util.Map.of("by_hour", java.util.Map.of("date_histogram", java.util.Map.of(
+                            "field", "@timestamp",
+                            "fixed_interval", "1h")))));
         }
         aggs.put("src_present", java.util.Map.of(
                 "filter", java.util.Map.of("bool", java.util.Map.of("should", should, "minimum_should_match", 1)),

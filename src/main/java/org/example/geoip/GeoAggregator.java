@@ -40,8 +40,23 @@ public final class GeoAggregator {
     private GeoAggregator() {
     }
 
-    /** 一条"来源 IP → 24 小时告警条数" */
-    public record IpCount(String ip, long count) {
+    /**
+     * 一条"来源 IP → 24 小时告警条数"，外加<b>该 IP 按小时的分布</b>（{@code hour → count}）。
+     *
+     * <p>{@code hourly} 是"小时 × 国家"交叉的唯一来源：国家只有 Java 侧（离线库）认得，
+     * 所以交叉只能在拿到"每个 IP 每个小时多少条"之后做（indexer 的 per-IP 子聚合提供）。
+     * 取不到时它就是空 map —— 此时不做任何摊派，{@code byCountryHour} 如实 {@code available:false}。
+     */
+    public record IpCount(String ip, long count, Map<String, Long> hourly) {
+
+        public IpCount {
+            hourly = hourly == null ? Map.of() : hourly;
+        }
+
+        /** 兼容旧调用方：没有按小时分布（= 只有 24h 合计） */
+        public IpCount(String ip, long count) {
+            this(ip, count, Map.of());
+        }
     }
 
     /** 时间桶（已换算成本地时间的 {@code yyyy-MM-dd'T'HH:mm}） */
@@ -103,6 +118,9 @@ public final class GeoAggregator {
         Map<String, Map<String, long[]>> provinceByCountry = new LinkedHashMap<>();
         Map<Integer, long[]> asnAgg = new LinkedHashMap<>();
         Map<Integer, String> asnOrgs = new LinkedHashMap<>();
+        // 小时 × 国家：country → (hour → count)。只在 indexer 真的给了 per-IP 小时桶时才有值
+        Map<String, Map<String, Long>> hourByCountry = new LinkedHashMap<>();
+        boolean hourCross = false;
         long geocoded = 0;
         long internal = 0;
         long reserved = 0;
@@ -141,6 +159,16 @@ public final class GeoAggregator {
                 String prov = info.getProvince() == null ? "未知" : info.getProvince();
                 bump(provinceByCountry.computeIfAbsent(cc, k -> new LinkedHashMap<>())
                         .computeIfAbsent(prov, k -> new long[2]), ic.count());
+                // 小时 × 国家：把该 IP 的每小时条数直接记到它的国家名下（没有任何摊派）
+                if (ic.hourly() != null && !ic.hourly().isEmpty()) {
+                    hourCross = true;
+                    Map<String, Long> dst = hourByCountry.computeIfAbsent(cc, k -> new LinkedHashMap<>());
+                    for (Map.Entry<String, Long> he : ic.hourly().entrySet()) {
+                        if (he.getKey() != null && he.getValue() != null && he.getValue() > 0) {
+                            dst.merge(he.getKey(), he.getValue(), Long::sum);
+                        }
+                    }
+                }
             }
             if (info.getAsn() > 0) {
                 bump(asnAgg.computeIfAbsent(info.getAsn(), k -> new long[2]), ic.count());
@@ -230,6 +258,8 @@ public final class GeoAggregator {
             }
         }
 
+        Map<String, Object> byCountryHour = byCountryHour(hourByCountry, hourCross, trend);
+
         Map<String, Object> coverage = emptyCoverage();
         coverage.put("totalAlerts", Math.max(0L, in == null ? 0L : in.alertsTotal24h()));
         coverage.put("withSourceIp", Math.max(0L, in == null ? 0L : in.alertsWithSourceIp24h()));
@@ -270,12 +300,128 @@ public final class GeoAggregator {
         data.put("byProvinceCN", byProvinceCN);
         data.put("byAsnTop", byAsnTop);
         data.put("trend", trend);
+        data.put("byCountryHour", byCountryHour);
         data.put("note", "只给聚合：响应里不含任何 IP（连掩码 IP 都没有）、不含单条告警、不含内网资产。"
                 + "分母以 coverage 为准（totalAlerts 是窗口内全部告警，withSourceIp 才是画地图用的那批）；"
                 + "trend 是「带来源 IP 的告警」按本地时间的小时分桶（24 点）；"
                 + "入榜门槛 count>=" + t.minCount() + " 且占比>=" + t.minSharePercent() + "%。"
                 + GeoIpService.ATTRIBUTION);
         return data;
+    }
+
+    /** 回放里最多画多少条国家曲线（其余并入 {@code OTHER}）：再多也只是把地图糊成一团 */
+    static final int MAX_HOUR_COUNTRIES = 12;
+
+    /**
+     * 「小时 × 国家」载荷：{@code {"available":true,"hours":[24 个整点],"series":[{"country":"FR","counts":[...]}]}}。
+     *
+     * <p><b>不摊分是红线</b>：这里的每个数字都是 indexer 里"这个 IP 在这个小时"的真实条数，
+     * 按它所属的国家累加而成。拿不到 per-IP 小时桶（{@code hourCross=false}）时整块
+     * {@code available:false + reason}，<b>绝不</b>把 24h 合计按比例拆到小时上。
+     *
+     * <p>{@code hours} 取自 trend 的整点标签（同一批数据、同一个窗口）；末尾"当前小时"未走完，
+     * 与站点 {@code scripts/geo/hourly.py} 的既有口径一致地丢掉（保留此前 24 个整点）。
+     */
+    static Map<String, Object> byCountryHour(Map<String, Map<String, Long>> hourByCountry,
+                                             boolean hourCross,
+                                             List<Map<String, Object>> trend) {
+        List<String> hours = new ArrayList<>();
+        if (trend != null) {
+            for (Map<String, Object> p : trend) {
+                Object ts = p == null ? null : p.get("ts");
+                if (ts != null) {
+                    hours.add(String.valueOf(ts));
+                }
+            }
+        }
+        // trend 是 min_doc_count:0 + extended_bounds 的稠密桶：通常 25 个（首尾各一个未走完的边界桶）。
+        // 只丢**末尾**那个"当前小时"（窗口没走完），保留此前 24 个整点。
+        if (hours.size() > 24) {
+            hours = new ArrayList<>(hours.subList(hours.size() - 25, hours.size() - 1));
+        }
+
+        Map<String, Object> block = new LinkedHashMap<>();
+        if (!hourCross) {
+            block.put("available", false);
+            block.put("reason", "HOUR_CROSS_MISSING");
+            block.put("hours", List.of());
+            block.put("series", List.of());
+            return block;
+        }
+        if (hours.isEmpty()) {
+            block.put("available", false);
+            block.put("reason", "HOUR_LABELS_MISSING");
+            block.put("hours", List.of());
+            block.put("series", List.of());
+            return block;
+        }
+
+        Map<String, long[]> rows = new LinkedHashMap<>();
+        for (Map.Entry<String, Map<String, Long>> e : hourByCountry.entrySet()) {
+            long[] arr = new long[hours.size()];
+            long total = 0L;
+            for (int i = 0; i < hours.size(); i++) {
+                Long v = e.getValue().get(hours.get(i));
+                if (v != null && v > 0) {
+                    arr[i] = v;
+                    total += v;
+                }
+            }
+            // 只保留窗口内真有数据的国家：窗口外的桶（例如刚被丢掉的那个整点）不算
+            if (total > 0) {
+                rows.put(e.getKey(), arr);
+            }
+        }
+        List<String> order = new ArrayList<>(rows.keySet());
+        order.sort(Comparator.comparingLong((String cc) -> sumOf(rows.get(cc))).reversed()
+                .thenComparing(cc -> cc));
+
+        List<Map<String, Object>> series = new ArrayList<>();
+        long[] other = new long[hours.size()];
+        boolean otherHasData = false;
+        for (int idx = 0; idx < order.size(); idx++) {
+            long[] arr = rows.get(order.get(idx));
+            if (idx < MAX_HOUR_COUNTRIES) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("country", order.get(idx));
+                row.put("counts", toCountList(arr));
+                series.add(row);
+            } else {
+                for (int i = 0; i < arr.length; i++) {
+                    if (arr[i] > 0) {
+                        other[i] += arr[i];
+                        otherHasData = true;
+                    }
+                }
+            }
+        }
+        if (otherHasData) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("country", "OTHER");
+            row.put("counts", toCountList(other));
+            series.add(row);
+        }
+        block.put("available", !series.isEmpty());
+        block.put("reason", series.isEmpty() ? "NO_HOUR_COUNTRY_DATA" : null);
+        block.put("hours", hours);
+        block.put("series", series);
+        return block;
+    }
+
+    private static long sumOf(long[] arr) {
+        long s = 0L;
+        for (long v : arr) {
+            s += v;
+        }
+        return s;
+    }
+
+    private static List<Long> toCountList(long[] arr) {
+        List<Long> out = new ArrayList<>(arr.length);
+        for (long v : arr) {
+            out.add(v);
+        }
+        return out;
     }
 
     /** 累加：{@code agg[0] += count}，{@code agg[1]++}（独立 IP 数按"一个 IP 一次"计） */

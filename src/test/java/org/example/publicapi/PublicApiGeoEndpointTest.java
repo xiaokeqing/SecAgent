@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import static org.hamcrest.Matchers.hasSize;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -221,6 +222,59 @@ class PublicApiGeoEndpointTest {
                 .andExpect(jsonPath("$.data.reason").value("NO_DATA_IN_WINDOW"))
                 .andExpect(jsonPath("$.data.coverage.totalAlerts").value(111031))
                 .andExpect(jsonPath("$.data.byCountry").isEmpty());
+    }
+
+    @Test
+    @DisplayName("小时 × 国家：有 per-IP 小时桶 → 24 点真实交叉；拿不到 → available:false 且不摊分")
+    void byCountryHourIsRealCrossOrHonestlyUnavailable() throws Exception {
+        baseController();
+        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+
+        // 25 个整点标签（与真实响应同形：extended_bounds 给出首尾两个边界桶，末尾那个是"当前小时"）
+        List<GeoAggregator.TrendPoint> trend = new java.util.ArrayList<>();
+        for (int i = 0; i <= 24; i++) {
+            trend.add(new GeoAggregator.TrendPoint(String.format("2026-10-13T%02d:00", i), 10));
+        }
+
+        // 有交叉数据：CN 的 12 条落在 00/01 点，US 的 4 条落在 02 点
+        wireSource("REAL", new GeoWindow(true, "OK", null, 1000, 16, false,
+                List.of(new GeoAggregator.IpCount("1.0.1.1", 12,
+                                java.util.Map.of("2026-10-13T00:00", 5L, "2026-10-13T01:00", 7L)),
+                        new GeoAggregator.IpCount("1.0.3.1", 4,
+                                java.util.Map.of("2026-10-13T02:00", 4L))),
+                trend));
+
+        mvc().perform(get("/api/public/geo"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.byCountryHour.available").value(true))
+                .andExpect(jsonPath("$.data.byCountryHour.hours", hasSize(24)))
+                .andExpect(jsonPath("$.data.byCountryHour.hours[0]").value("2026-10-13T00:00"))
+                .andExpect(jsonPath("$.data.byCountryHour.hours[23]").value("2026-10-13T23:00"))
+                .andExpect(jsonPath("$.data.byCountryHour.series[0].country").value("CN"))
+                .andExpect(jsonPath("$.data.byCountryHour.series[0].counts", hasSize(24)))
+                .andExpect(jsonPath("$.data.byCountryHour.series[0].counts[0]").value(5))
+                .andExpect(jsonPath("$.data.byCountryHour.series[0].counts[1]").value(7))
+                .andExpect(jsonPath("$.data.byCountryHour.series[0].counts[2]").value(0))
+                .andExpect(jsonPath("$.data.byCountryHour.series[1].country").value("US"))
+                .andExpect(jsonPath("$.data.byCountryHour.series[1].counts[2]").value(4));
+
+        // 拿不到交叉数据（旧解析/子聚合缺失）：整块 available:false，且**不拿合计摊到小时**
+        baseController();
+        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        wireSource("REAL", new GeoWindow(true, "OK", null, 1000, 16, false,
+                List.of(new GeoAggregator.IpCount("1.0.1.1", 12),
+                        new GeoAggregator.IpCount("1.0.3.1", 4)),
+                trend));
+
+        mvc().perform(get("/api/public/geo"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.byCountryHour.available").value(false))
+                .andExpect(jsonPath("$.data.byCountryHour.reason").value("HOUR_CROSS_MISSING"))
+                .andExpect(jsonPath("$.data.byCountryHour.hours", hasSize(0)))
+                .andExpect(jsonPath("$.data.byCountryHour.series", hasSize(0)))
+                // 24h 合计照常给（不因为小时交叉缺失就丢掉既有能力）
+                .andExpect(jsonPath("$.data.byCountry[0].country").value("CN"))
+                .andExpect(jsonPath("$.data.byCountry[0].count").value(12));
     }
 
     @Test
