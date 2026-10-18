@@ -200,12 +200,35 @@
 
     <build>
         <plugins>
+            <!--
+              MCP server（独立进程，stdio 传输）的可执行 jar。
+
+              为什么复用 spring-boot-maven-plugin 而不是新增 maven-jar-plugin + copy-dependencies：
+              这台机器是离线构建（mvn -o），新增插件/依赖必须本地仓库里已经有；而 spring-boot 插件
+              本来就在跑，加一个 execution 就能产出"带全部依赖、Main-Class 指向 MCP 入口"的第二份 jar，
+              零新增插件、零新增依赖。产物与 Web 主 jar 并存，互不影响（不共享端口、不共享生命周期）。
+
+              产物：target/sec-agent-1.0-SNAPSHOT-mcp.jar
+              运行：java -jar target/sec-agent-1.0-SNAPSHOT-mcp.jar   （stdio，被 MCP 客户端拉起）
+            -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
                     <mainClass>org.example.Main</mainClass>
                 </configuration>
+                <executions>
+                    <execution>
+                        <id>mcp-repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>mcp</classifier>
+                            <mainClass>org.example.mcp.McpServerMain</mainClass>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             
             <!--
