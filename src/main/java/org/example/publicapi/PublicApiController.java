@@ -158,7 +158,9 @@ public class PublicApiController {
 
     /** 发布信息文件允许透传的键（白名单：不把运维文件的任意内容端到公网） */
     private static final List<String> DEPLOY_FILE_KEYS = List.of(
-            "release", "releaseDir", "commit", "fileCount", "totalBytes", "switchedAt", "publishedAt", "host");
+            "release", "releaseDir", "commit", "fileCount", "totalBytes", "switchedAt", "publishedAt", "host",
+            // 2026-10-18：/status/ 的部署面板要的三样一直显示「未取到」，因为白名单里没有它们。
+            "builtAt", "files", "history");
 
     /** 评测报告允许透传的键（白名单：正好是 C2 面板要的那几个真值 + 自证新鲜度用的 generatedAt） */
     private static final List<String> EVAL_REPORT_KEYS = List.of(

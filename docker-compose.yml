@@ -182,6 +182,9 @@ services:
       # 【三道闸】只认 phraseId / textHash（拒绝自由文本）、长度 ≤ MAX_CHARS、
       #   单 IP 与全局每日额度（落盘 data/tts-quota.json，重启不丢）。
       APP_TTS_ENABLED: "${APP_TTS_ENABLED:-false}"
+      # 2026-10-18：上游从 fish 切到 dashscope 需要显式 provider；
+      # 不透传时 Java 侧恒取默认 fish —— 「.env 里改了却不生效」的典型坑。
+      APP_TTS_PROVIDER: "${APP_TTS_PROVIDER:-fish}"
       APP_TTS_VOICE_ID: "${APP_TTS_VOICE_ID:-}"
       APP_TTS_MODEL: "${APP_TTS_MODEL:-s1}"
       APP_TTS_BASE_URL: "${APP_TTS_BASE_URL:-https://api.fish.audio}"
