@@ -256,6 +256,11 @@ public class MailSenderService {
             socket = new Socket();
             socket.connect(new InetSocketAddress(props.getHost(), props.getPort()), timeout);
             socket.setSoTimeout(timeout);
+            if (props.isSsl()) {
+                // 465：隐式 TLS —— 连上先握手，握手成功后才读 220 欢迎语。
+                // 少了这一步，服务器在等 ClientHello、客户端在等 220，双方都读到超时。
+                socket = wrapTls(socket, timeout);
+            }
             streams(socket);
             try {
                 expect(read(), 220);
@@ -287,11 +292,18 @@ public class MailSenderService {
 
         /** TLS 升级：在已连接的 socket 上包一层，之后的读写都走加密通道。 */
         private void upgrade() throws IOException {
+            int timeout = Math.max(1, props.getTimeoutSeconds()) * 1000;
+            socket = wrapTls(socket, timeout);
+            streams(socket);
+        }
+
+        /** 把已建好的明文 socket 包成 TLS，并完成握手（隐式 TLS 与 STARTTLS 共用）。 */
+        private SSLSocket wrapTls(Socket plain, int timeout) throws IOException {
             SSLSocket ssl = (SSLSocket) ((SSLSocketFactory) SSLSocketFactory.getDefault())
-                    .createSocket(socket, props.getHost(), props.getPort(), true);
+                    .createSocket(plain, props.getHost(), props.getPort(), true);
+            ssl.setSoTimeout(timeout);
             ssl.startHandshake();
-            socket = ssl;
-            streams(ssl);
+            return ssl;
         }
 
         private void streams(Socket s) throws IOException {
