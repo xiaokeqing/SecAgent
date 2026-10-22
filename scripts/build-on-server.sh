@@ -105,7 +105,15 @@ export ARTIFACT_MD5
 SOURCE_SHA="$(git -C "$APP" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 export SOURCE_SHA
 echo "  上传 jar MD5 = $JAR_MD5"
-docker build --network=host -f Dockerfile.runtime -t secagent:local . 2>&1 | tail -6
+# 【为什么必须打 label】srv1-redeploy.sh 第 5/9 步是 fail-closed 闸门：镜像没有
+# org.opencontainers.image.revision 就拒绝部署（"来源不明"）。2026-10-22 实测踩到：
+# 用本脚本建出的镜像缺 label → 推到 ACR stable 后 redeploy 直接被拒，
+# 而 secagent-redeploy.timer 每 5 分钟还会把容器换回 ACR 里那版旧镜像。
+# 所以镜像必须自证身份：revision = 完整 commit，artifact-md5 = 上传 jar 的 MD5。
+docker build --network=host -f Dockerfile.runtime \
+  --label "org.opencontainers.image.revision=$TARGET_FULL" \
+  --label "artifact-md5=$JAR_MD5" \
+  -t secagent:local . 2>&1 | tail -6
 
 # 【硬校验】镜像内产物必须等于上传的 jar。
 # 不加这一步就会重演实测过的坑：多阶段 Dockerfile 在镜像内用【服务器旧源码】编译，
