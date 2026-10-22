@@ -22,6 +22,8 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,6 +117,69 @@ public class DailyReportController {
         return ResponseEntity.ok().cacheControl(CacheControl.maxAge(Duration.ofSeconds(60))).body(body);
     }
 
+    /**
+     * 归档索引：一次请求回答「有哪些天留下了日报」。
+     *
+     * <h3>为什么不是让前端按日期试探</h3>
+     * 站点的 {@code /daily/} 栏目要"往前翻"。没有这个端点时，浏览器只能对最近 30 天逐个发
+     * {@code /daily/daily-<日期>.json}：① 公网端点有 20 次/分钟的限流，30 个请求会互相踩；
+     * ② 限流失败与"那天没生成"在直线上长得一样，页面只能说"未生成"，而那是两件不同的事。
+     * 把"有没有"交给服务端回答，一次请求就够了。
+     *
+     * <p>只回摘要字段：归档表要的是「哪天、多少条、谁最凶」，不把 {@code speech}（日语长文本）
+     * 之类的整份清单拖到浏览器上。
+     */
+    @GetMapping("/daily/index.json")
+    public ResponseEntity<Map<String, Object>> index() {
+        Path dir = reportDir();
+        List<Path> found = new ArrayList<>();
+        if (Files.isDirectory(dir)) {
+            try (var stream = Files.list(dir)) {
+                stream.filter(Files::isRegularFile)
+                        .filter(p -> NAME.matcher(p.getFileName().toString()).matches())
+                        .filter(p -> p.getFileName().toString().endsWith(".json"))
+                        .forEach(found::add);
+            } catch (IOException e) {
+                logger.warn("日报归档目录读取失败：{}", e.getMessage());
+            }
+        }
+        found.sort(Comparator.comparing((Path p) -> p.getFileName().toString()).reversed());
+        List<Map<String, Object>> days = new ArrayList<>();
+        for (Path p : found) {
+            String name = p.getFileName().toString();
+            String day = name.substring("daily-".length(), "daily-".length() + 10);
+            Map<String, Object> one = new LinkedHashMap<>();
+            one.put("date", day);
+            try {
+                JsonNode node = json.readTree(Files.readString(p));
+                one.put("generatedAt", text(node.path("generatedAt")));
+                one.put("alertTotal", num(node.get("alertTotal")));
+                one.put("alertsBySeverity", json.convertValue(node.path("alertsBySeverity"), Map.class));
+                one.put("topCountry", json.convertValue(node.path("topCountry"), Map.class));
+                JsonNode worst = node.path("worstSource");
+                Map<String, Object> w = new LinkedHashMap<>();
+                String ip = text(worst.get("ip"));
+                w.put("ip", ip == null ? null : policy.display(ip));
+                w.put("attempts", num(worst.get("attempts")));
+                one.put("worstSource", w);
+                one.put("missingCount", node.path("missing").isArray() ? node.path("missing").size() : 0);
+            } catch (IOException | RuntimeException e) {
+                /* 单个清单坏了不能把整张归档表变成错误态：那一行显示「清单损坏」，其余照常 */
+                logger.warn("日报清单解析失败，归档里标为不可读：{} {}", name, e.getMessage());
+                one.put("reason", "unreadable");
+            }
+            one.put("files", files(LocalDate.parse(day)));
+            days.add(one);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("generatedAt", LocalDateTime.now().format(STAMP));
+        body.put("cacheSeconds", 600);
+        body.put("count", days.size());
+        body.put("days", days);
+        body.putAll(policy.disclosure());
+        return ResponseEntity.ok().cacheControl(CacheControl.maxAge(Duration.ofMinutes(10))).body(body);
+    }
+
     /** 交付物本体（HTML / 音频 / Markdown / 清单）。名字不在白名单里一律 404，不暴露路径。 */
     @GetMapping("/daily/{name}")
     public ResponseEntity<byte[]> file(@PathVariable String name) {
@@ -150,6 +215,11 @@ public class DailyReportController {
     }
 
     private Map<String, Object> files(LocalDate day, JsonNode node) {
+        return files(day);
+    }
+
+    /** 某一天真正存在的交付物（按后缀探测，只回存在的）。 */
+    private Map<String, Object> files(LocalDate day) {
         Map<String, Object> out = new LinkedHashMap<>();
         for (String ext : List.of("html", "md", "json", "wav", "mp3")) {
             String name = DailyDigestService.fileName(day, ext);
