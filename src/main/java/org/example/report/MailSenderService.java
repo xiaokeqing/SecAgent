@@ -111,6 +111,64 @@ public class MailSenderService {
         return missingKeys().isEmpty();
     }
 
+    /**
+     * 发一封<b>点对点</b>的文本邮件（当前用途：登录验证码），收件人由调用方给出。
+     *
+     * <p>与 {@link #deliver} 的三点不同，都是刻意的：
+     * <ul>
+     *   <li><b>不落 {@code .eml}</b>：验证码是几分钟就过期的凭据，落盘等于把它写进数据卷；</li>
+     *   <li><b>不要求 {@code app.mail.to[]}</b>：收件人是请求里指定的站主邮箱，与日报订阅列表无关；</li>
+     *   <li><b>失败只返回 false</b>：由调用方决定对外怎么答（本项目的答案是"看起来没这个功能"），
+     *       不在这里抛出、也不在这里记录收件人完整地址。</li>
+     * </ul>
+     *
+     * @return true = 已交给 SMTP 服务器；false = 配置不全 / 收件人为空 / 连接或认证失败
+     */
+    public boolean sendText(String to, String subject, String textBody, String htmlBody) {
+        if (blank(to)) {
+            return false;
+        }
+        List<String> missing = missingTransportKeys();
+        if (!missing.isEmpty()) {
+            logger.warn("点对点邮件未发送：SMTP 配置不全（缺 {}）", String.join("、", missing));
+            return false;
+        }
+        String message = buildMessage(List.of(to.trim()), subject, textBody, htmlBody);
+        try {
+            new SmtpSession(props).send(props.getFrom().trim(), List.of(to.trim()), message);
+            logger.info("点对点邮件已通过 SMTP 发出：{}:{}", props.getHost(), props.getPort());
+            return true;
+        } catch (Exception e) {
+            // 只记异常消息：收件人地址与验证码都不进日志
+            logger.warn("点对点邮件 SMTP 发送失败：{}", e.getMessage());
+            return false;
+        }
+    }
+
+    /** 发信必需的传输项（不含收件人列表）：点对点发信只看这几项。 */
+    private List<String> missingTransportKeys() {
+        List<String> m = new ArrayList<>();
+        if (!props.isEnabled()) {
+            m.add("app.mail.enabled=true");
+        }
+        if (blank(props.getHost())) {
+            m.add("app.mail.host");
+        }
+        if (props.getPort() <= 0) {
+            m.add("app.mail.port");
+        }
+        if (blank(props.getUsername())) {
+            m.add("app.mail.username");
+        }
+        if (blank(props.getPassword())) {
+            m.add("app.mail.password");
+        }
+        if (blank(props.getFrom())) {
+            m.add("app.mail.from");
+        }
+        return m;
+    }
+
     /** 邮件标题：{@code 前缀 + 日期}（默认 {@code [安全日报] 2026-10-19}）。 */
     public String subject(LocalDate day) {
         String prefix = props.getSubjectPrefix() == null ? "" : props.getSubjectPrefix();
@@ -178,10 +236,20 @@ public class MailSenderService {
      * base64 一行 76 字符的硬约束最容易满足，且不会被各家的 8BITMIME 差异坑。
      */
     String buildMessage(String subject, String textBody, String htmlBody) {
+        return buildMessage(recipients(), subject, textBody, htmlBody);
+    }
+
+    /**
+     * 同上，但收件人由调用方给出（点对点发信不读 {@code app.mail.to[]}）。
+     *
+     * <p>抽成重载而不是复制一份：报文里最容易出错的两处（头字段防注入、base64 折行）
+     * 只该有一份实现。原三参版本委派到这里，日报报文逐字节不变。
+     */
+    String buildMessage(List<String> to, String subject, String textBody, String htmlBody) {
         String boundary = "=secagent-daily-" + UUID.randomUUID().toString().replace("-", "");
         StringBuilder sb = new StringBuilder();
         sb.append("From: ").append(header(props.getFrom())).append("\r\n");
-        sb.append("To: ").append(header(String.join(", ", recipients()))).append("\r\n");
+        sb.append("To: ").append(header(String.join(", ", to))).append("\r\n");
         sb.append("Subject: ").append(encodeHeader(subject)).append("\r\n");
         sb.append("Date: ").append(DateTimeFormatter.RFC_1123_DATE_TIME
                 .format(ZonedDateTime.now())).append("\r\n");

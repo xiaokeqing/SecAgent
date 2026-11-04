@@ -40,8 +40,17 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
     @Value("${app.auth.white-list:/api/health}")
     private String whiteList;
 
-    /** 登录接口本身不做 Token 校验，否则无法登录 */
-    private static final String LOGIN_PATH = "/api/auth/login";
+    /**
+     * 匿名可访问的登录端点：不校验 Token，否则根本没法登录。
+     *
+     * <p>{@code /api/auth/check} 与 {@code /api/auth/logout} 不在这里 —— 它们要读 Token。
+     * 加新登录方式时必须同时加到这里，否则表现是"匿名 401"，而且因为走了拦截器，
+     * 连控制器的日志都不会留下一条（排查时极容易误判成前端没发请求）。
+     */
+    private static final java.util.Set<String> ANONYMOUS_AUTH_PATHS = java.util.Set.of(
+            "/api/auth/login",
+            "/api/auth/code",
+            "/api/auth/code-login");
 
     @org.springframework.beans.factory.annotation.Autowired
     private AuthService authService;
@@ -89,8 +98,8 @@ public class ApiTokenInterceptor implements HandlerInterceptor {
             return true;
         }
 
-        // 登录接口直接放行，否则无法获取 Token
-        if (LOGIN_PATH.equals(path)) {
+        // 登录接口直接放行，否则无法获取 Token（含邮箱验证码的两个端点）
+        if (ANONYMOUS_AUTH_PATHS.contains(path)) {
             return true;
         }
         if (isWhiteListed(path)) {

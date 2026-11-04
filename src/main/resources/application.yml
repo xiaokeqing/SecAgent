@@ -216,6 +216,18 @@ app:
     #      避免变成"反射型 XSS 跳板"或"内网拓扑查询接口"
     # 处置类接口一律要求管理员角色 + 人工审批，和这条路径是两条完全分开的路。
     white-list: /api/health,/api/playground/check,/api/public/**,/api/openapi.json
+    # ===== 站主邮箱：邮箱验证码登录的唯一白名单（见 AuthCodeService）=====
+    # 【默认空 = 功能关闭】fail-closed：没配就是"谁都不能用"，不是"谁都能用"。
+    #   白名单为空、或请求里的邮箱不等于它，/api/auth/code 一律返回
+    #   {"ok":false,"reason":"unavailable"} 且不发信 —— 对外不区分原因，防扫描。
+    # 【这不是注册】全站只有这一个地址：没有注册、没有改绑、没有第二封确认信。
+    #   换地址只能改这一行配置 + 重建容器（srv1 上就是 .env 里改一行，见下）。
+    # 【为什么不用 app.mail.to[]】那是日报收件人列表，可以有多个；这里是"谁能登录"，
+    #   只有一个。语义混在一起，就会出现"给日报加个收件人，顺手多开一个登录入口"。
+    # 【部署提醒】docker-compose.yml 的 environment 段目前【没有】显式透传
+    #   APP_AUTH_OWNER_EMAIL，靠 env_file: .env 兜底；若以后 compose 改成白名单式透传，
+    #   这里要跟着补一行，否则表现为"配了也不生效，且不报错"。
+    owner-email: ${APP_AUTH_OWNER_EMAIL:}
   # 登录账号配置（生产环境请通过环境变量 SECAGENT_PASSWORD 注入密码）
   security:
     login:

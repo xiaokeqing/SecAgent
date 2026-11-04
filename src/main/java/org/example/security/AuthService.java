@@ -119,13 +119,43 @@ public class AuthService {
         if (!passwordEncoder.matches(inputPass, account.passwordHash)) {
             return null;
         }
+        String token = newSession(account);
+        logger.info("用户 {}（角色 {}）登录成功，已签发会话 Token", account.username, account.role);
+        return token;
+    }
+
+    /**
+     * 签发一个<b>站主本人</b>的会话（邮箱验证码登录用），返回 token；内置管理员账号不存在时返回 null。
+     *
+     * <p>为什么要有这个方法，而不是让验证码那侧自己往 {@code sessions} 里塞 token：
+     * 会话的构造（随机源、TTL、过期清理）只该有一份实现 —— 两套签发逻辑迟早会出现
+     * 「密码登录 120 分钟、验证码登录永不过期」这种没人发现的差异。
+     *
+     * <p><b>危险点</b>：这里不做任何身份校验，谁调到它谁就拿到一个管理员会话。
+     * 所以它只能被 {@code org.example.security.AuthCodeService} 在验证码校验通过之后调用，
+     * <b>绝不允许</b>挂到任何 HTTP 端点上（本方法没有"凭密码/凭码"的入参，就是为了让它
+     * 无法被当成一个独立的登录入口）。
+     */
+    public String issueSessionForOwner() {
+        Account account = accounts.get(adminUsername);
+        if (account == null) {
+            logger.warn("站主验证码登录失败：内置管理员账号不存在，拒绝签发会话");
+            return null;
+        }
+        String token = newSession(account);
+        logger.info("站主通过邮箱验证码登录成功（账号 {}，角色 {}），已签发会话 Token",
+                account.username, account.role);
+        return token;
+    }
+
+    /** 唯一的会话签发实现：生成 token → 落 sessions → 顺手清过期。 */
+    private String newSession(Account account) {
         byte[] bytes = new byte[32];
         secureRandom.nextBytes(bytes);
         String token = toHex(bytes);
         sessions.put(token, new Session(account.username, account.role,
                 System.currentTimeMillis() + ttlMinutes * 60_000L));
         evictExpired();
-        logger.info("用户 {}（角色 {}）登录成功，已签发会话 Token", account.username, account.role);
         return token;
     }
 
