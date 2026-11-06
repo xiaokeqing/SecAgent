@@ -202,6 +202,20 @@ services:
       APP_TTS_HISTORY_SIZE: "${APP_TTS_HISTORY_SIZE:-200}"
       APP_TTS_PHRASES_FILE: "${APP_TTS_PHRASES_FILE:-classpath:tts-phrases.yml}"
 
+      # ===== 安全日报邮件（SMTP，RUNBOOK §30；2026-11-06 从服务器手工改动回填进仓库）=====
+      # 与额度/TTS 同理：不在这里透传时，"在 .env 里加一行 APP_MAIL_*" 会不生效且不报错。
+      # 465 端口走隐式 TLS（MailSenderService 已改为连上即包 TLS），587 才用 STARTTLS。
+      APP_MAIL_ENABLED: "${APP_MAIL_ENABLED:-false}"
+      APP_MAIL_HOST: "${APP_MAIL_HOST:-}"
+      APP_MAIL_PORT: "${APP_MAIL_PORT:-465}"
+      APP_MAIL_USERNAME: "${APP_MAIL_USERNAME:-}"
+      APP_MAIL_PASSWORD: "${APP_MAIL_PASSWORD:-}"
+      APP_MAIL_FROM: "${APP_MAIL_FROM:-}"
+      APP_MAIL_TO: "${APP_MAIL_TO:-}"
+      APP_MAIL_SSL: "${APP_MAIL_SSL:-true}"
+      APP_MAIL_STARTTLS: "${APP_MAIL_STARTTLS:-false}"
+      APP_REPORT_ENABLED: "${APP_REPORT_ENABLED:-false}"
+
       # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
       # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
       # 全部可留空（留空即用代码默认值，与改造前行为兼容）。
