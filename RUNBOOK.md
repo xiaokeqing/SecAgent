@@ -4211,3 +4211,70 @@ done
    `sudo shred -u /root/.secagent_ro.pw`（应用不依赖它）。删除后只能从 srv1 `.env` 取回。
 4. **明文口令一旦进 argv 就会落盘**：`sudo` 会把整条命令（含参数）写进 `/var/log/secure`。
    查询/测试一律用 `--config`、`-env`、环境变量或 stdin，**绝不用 `-u user:pass` 或 `grep <口令>`**。
+
+
+---
+
+## §34 全事件采集与封禁升级（2026-11-06）
+
+### 34.1 为什么做
+
+原来的 Suricata 通路只读 `event_type=alert`（命中规则的告警），看不到 flow / http / dns / tls 这些"没命中规则但很有价值"的原始连接事实：
+扫描器换端口、蜜罐被连上但没触发规则、某个 IP 反复做 TLS 握手换 SNI，这些都只出现在全事件里。
+处置侧同理：老版本封禁只支持 IPv4、TTL 固定、没有演练与回滚。
+
+### 34.2 全事件摄取（`integration/suricata`）
+
+- 新增 `EveEvent/FlowEvent/HttpEvent/DnsEvent/TlsEvent/AlertEvent`（统一接口 `EveEvent`）、
+  `EveEventParser`（按 `event_type` 分派，字段缺失就留 null，不猜）、
+  `BoundedRingBuffer`（每类 5 万条，满后覆盖最旧，内存有界）、`SuricataEventStore`（按 IP / SNI / JA3 建索引）。
+- `SuricataService` 用 `@Scheduled(fixedDelay = ingest-interval-ms)` 按**字节偏移**增量读 `eve.json`：
+  只解析新追加的行；检测到文件变小（轮转/截断）就回到起点重读。
+- 配置（`application.yml`，全部可用环境变量覆盖）：
+  `integration.suricata.eve-json` = `${SURICATA_EVE:/var/log/suricata/eve.json}`、
+  `buffer-capacity` = `${SURICATA_BUFFER_CAPACITY:50000}`、
+  `ingest-interval-ms` = `${SURICATA_INGEST_INTERVAL_MS:10000}`。
+- 端点（登录态，`X-Api-Token` 或会话；响应统一 `{code,message,data}`，`data.mode` 标明 REAL/MOCK/OFF）：
+  - `GET /api/sec/conn/top-ports?minutes=15&limit=3` → 目标端口 TOP
+  - `GET /api/sec/conn/by-ip?ip=…&limit=2` → 某个 IP 的连接明细（含 appProto / 字节数 / 包数）
+  - `GET /api/sec/conn/tls-stats?minutes=60&limit=3` → SNI 与 JA3 分布
+- 三种模式的含义：`REAL` 文件可读且在摄取；`MOCK` 文件不存在（容器没挂载或同步没跑）；`OFF` 显式关闭。
+  **`MOCK` 不是故障，是"没有数据源"**，端点照常 200 返回空列表。
+
+### 34.3 事件怎么到 srv1（跨机同步，踩过三个坑）
+
+`srv2` 上的 Suricata 是容器，`eve.json` 落在宿主 `/opt/suricata/logs/eve.json`；应用跑在 `srv1`。
+`srv1:/usr/local/sbin/secagent-eve-sync.sh` + `/etc/cron.d/secagent-eve-sync`（每分钟）：
+
+- 坑 ① **远端偏移必须单独记**：本地文件只是"远端某个偏移之后的一段"，拿 `本地大小` 当远端偏移会把旧数据追到最新后面
+  （第一版就这么错的，结果最后一条事件时间戳停在一天前）。正解：`/var/log/suricata/.eve.remote_offset` 存远端 size。
+- 坑 ② **`tail -c +N` 是从第 N 字节到 EOF**：种子如果取的是"最后 8 MB"，之后必须用 `tail -c +(远端上次大小+1)`，
+  不能拿种子长度当起点。
+- 坑 ③ **链路只有 ~2 Mbps**：直接 `tail | ssh` 传 8 MB 要 6 分钟；改成 `tail | gzip -1 | ssh | gunzip` 后 20 秒。
+  另外必须 `flock`，否则 cron 每分钟重入会并发写同一个 `.tmp`。
+- 坑 ④ **种子首行是残行**：`tail -c` 从任意字节开始，第一行必然是半截 JSON；装种子后用 Python 砍掉到第一个 `
+`。
+- 容器必须挂载：`docker-compose.yml` 的 `volumes` 加 `/var/log/suricata:/var/log/suricata:ro`；没挂时启动日志会打印
+  `未挂载 Suricata eve.json … 属预期`，端点报 `mode=MOCK`。
+
+实测（2026-11-06 23:45）：`top-ports(15)` = 2222:496 / 80:450 / 1433:115；`tls-stats(60)` = SNI
+`demo.xiaokeqing.cn` 31、`xiaokeqing.cn` 14、`backup.xiaokeqing.cn` 5；`by-ip(193.32.162.20)` 返回 SSH 连接明细。
+
+### 34.4 封禁升级
+
+- `BlockPolicy`（策略 → 实际 TTL，带上限）、`BlockCommands`（生成 SSH forced command 参数）、`BlockRequest`（入参）。
+- 执行顺序：策略定 TTL → `ResponseGuard` 护栏（IPv6 支持、本机公网 IP / 健康检查源 / 受保护网段一律拒）→
+  `dryRun` 时只写审计 → SSH forced command → ipset（`secagent_block` / `secagent_block6`）→ 失败降级 Wazuh → 再不行 MOCK，全程不抛异常。
+- 服务器侧 `secagent-block-cli`（v2）：`block <ip> <ttl> <reason>` / `unblock <ip>` / `flush` / `status`；
+  `ipset create … hash:net family inet|inet6 timeout 1800 -exist` + `iptables|ip6tables -I INPUT 1 -m set --match-set … -j DROP`；
+  无 ipset 时回退逐条 iptables + 状态文件到期清理。
+- 端点：`POST /api/response/block`（支持 `dryRun`）、`POST /api/response/unblock`、`POST /api/response/rollback`。
+- 限制（写清楚免得误判）：`ipset create -exist` 遇到历史同名集合会沿用旧类型（当前 srv2 的 `secagent_block` 是 `hash:ip`），
+  要下发 CIDR 必须先 `ipset destroy` 重建；iptables 回退路径没有原生 timeout，只靠状态文件 + 调度器清理。
+
+### 34.5 部署链（这次踩的两个坑）
+
+- `scripts/deploy-to-server1.ps1` 会**本机 `docker build`**，本机没 Docker Desktop 就必挂 ⇒ 用 `scripts/deploy-remote-build.ps1`（本机只出 jar，srv1 构建镜像）。
+- 远程构建是 **fail-closed**：要求 srv1 `/opt/secagent` 的 `git HEAD == 目标 commit` 且工作区干净。
+  把新 commit 送上去的办法：本地 `git bundle create … main` → `scp` → srv1 `git fetch /tmp/x.bundle main` → `git checkout -f <sha>`。
+  srv1 上手工改过的 `docker-compose.yml`（日报邮件 env）已经**回填进仓库**（commit `3bf7a65`），以后不要再在服务器上直接改。
