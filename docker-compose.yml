@@ -269,6 +269,10 @@ services:
       # 运行数据持久化：向量库、审计留痕、封禁记录、评测结果
       - ./data:/app/data
       - ./uploads:/app/uploads
+      # ★2026-11-06 Suricata 全事件摄取：宿主机上的 eve.json 以只读方式挂进来。
+      # 宿主机那份由 /etc/cron.d/secagent-eve-sync 每分钟从 srv2(/opt/suricata/logs) 增量拉取；
+      # 没挂这个卷时端点会如实报 mode=MOCK（不是故障，是没数据源）。
+      - /var/log/suricata:/var/log/suricata:ro
 
     # 内存硬上限：超过时本容器被 OOM Kill，而不是拖垮整台机器
     mem_limit: 1536m
