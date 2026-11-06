@@ -7,26 +7,48 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 处置动作执行服务（SecAgent 自己的"手"的编排层）。
  *
- * <p>架构原则：研判、风险分级、护栏都在本服务内；Wazuh 只是"真实执行封禁的手"。
- * 没有 Wazuh 可用时，一律走 MOCK 模拟，保证闭环可演示。
+ * <p>架构原则：研判、风险分级、护栏都在本服务内；执行器（SSH 直连脚本 / Wazuh）
+ * 只是"真实执行封禁的手"。
  *
- * <p>每一个动作执行前都会先过 {@link ResponseGuard} 护栏（封IP）或基本入参校验（锁账号/杀进程），
+ * <p>每一个动作执行前都会先过 {@link ResponseGuard} 护栏（封 IP）或基本入参校验，
  * 被拦截的动作不真正下发，但同样写审计留痕。
+ *
+ * <h3>封禁链路（本次升级后的顺序）</h3>
+ * <ol>
+ *   <li><b>分级 TTL</b>：{@link BlockPolicy} 按攻击类型/显式时长定下封多久（不再写死 60 分钟）</li>
+ *   <li><b>护栏</b>：白名单/本机公网 IP/健康检查源/上限，一律先在 {@link ResponseGuard} 判；
+ *       策略算出的长时长走"策略上限"，人工指定走"人工上限"</li>
+ *   <li><b>dry-run</b>：只算出并记录"本应执行的命令"，<b>不碰执行器、不登记封禁记录</b></li>
+ *   <li><b>SSH 集合式封禁</b>（ipset 优先、无 ipset 回退 iptables，回退点在服务端）</li>
+ *   <li><b>降级</b>：SSH 失败 → Wazuh AR（若可用）→ 仍失败则如实返回 failed</li>
+ * </ol>
+ * 任何一步失败都<b>不抛异常</b>：处置接口被调用方包在告警流水线里，
+ * 抛出去会打断整条告警处理；失败要变成"带审计的失败结果"而不是异常。
  */
 @Service
 public class ResponseActionService {
 
     private static final Logger logger = LoggerFactory.getLogger(ResponseActionService.class);
 
+    /** 全局演练开关：打开后所有封禁只算命令不下发（与单次 dryRun 是"或"关系） */
+    @org.springframework.beans.factory.annotation.Value("${response.dry-run:false}")
+    private boolean dryRunEnabled;
+
     private final ResponseGuard responseGuard;
     private final AuditService auditService;
     private final BlockRecordStore blockRecordStore;
+    private final BlockPolicy blockPolicy;
 
     /** Wazuh 网关可能没有实现 Bean，缺失时自动降级 MOCK */
     private final ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider;
@@ -54,13 +76,13 @@ public class ResponseActionService {
      */
     private final ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider;
 
-    /** 便捷构造器：**仅供单测**直接 new 使用（通知为空）。Spring 不要用它。 */
+    /** 便捷构造器：**仅供单测**直接 new 使用（通知为空，策略用默认档位）。Spring 不要用它。 */
     public ResponseActionService(ResponseGuard responseGuard,
                                  AuditService auditService,
                                  BlockRecordStore blockRecordStore,
                                  ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
                                  ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider) {
-        this(responseGuard, auditService, blockRecordStore, wazuhGatewayProvider, sshBlockProvider, null);
+        this(responseGuard, auditService, blockRecordStore, wazuhGatewayProvider, sshBlockProvider, null, new BlockPolicy());
     }
 
     /**
@@ -79,13 +101,15 @@ public class ResponseActionService {
                                  BlockRecordStore blockRecordStore,
                                  ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
                                  ObjectProvider<org.example.integration.wazuh.SshBlockExecutor> sshBlockProvider,
-                                 ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider) {
+                                 ObjectProvider<org.example.notify.SecurityEventNotifier> notifierProvider,
+                                 BlockPolicy blockPolicy) {
         this.responseGuard = responseGuard;
         this.auditService = auditService;
         this.blockRecordStore = blockRecordStore;
         this.wazuhGatewayProvider = wazuhGatewayProvider;
         this.sshBlockProvider = sshBlockProvider;
         this.notifierProvider = notifierProvider;
+        this.blockPolicy = blockPolicy == null ? new BlockPolicy() : blockPolicy;
     }
 
     /** 通知门面（可能不存在）；任何异常都不影响处置链路 */
@@ -99,6 +123,24 @@ public class ResponseActionService {
             logger.warn("取通知门面失败（不影响处置）：{}", e.getMessage());
             return null;
         }
+    }
+
+    /** 取 SSH 执行器（可能不存在/未启用），异常一律当"不存在"处理 */
+    private org.example.integration.wazuh.SshBlockExecutor ssh() {
+        if (sshBlockProvider == null) {
+            return null;
+        }
+        try {
+            return sshBlockProvider.getIfAvailable();
+        } catch (Exception e) {
+            logger.warn("取 SSH 封禁执行器失败（降级）：{}", e.getMessage());
+            return null;
+        }
+    }
+
+    private boolean sshReady() {
+        org.example.integration.wazuh.SshBlockExecutor ssh = ssh();
+        return ssh != null && ssh.isEnabled();
     }
 
     /**
@@ -119,14 +161,12 @@ public class ResponseActionService {
     private boolean wazuhReady() {
         try {
             // 1) 首选：SSH 直连可用就能处置（不依赖 Wazuh API）
-            org.example.integration.wazuh.SshBlockExecutor ssh = sshBlockProvider.getIfAvailable();
-            logger.info("处置通道判定: sshBean={} enabled={}",
-                    ssh != null, ssh == null ? "n/a" : ssh.isEnabled());
-            if (ssh != null && ssh.isEnabled()) {
+            if (sshReady()) {
                 return true;
             }
             // 2) 退回：Wazuh API 通道
-            org.example.integration.WazuhGateway gw = wazuhGatewayProvider.getIfAvailable();
+            org.example.integration.WazuhGateway gw = wazuhGatewayProvider == null
+                    ? null : wazuhGatewayProvider.getIfAvailable();
             return gw != null && gw.isAvailable();
         } catch (Exception e) {
             return false;
@@ -135,8 +175,6 @@ public class ResponseActionService {
 
     /**
      * 封禁来源 IP（默认来源"手动"）。
-     * 先过护栏；护栏拒绝则返回 BLOCKED 并写审计。通过后：网关可用→REAL 下发 firewall-drop，否则 MOCK。
-     * 真正执行成功后追加一条带到期时间的封禁记录，供到期自动解封。
      */
     public ActiveResponseResult blockIp(String ip, Integer durationMinutes, String reason, String actor) {
         return blockIp(ip, durationMinutes, reason, actor, "手动");
@@ -144,57 +182,338 @@ public class ResponseActionService {
 
     /**
      * 封禁来源 IP（显式指定执行来源 source：手动 / 审批 / 智能体）。
-     * 护栏与高危审批逻辑保持不变；仅在成功执行（非 BLOCKED）后追加封禁记录。
+     *
+     * <p>保留这个签名是刻意的：审批服务与智能体工具都按它调用，
+     * 单测也用匿名子类覆写它来验证"只执行一次"。新增能力一律通过
+     * {@link #blockIp(BlockRequest)} 扩展，不动这条缝。
      */
     public ActiveResponseResult blockIp(String ip, Integer durationMinutes, String reason, String actor, String source) {
-        String guardReason = responseGuard.validateBlock(ip, durationMinutes);
-        if (guardReason != null) {
-            ResponseAudit audit = ResponseAudit.of(actor, "block-ip", ip == null ? "" : ip.trim(),
-                    guardReason, "LOW", "BLOCKED", false, "封禁被护栏拦截");
-            auditService.append(audit);
-            logger.warn("封IP被护栏拦截 target={} reason={}", ip, guardReason);
-            return ActiveResponseResult.blocked("firewall-drop", ip == null ? "" : ip.trim(), guardReason);
-        }
-        String target = ip.trim();
-        int duration = durationMinutes == null ? responseGuard.getDefaultDurationMinutes() : durationMinutes;
+        return blockIp(BlockRequest.of(ip, durationMinutes, reason, actor, source));
+    }
 
+    /**
+     * 封禁来源 IP（完整参数：风险提示 + dry-run）。
+     *
+     * <p>顺序见类注释。失败<b>不抛异常</b>，一律转成 failed 结果 + 审计。
+     */
+    public ActiveResponseResult blockIp(BlockRequest req) {
+        if (req == null) {
+            req = new BlockRequest();
+        }
+        String actor = req.getActor() == null || req.getActor().isBlank() ? "system" : req.getActor();
+        String source = req.getSource() == null || req.getSource().isBlank() ? "手动" : req.getSource();
+        String rawIp = req.getIp();
+        boolean dryRun = req.isDryRun() || dryRunEnabled;
+
+        // ① 分级 TTL：显式时长 > 攻击类型 > 风险等级兜底 > 默认
+        BlockPolicy.Decision decision = blockPolicy.decide(req.getDurationMinutes(), req.getReason(), req.getRiskLevel());
+        int duration = decision.getMinutes();
+        int cap = decision.isPolicyDerived()
+                ? responseGuard.getPolicyMaxDurationMinutes()
+                : responseGuard.getMaxDurationMinutes();
+        boolean clamped = duration > cap;
+        if (clamped) {
+            // 策略配得比上限还大时在这里截断，而不是让护栏直接拒绝 ——
+            // 拒绝会让这次攻击完全得不到处置，截断至少保住了"封住"这个目标
+            logger.warn("封禁时长 {}min 超过{}上限 {}min，已截断",
+                    duration, decision.isPolicyDerived() ? "策略" : "人工", cap);
+            duration = cap;
+        }
+
+        // ② 护栏（新路径同样必须过；policyDerived 决定用哪档上限）
+        String guardReason = responseGuard.validateBlock(rawIp, duration, decision.isPolicyDerived());
+        if (guardReason != null) {
+            ResponseAudit audit = ResponseAudit.of(actor, "block-ip", rawIp == null ? "" : rawIp.trim(),
+                    guardReason, riskOf(duration), "BLOCKED", false,
+                    "封禁被护栏拦截（type=" + decision.getThreatClass().getToken() + "）");
+            auditService.append(audit);
+            logger.warn("封IP被护栏拦截 target={} reason={}", rawIp, guardReason);
+            return ActiveResponseResult.blocked("ipset-block", rawIp == null ? "" : rawIp.trim(), guardReason);
+        }
+        String target = rawIp.trim();
+        int ttl = BlockPolicy.toTimeoutSeconds(duration);
+        String slug = BlockCommands.reasonSlug(decision.getThreatClass().getToken());
+
+        // ③ dry-run：算出命令就返回，绝不调用执行器
+        if (dryRun) {
+            String planned = BlockCommands.plan(target, ttl, slug);
+            String detail = baseDetail(duration, ttl, decision, clamped)
+                    + "; backend=DRY_RUN; 未下发; plan={" + planned.replace('\n', '|') + "}";
+            ResponseAudit audit = ResponseAudit.of(actor, "block-ip", target, req.getReason(),
+                    riskOf(duration), "DRY_RUN", true, detail);
+            auditService.append(audit);
+            logger.info("封禁 dry-run（未下发）：target={} duration={}min plan={}", target, duration, planned);
+            return ActiveResponseResult.dryRun("ipset-block", target,
+                    "DRY_RUN（演练，未下发）：本应执行\n" + planned, audit.getId());
+        }
+
+        // ④ 真实下发：SSH 集合式 → Wazuh 降级
         ActiveResponseResult result;
-        if (wazuhReady()) {
-            Map<String, Object> args = new HashMap<>();
-            args.put("ip", target);
-            args.put("duration", duration);
+        String backend;
+        String command = BlockCommands.forcedCommand(target, ttl, slug);
+        org.example.integration.wazuh.SshBlockExecutor ssh = ssh();
+        boolean sshUsable = ssh != null && ssh.isEnabled();
+        if (sshUsable) {
             try {
-                result = wazuhGatewayProvider.getIfAvailable().runActiveResponse("firewall-drop", args);
-                if (result.getAuditId() == null) {
-                    result.setAuditId(nextAuditId());
-                }
+                String out = ssh.block(target, ttl, slug);
+                backend = BlockCommands.parseBackend(out);
+                result = ActiveResponseResult.real("ipset-block", target,
+                        "已封禁 " + target + " 共 " + duration + " 分钟（后端=" + backend
+                                + "，ttl=" + ttl + "s）：" + out, nextAuditId());
             } catch (Exception e) {
-                result = ActiveResponseResult.failed("firewall-drop", target, "Wazuh 下发异常: " + e.getMessage());
+                logger.warn("SSH 集合式封禁失败，尝试降级 Wazuh：target={} err={}", target, e.getMessage());
+                backend = "SSH-FAILED";
+                result = degradeToWazuh(target, duration, "SSH 失败: " + e.getMessage());
+                if (result != null) {
+                    backend = "WAZUH";
+                } else {
+                    result = ActiveResponseResult.failed("ipset-block", target,
+                            "封禁下发失败（SSH: " + e.getMessage() + "；Wazuh 不可用或同样失败）");
+                }
+            }
+        } else if (wazuhReady()) {
+            backend = "WAZUH";
+            ActiveResponseResult w = degradeToWazuh(target, duration, "SSH 未启用");
+            if (w != null) {
+                result = w;
+            } else {
+                backend = "MOCK";
+                result = mockResult(target, duration);
             }
         } else {
-            result = ActiveResponseResult.mock("firewall-drop", target,
-                    "已封禁 " + target + " 共 " + duration + " 分钟（MOCK 模拟，未连接真实 Wazuh）", nextAuditId());
+            backend = "MOCK";
+            result = mockResult(target, duration);
         }
 
-        String risk = duration > 120 ? "HIGH" : "LOW";
-        ResponseAudit audit = ResponseAudit.of(actor, "block-ip", target, reason, risk,
-                result.getMode(), result.isSuccess(), "duration=" + duration + "min; " + result.getMessage());
+        // ⑤ 审计 + 登记 + 通知
+        String detail = baseDetail(duration, ttl, decision, clamped)
+                + "; backend=" + backend + "; cmd=" + command + "; " + result.getMessage();
+        ResponseAudit audit = ResponseAudit.of(actor, "block-ip", target, req.getReason(),
+                riskOf(duration), result.getMode(), result.isSuccess(), detail);
         auditService.append(audit);
         result.setAuditId(audit.getId());
 
-        // 成功执行（REAL/MOCK，非拦截）才登记带到期时间的封禁记录，供到期自动解封；
-        // 被护栏拦截或下发失败不登记。
-        if (result.isSuccess() && result.getMode() != null && !"BLOCKED".equals(result.getMode())) {
-            blockRecordStore.register(target, duration, source, actor, result.getAuditId(), result.getMode());
+        // 只有真正生效（REAL/MOCK/wazuh，且非拦截、非演练）才登记到期记录。
+        // MOCK 也登记是历史约定：演示环境里仍要能看到"到期自动解封"闭环。
+        if (result.isSuccess()
+                && !"BLOCKED".equals(result.getMode())
+                && !"DRY_RUN".equals(result.getMode())) {
+            try {
+                blockRecordStore.register(target, duration, source, actor, result.getAuditId(),
+                        result.getMode(), decision.getThreatClass().getToken(),
+                        decision.isPolicyDerived(), backend, command);
+            } catch (Exception e) {
+                // 登记失败不能反过来把一次已经成功的封禁报成失败
+                logger.error("封禁记录登记失败（封禁已生效）：target={} err={}", target, e.getMessage());
+            }
         }
 
-        // ② 自动封禁通知：成功与失败都通知（失败等级更高，见 NotifyEvent.defaultSeverity）。
-        // 刻意放在"审计与登记之后"：通知是最后一步，它慢了/挂了都不该改变处置结果。
-        notifyBlock(target, result, reason, actor, duration);
+        notifyBlock(target, result, req.getReason(), actor, duration);
         return result;
     }
 
-    /** 封禁结果 → 通知（封禁被护栏拦截属于"没执行"，不通知，避免噪声） */
+    /** 降级到 Wazuh AR；不可用或失败返回 null（让调用方决定最终结果） */
+    private ActiveResponseResult degradeToWazuh(String target, int duration, String why) {
+        try {
+            org.example.integration.WazuhGateway gw = wazuhGatewayProvider == null
+                    ? null : wazuhGatewayProvider.getIfAvailable();
+            if (gw == null || !gw.isAvailable()) {
+                return null;
+            }
+            Map<String, Object> args = new HashMap<>();
+            args.put("ip", target);
+            args.put("duration", duration);
+            ActiveResponseResult r = gw.runActiveResponse("firewall-drop", args);
+            if (r == null) {
+                return null;
+            }
+            if (r.getAuditId() == null) {
+                r.setAuditId(nextAuditId());
+            }
+            r.setMessage((r.getMessage() == null ? "" : r.getMessage()) + "（降级路径：" + why + "）");
+            return r;
+        } catch (Exception e) {
+            logger.warn("降级 Wazuh 也失败：{}", e.getMessage());
+            return null;
+        }
+    }
+
+    private ActiveResponseResult mockResult(String target, int duration) {
+        return ActiveResponseResult.mock("ipset-block", target,
+                "已封禁 " + target + " 共 " + duration + " 分钟（MOCK 模拟，未连接真实执行通道）", nextAuditId());
+    }
+
+    private static String baseDetail(int duration, int ttl, BlockPolicy.Decision d, boolean clamped) {
+        return "duration=" + duration + "min; class=" + d.getThreatClass().getToken()
+                + "; policy=" + (d.isPolicyDerived() ? "auto" : "explicit")
+                + "（" + d.getBasis() + "）; ttl=" + ttl + "s" + (clamped ? "; clamped=true" : "");
+    }
+
+    private static String riskOf(int durationMinutes) {
+        return durationMinutes > 120 ? "HIGH" : "LOW";
+    }
+
+    /**
+     * 解封单个 IP（手动/回滚）。
+     *
+     * <p>解封<b>不套用封禁白名单</b>：白名单是"不该封"，不是"不该解"。
+     * 反过来说，如果历史上误封了白名单里的地址，套用白名单会让它永远解不掉。
+     */
+    public ActiveResponseResult unblockIp(String ip, String actor, String source) {
+        String a = actor == null || actor.isBlank() ? "system" : actor;
+        if (!BlockCommands.isIpLiteral(ip)) {
+            String r = "非法 IP 地址: " + ip;
+            auditService.append(ResponseAudit.of(a, "unblock-ip", ip == null ? "" : ip,
+                    r, "LOW", "BLOCKED", false, "解封被入参校验拦截"));
+            return ActiveResponseResult.blocked("ipset-unblock", ip == null ? "" : ip, r);
+        }
+        String target = ip.trim();
+        ActiveResponseResult result;
+        String backend;
+        try {
+            org.example.integration.wazuh.SshBlockExecutor ssh = ssh();
+            if (ssh != null && ssh.isEnabled()) {
+                String out = ssh.unblock(target);
+                backend = BlockCommands.parseBackend(out);
+                result = ActiveResponseResult.real("ipset-unblock", target,
+                        "已解封 " + target + "（后端=" + backend + "）：" + out, nextAuditId());
+            } else if (wazuhReady()) {
+                backend = "WAZUH";
+                Map<String, Object> args = new HashMap<>();
+                args.put("ip", target);
+                ActiveResponseResult r = wazuhGatewayProvider.getIfAvailable()
+                        .runActiveResponse("firewall-unblock", args);
+                result = r == null ? ActiveResponseResult.failed("ipset-unblock", target, "Wazuh 返回空结果") : r;
+            } else {
+                backend = "MOCK";
+                result = ActiveResponseResult.mock("ipset-unblock", target,
+                        "已解封 " + target + "（MOCK 模拟，未连接真实执行通道）", nextAuditId());
+            }
+        } catch (Exception e) {
+            backend = "FAILED";
+            result = ActiveResponseResult.failed("ipset-unblock", target, "解封下发失败: " + e.getMessage());
+        }
+
+        ResponseAudit audit = ResponseAudit.of(a, "unblock-ip", target,
+                "手动解封（来源=" + (source == null ? "手动" : source) + "）", "LOW",
+                result.getMode(), result.isSuccess(),
+                "backend=" + backend + "; " + result.getMessage());
+        auditService.append(audit);
+        result.setAuditId(audit.getId());
+
+        if (result.isSuccess()) {
+            try {
+                blockRecordStore.markUnblockedByIp(target, result.getMode());
+            } catch (Exception e) {
+                logger.error("标记解封记录失败：target={} err={}", target, e.getMessage());
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 回滚（误封止血）：清空本次运行加入的封禁条目。
+     *
+     * @param flushAll true = 一次性清空服务端两个集合（v4/v6）+ 回退规则；
+     *                 false = 逐条解封当前"生效中"的记录
+     * @return 结构化结果（mode/removed/failed/message），供控制器直接返回
+     */
+    public Map<String, Object> rollback(boolean flushAll, String actor) {
+        String a = actor == null || actor.isBlank() ? "system" : actor;
+        Set<String> ips = new LinkedHashSet<>();
+        for (BlockRecord r : blockRecordStore.listActive()) {
+            if (r.getIp() != null && !r.getIp().isBlank()) {
+                ips.add(r.getIp());
+            }
+        }
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("flushAll", flushAll);
+        out.put("targets", new ArrayList<>(ips));
+
+        if (!flushAll && ips.isEmpty()) {
+            out.put("success", true);
+            out.put("removed", 0);
+            out.put("message", "当前没有生效中的封禁记录，无需回滚");
+            return out;
+        }
+
+        int removed = 0;
+        List<String> failed = new ArrayList<>();
+        String mode;
+        String command;
+        org.example.integration.wazuh.SshBlockExecutor ssh = ssh();
+        try {
+            if (ssh != null && ssh.isEnabled()) {
+                mode = "REAL";
+                if (flushAll) {
+                    command = "flush";
+                    String resp = ssh.flush();
+                    out.put("response", resp);
+                    for (String ip : ips) {
+                        blockRecordStore.markUnblockedByIp(ip, "REAL");
+                        removed++;
+                    }
+                } else {
+                    command = "unblock <ip> ×" + ips.size();
+                    for (String ip : ips) {
+                        try {
+                            ssh.unblock(ip);
+                            blockRecordStore.markUnblockedByIp(ip, "REAL");
+                            removed++;
+                        } catch (Exception e) {
+                            failed.add(ip + ": " + e.getMessage());
+                        }
+                    }
+                }
+            } else if (wazuhReady()) {
+                mode = "REAL";
+                command = "firewall-unblock <ip> ×" + ips.size();
+                for (String ip : ips) {
+                    try {
+                        Map<String, Object> args = new HashMap<>();
+                        args.put("ip", ip);
+                        wazuhGatewayProvider.getIfAvailable().runActiveResponse("firewall-unblock", args);
+                        blockRecordStore.markUnblockedByIp(ip, "REAL");
+                        removed++;
+                    } catch (Exception e) {
+                        failed.add(ip + ": " + e.getMessage());
+                    }
+                }
+            } else {
+                // 无执行通道时仍标记记录：与调度器 MOCK 口径一致，避免记录永远挂着
+                mode = "MOCK";
+                command = "MOCK rollback ×" + ips.size();
+                for (String ip : ips) {
+                    blockRecordStore.markUnblockedByIp(ip, "MOCK");
+                    removed++;
+                }
+            }
+        } catch (Exception e) {
+            mode = "REAL";
+            command = flushAll ? "flush" : "unblock <ip>";
+            failed.add("整体失败: " + e.getMessage());
+        }
+
+        boolean ok = failed.isEmpty();
+        auditService.append(ResponseAudit.of(a, flushAll ? "rollback-all" : "rollback-ip",
+                flushAll ? "*" : String.join(",", ips), "手动回滚封禁（误封止血）", "HIGH",
+                mode, ok, "cmd=" + command + "; 解除=" + removed + "; 失败=" + failed));
+
+        out.put("success", ok);
+        out.put("mode", mode);
+        out.put("removed", removed);
+        out.put("failed", failed.size());
+        out.put("failedTargets", failed);
+        out.put("command", command);
+        out.put("message", ok
+                ? "已回滚 " + removed + " 条封禁（" + mode + "）"
+                : "回滚部分失败：成功 " + removed + "，失败 " + failed.size());
+        logger.info("封禁回滚完成：flushAll={} mode={} removed={} failed={}", flushAll, mode, removed, failed.size());
+        return out;
+    }
+
+    /** 封禁结果 → 通知（拦截/演练属于"没执行"，不通知，避免噪声） */
     private void notifyBlock(String target, ActiveResponseResult result, String reason,
                              String actor, int durationMinutes) {
         org.example.notify.SecurityEventNotifier notifier = notifier();
@@ -202,8 +521,9 @@ public class ResponseActionService {
             return;
         }
         try {
-            if ("BLOCKED".equals(result.getMode())) {
-                logger.info("封禁被护栏拦截（{}），不触发通知（未执行的动作不是「处置结果」）", target);
+            if ("BLOCKED".equals(result.getMode()) || "DRY_RUN".equals(result.getMode())) {
+                logger.info("封禁未真正执行（mode={}，{}），不触发通知",
+                        result.getMode(), target);
                 return;
             }
             notifier.blockIp(target, result.isSuccess(), result.getMode(),

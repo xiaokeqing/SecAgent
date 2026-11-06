@@ -158,6 +158,20 @@ public class ApprovalService {
                 Integer dur = p.get("durationMinutes") == null ? null
                         : (p.get("durationMinutes") instanceof Number ? ((Number) p.get("durationMinutes")).intValue()
                         : Integer.parseInt(String.valueOf(p.get("durationMinutes"))));
+                // 策略派生时长（分级 TTL）的审批单必须回放"策略派生"语义：
+                // 若把算出来的 10080 分钟当成"人工显式时长"再下发，
+                // 服务端会按人工上限（默认 1440）截断，7 天的利用类封禁悄悄缩水成 1 天。
+                if (Boolean.parseBoolean(String.valueOf(p.get("policyDerived")))) {
+                    BlockRequest req = new BlockRequest();
+                    req.setIp(ip);
+                    req.setDurationMinutes(null);           // null = 让策略重新按类型定档
+                    req.setReason(o.getReason());
+                    req.setActor(o.getDecidedBy());
+                    req.setSource("审批");
+                    req.setRiskLevel(o.getRiskLevel());
+                    req.setDryRun(Boolean.parseBoolean(String.valueOf(p.get("dryRun"))));
+                    return actionService.blockIp(req);
+                }
                 return actionService.blockIp(ip, dur, o.getReason(), o.getDecidedBy(), "审批");
             }
             case "lock-account":

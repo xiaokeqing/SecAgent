@@ -31,7 +31,7 @@ public class ResponseAudit {
     /** 风险等级：LOW 低危 / HIGH 高危 */
     private String riskLevel;
 
-    /** 执行模式：REAL 真实下发 / MOCK 模拟执行 / BLOCKED 被护栏拦截 */
+    /** 执行模式：REAL 真实下发 / MOCK 模拟执行 / BLOCKED 被护栏拦截 / DRY_RUN 演练（只记录本应执行的命令） */
     private String mode;
 
     /** 是否成功（被拦截/驳回/失败为 false） */

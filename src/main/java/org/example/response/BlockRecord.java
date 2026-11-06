@@ -44,4 +44,24 @@ public class BlockRecord {
 
     /** 解封执行模式：REAL 真实下发 / MOCK 模拟 */
     private String unblockMode;
+
+    // ==================== 集合式封禁（ipset/iptables）补充字段 ====================
+
+    /**
+     * 攻击类型分档（scan / brute-force / exploit / other）。
+     *
+     * <p>为什么把它落盘：封禁时长是按类型算出来的，事后复盘要能回答
+     * "这条 7 天的封禁是因为判成了利用，还是有人手填了 10080 分钟"。
+     * 只存 durationMinutes 的话这两个原因无法区分。
+     */
+    private String threatClass;
+
+    /** 时长是否由分级策略算出（false = 调用方显式指定） */
+    private boolean policyDerived;
+
+    /** 实际生效的后端：IPSET / IPTABLES / WAZUH / MOCK */
+    private String backend;
+
+    /** 实际下发给远端的命令（集合式：{@code block <ip> <ttl> <reason>}） */
+    private String command;
 }

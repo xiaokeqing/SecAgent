@@ -76,6 +76,20 @@ public class BlockRecordStore {
     /** 登记一条新生效的封禁记录并持久化（锁内只改内存，落盘在锁外） */
     public BlockRecord register(String ip, int durationMinutes, String source,
                                 String actor, String auditId, String mode) {
+        return register(ip, durationMinutes, source, actor, auditId, mode, null, false, mode, null);
+    }
+
+    /**
+     * 登记一条新生效的封禁记录（带集合式封禁的元数据）。
+     *
+     * <p>参数：threatClass 攻击类型档位；policyDerived 时长是否来自策略；
+     * backend 实际后端（IPSET/IPTABLES/WAZUH/MOCK）；command 实际下发的命令。
+     * 这些字段在旧 JSON 里不存在，Jackson 反序列化时会留空/默认，兼容历史文件。
+     */
+    public BlockRecord register(String ip, int durationMinutes, String source,
+                                String actor, String auditId, String mode,
+                                String threatClass, boolean policyDerived,
+                                String backend, String command) {
         BlockRecord r = new BlockRecord();
         r.setId("BLK-" + UUID.randomUUID().toString().substring(0, 8));
         r.setIp(ip);
@@ -87,11 +101,16 @@ public class BlockRecordStore {
         r.setCreatedAt(now.format(FMT));
         r.setExpiresAt(now.plusMinutes(durationMinutes).format(FMT));
         r.setUnblocked(false);
+        r.setThreatClass(threatClass);
+        r.setPolicyDerived(policyDerived);
+        r.setBackend(backend);
+        r.setCommand(command);
         synchronized (stateLock) {
             records.add(r);
         }
         persist();
-        logger.info("登记封禁记录 {}：IP={} 时长={}min 到期={} 来源={}", r.getId(), ip, durationMinutes, r.getExpiresAt(), source);
+        logger.info("登记封禁记录 {}：IP={} 时长={}min 类型={} 后端={} 到期={} 来源={}",
+                r.getId(), ip, durationMinutes, threatClass, backend, r.getExpiresAt(), source);
         return r;
     }
 
@@ -114,9 +133,48 @@ public class BlockRecordStore {
         }
     }
 
-    /** 全部封禁记录（最新在前），供前端展示 */
-    public List<BlockRecord> listAll() {
+    /**
+     * 按 IP 批量标记解封（回滚单个 IP 时用）。
+     *
+     * <p>为什么按 IP 而不是按记录 ID：同一个 IP 可能被多次封禁（扫描一次、爆破一次），
+     * iptables/ipset 里最终只留一条条目。回滚时如果不把这批记录一起标掉，
+     * 调度器会在下轮把"已经解封的 IP"再解封一次 —— 无害但会制造假审计。
+     *
+     * @return 实际被标记的记录条数
+     */
+    public int markUnblockedByIp(String ip, String unblockMode) {
+        int changed = 0;
+        String now = LocalDateTime.now().format(FMT);
+        synchronized (stateLock) {
+            for (BlockRecord r : records) {
+                if (!r.isUnblocked() && r.getIp() != null && r.getIp().equals(ip)) {
+                    r.setUnblocked(true);
+                    r.setUnblockedAt(now);
+                    r.setUnblockMode(unblockMode);
+                    changed++;
+                }
+            }
+        }
+        if (changed > 0) {
+            persist();
+            logger.info("按 IP 标记解封 {} 条记录：{} 模式={}", changed, ip, unblockMode);
+        }
+        return changed;
+    }
+
+    /** 生效中的封禁记录（未解封），回滚全量时按 IP 去重后逐条清 */
+    public List<BlockRecord> listActive() {
         List<BlockRecord> out = new ArrayList<>();
+        for (BlockRecord r : records) {
+            if (!r.isUnblocked()) {
+                out.add(r);
+            }
+        }
+        return out;
+    }
+
+    /** 全部封禁记录（最新在前），供前端展示 */
+    public List<BlockRecord> listAll() {        List<BlockRecord> out = new ArrayList<>();
         for (int i = records.size() - 1; i >= 0; i--) {
             out.add(records.get(i));
         }

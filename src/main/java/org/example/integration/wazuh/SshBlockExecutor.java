@@ -49,8 +49,25 @@ public class SshBlockExecutor {
 
     private static final Logger logger = LoggerFactory.getLogger(SshBlockExecutor.class);
 
-    /** 只接受 add / delete，其它一律不构造命令。 */
+    /** 只接受 add / delete，其它一律不构造命令。（旧版协议，保留兼容） */
     private static final Pattern ACTION = Pattern.compile("^(add|delete)$");
+
+    /**
+     * 集合式封禁的四个语义动作（v2 协议）。
+     *
+     * <p>为什么改成语义动作而不是让 Java 拼 {@code iptables -I ...}：
+     * 真正执行防火墙的是服务器 2，只有它知道本机有没有 ipset、集合叫什么、
+     * 老规则要不要清。把"做什么"（block/unblock/flush/status）而不是"怎么做"发下去，
+     * 回退策略才能<b>在执行现场</b>决定（见 {@code secagent-block-cli}）。
+     * 旧版 add/delete 仍可用，避免滚动升级时服务器脚本还没更新就整体失效。
+     */
+    private static final Pattern ACTION_V2 = Pattern.compile("^(block|unblock|flush|status)$");
+
+    /** TTL 上限（秒）：与服务端脚本校验一致，365 天 */
+    private static final int MAX_TTL_SECONDS = 31_536_000;
+
+    /** reason 只作为服务端日志 token，形状收紧到 ASCII 白名单，非法回落 auto */
+    private static final Pattern REASON = Pattern.compile("^[a-z0-9][a-z0-9._-]{0,31}$");
 
     /**
      * 目标 IP 的白名单正则。
@@ -209,14 +226,92 @@ public class SshBlockExecutor {
         if (!looksLikeIp(ip)) {
             throw new IOException("非法 IP: " + ip);
         }
+        return guarded(action, ip);
+    }
+
+    // ==================== 集合式封禁 v2：block / unblock / flush / status ====================
+
+    /**
+     * 集合式封禁：把 IP 加进服务端的 ipset 集合，TTL 到点由内核自动过期。
+     *
+     * <p>与 {@link #run} 的关系：run 是旧版"add/delete 一条 iptables 规则"，
+     * 这里是新版语义命令。两者共用同一把密钥、同一套超时与出站守卫，
+     * 区别只在发给服务端的动作字符串。
+     * <p>
+     * 参数校验仍在本类做一遍（尽早失败），但<b>权威判断在服务端脚本</b>：
+     * 这里不知道服务器 2 有没有 ipset，也不该知道 —— 那属于执行现场的知识。
+     *
+     * @param ip         目标 IP（v4 或 v6，服务端据此选集合与 iptables/ip6tables）
+     * @param ttlSeconds 封禁秒数，超过 365 天视为调用错误
+     * @param reason     原因 token（只作服务端审计用，非法形状回落 {@code auto}）
+     * @return 服务端回显，含 {@code backend=ipset|iptables}
+     */
+    public String block(String ip, int ttlSeconds, String reason) throws IOException {
+        if (!isEnabled()) {
+            throw new IOException("SSH 直连封禁未启用（integration.block.ssh.*）");
+        }
+        if (!looksLikeIp(ip)) {
+            throw new IOException("非法 IP: " + ip);
+        }
+        if (ttlSeconds <= 0 || ttlSeconds > MAX_TTL_SECONDS) {
+            throw new IOException("非法 TTL: " + ttlSeconds + "s（允许 1~" + MAX_TTL_SECONDS + "）");
+        }
+        // reason 是纯装饰性字段：形状不对就回落 auto，不因为一个日志 token 让整次处置失败
+        String slug = (reason != null && REASON.matcher(reason).matches()) ? reason : "auto";
+        return guarded("block", ip + " " + ttlSeconds + " " + slug);
+    }
+
+    /** 解封单个 IP：从集合里删条目，并清掉回退路径留下的逐条规则 */
+    public String unblock(String ip) throws IOException {
+        if (!isEnabled()) {
+            throw new IOException("SSH 直连封禁未启用（integration.block.ssh.*）");
+        }
+        if (!looksLikeIp(ip)) {
+            throw new IOException("非法 IP: " + ip);
+        }
+        return guarded("unblock", ip);
+    }
+
+    /**
+     * 一键清空本次会话加入的全部封禁条目（v4 与 v6 两个集合 + 回退规则）。
+     *
+     * <p>这是"误封止血"用的：批量规则误伤时，逐条解封来不及，必须能一次清空。
+     * 它只清 SecAgent 自己的集合，不碰其它防火墙规则 —— 这也是用独立集合的好处。
+     */
+    public String flush() throws IOException {
+        if (!isEnabled()) {
+            throw new IOException("SSH 直连封禁未启用（integration.block.ssh.*）");
+        }
+        return guarded("flush", "");
+    }
+
+    /** 查询当前封禁条目（排障用，只读） */
+    public String status() throws IOException {
+        if (!isEnabled()) {
+            throw new IOException("SSH 直连封禁未启用（integration.block.ssh.*）");
+        }
+        return guarded("status", "");
+    }
+
+    /**
+     * 统一的出站守卫包装：有界等待 + 每依赖冷却 + 半开。
+     *
+     * <p>抽出来是避免 v2 的四个动作各写一遍 try/catch —— 四处各写一份，
+     * 迟早有一处漏掉冷却或漏掉异常转换。旧版 run 也走这里。
+     */
+    private String guarded(String verb, String args) throws IOException {
+        // 纵深防御：动作字符串只允许已知集合，任何拼接错误都在此直接失败
+        if (verb == null || (!ACTION.matcher(verb).matches() && !ACTION_V2.matcher(verb).matches())) {
+            throw new IOException("非法动作: " + verb);
+        }
         if (outboundGuard == null) {
-            return runOnce(action, ip);
+            return runOnce(verb, args);
         }
         // 有界等待 + 每依赖 60s 冷却 + 半开：一次超时后短时间内直接失败，
         // 不再让每个处置请求各等一遍（那会把处置线程占满）
         try {
             return outboundGuard.call(DEP_SSH, outboundTimeouts.getCallTimeoutMs(),
-                    () -> runOnce(action, ip));
+                    () -> runOnce(verb, args));
         } catch (IOException e) {
             throw e;
         } catch (RuntimeException e) {
@@ -231,8 +326,11 @@ public class SshBlockExecutor {
      *
      * <p>抽成独立方法是为了单测能直接断言"实际下发给了 ssh 哪几个超时参数" ——
      * 光断言常量不算证据，要断言真正进了命令行。
+     *
+     * @param verb 动作（add/delete 旧协议；block/unblock/flush/status 新协议）
+     * @param args 动作之后的参数串（如 {@code "1.2.3.4 1800 scan"}）；空串表示无参数
      */
-    List<String> buildCommand(String action, String ip) {
+    List<String> buildCommand(String verb, String args) {
         List<String> cmd = new ArrayList<>(Arrays.asList(
                 "ssh",
                 "-i", keyPath,
@@ -249,15 +347,15 @@ public class SshBlockExecutor {
         // 注意：整条指令作为【一个】参数传给 ssh，
         // 服务端的 forced command 会从 $SSH_ORIGINAL_COMMAND 读到它。
         cmd.add(user + "@" + host);
-        cmd.add(action + " " + ip);
+        cmd.add(args == null || args.isEmpty() ? verb : verb + " " + args);
         return cmd;
     }
 
-    private String runOnce(String action, String ip) throws IOException {
+    private String runOnce(String verb, String args) throws IOException {
         logger.info("SSH 直连处置：{} {} -> {}@{}（ConnectTimeout={}s，等待上限={}ms）",
-                action, ip, user, host, connectTimeoutSeconds(), processWaitMs());
+                verb, args, user, host, connectTimeoutSeconds(), processWaitMs());
 
-        ProcessBuilder pb = new ProcessBuilder(buildCommand(action, ip));
+        ProcessBuilder pb = new ProcessBuilder(buildCommand(verb, args));
         pb.redirectErrorStream(true);
         Process p;
         try {

@@ -33,6 +33,16 @@ public class ResponseController {
     private final ResponseGuard responseGuard;
     private final ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider;
 
+    /**
+     * 分级 TTL 策略。
+     *
+     * <p>控制器需要它<b>只为两件事</b>：① 在转审批之前就定出"到底封多久"
+     * （审批卡片必须显示真实时长，否则管理员批的是一个数、执行的是另一个数）；
+     * ② 需求里"高危 = 超长封禁"的判据要基于最终时长，而不是请求里有没有填 durationMinutes。
+     * 真正的时长决策仍然只在服务层做一次（{@code BlockPolicy.decide} 是纯函数，重复调用结果一致）。
+     */
+    private final BlockPolicy blockPolicy;
+
     /** 超长封禁（分钟）即视为高危，需人工确认 */
     private static final int LONG_BLOCK_MINUTES = 120;
 
@@ -49,6 +59,16 @@ public class ResponseController {
     private volatile boolean highRiskRequireApproval;
 
     /**
+     * 全局演练开关（只读，来自 yml）。
+     *
+     * <p>加它是因为"演练模式"必须能被运维<b>紧急打开</b>而不改代码；
+     * 单次请求上的 {@code dryRun} 字段则给测试/演示用。两者的关系是"或"，
+     * 由服务层的 {@code dryRun || dryRunEnabled} 统一裁决，避免两个地方各判一套。
+     */
+    @Value("${response.dry-run:false}")
+    private boolean dryRunEnabled;
+
+    /**
      * 策略锁：<b>只保护四个开关的内存更新</b>。
      *
      * <p>原来 {@code putPolicy} 是 {@code synchronized} 方法，临界区里包含
@@ -63,13 +83,15 @@ public class ResponseController {
                               AuditService auditService,
                               BlockRecordStore blockRecordStore,
                               ResponseGuard responseGuard,
-                              ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider) {
+                              ObjectProvider<org.example.integration.WazuhGateway> wazuhGatewayProvider,
+                              BlockPolicy blockPolicy) {
         this.actionService = actionService;
         this.approvalService = approvalService;
         this.auditService = auditService;
         this.blockRecordStore = blockRecordStore;
         this.responseGuard = responseGuard;
         this.wazuhGatewayProvider = wazuhGatewayProvider;
+        this.blockPolicy = blockPolicy == null ? new BlockPolicy() : blockPolicy;
     }
 
     private static Map<String, Object> ok(Object data, String message) {
@@ -95,6 +117,19 @@ public class ResponseController {
         p.put("autoKillProcess", autoKillProcess);
         p.put("highRiskRequireApproval", highRiskRequireApproval);
         p.put("defaultDurationMinutes", responseGuard.getDefaultDurationMinutes());
+        p.put("maxDurationMinutes", responseGuard.getMaxDurationMinutes());
+        p.put("policyMaxDurationMinutes", responseGuard.getPolicyMaxDurationMinutes());
+        p.put("dryRun", dryRunEnabled);
+        // 把分级 TTL 档位暴露给前端：运维要能一眼看到"扫描 30min / 爆破 1d / 利用 7d"，
+        // 否则封了 7 天会被当成 bug 来报
+        Map<String, Object> ttl = new LinkedHashMap<>();
+        for (BlockPolicy.ThreatClass tc : BlockPolicy.ThreatClass.values()) {
+            Map<String, Object> one = new LinkedHashMap<>();
+            one.put("label", tc.getLabel());
+            one.put("minutes", blockPolicy.minutesFor(tc));
+            ttl.put(tc.getToken(), one);
+        }
+        p.put("ttl", ttl);
         return ok(p, "success");
     }
 
@@ -180,6 +215,13 @@ public class ResponseController {
 
     // ===== 执行 / 转审批 =====
 
+    /**
+     * 封禁来源 IP。
+     *
+     * <p>请求体可带：ip / durationMinutes / reason / riskLevel / dryRun。
+     * {@code durationMinutes} 省略时<b>不再默认 60 分钟</b>，而是交给
+     * {@link BlockPolicy} 按攻击类型定档（扫描 30min、爆破 24h、利用 7d）。
+     */
     @PostMapping("/block")
     public Map<String, Object> block(@RequestBody Map<String, Object> body, HttpServletRequest req) {
         String actor = actor(req);
@@ -188,34 +230,89 @@ public class ResponseController {
                 : (intVal(body.get("durationMinutes")));
         String reason = str(body.get("reason"));
         if (reason == null) reason = "手动封IP";
+        String riskHint = str(body.get("riskLevel"));
+        boolean dryRun = Boolean.parseBoolean(String.valueOf(body.get("dryRun")));
 
         if (!autoBlockEnabled) {
-            ActiveResponseResult blocked = ActiveResponseResult.blocked("firewall-drop", ip == null ? "" : ip,
+            ActiveResponseResult blocked = ActiveResponseResult.blocked("ipset-block", ip == null ? "" : ip,
                     "封IP自动处置策略已关闭，请先在策略面板开启");
             auditService.append(ResponseAudit.of(actor, "block-ip", ip == null ? "" : ip,
                     blocked.getMessage(), "LOW", "BLOCKED", false, "策略关闭"));
             return ok(wrap(blocked, false, false), "封IP被策略关闭拦截");
         }
 
-        // 先过护栏：被拦立刻返回原因，不进入审批
-        String guardReason = responseGuard.validateBlock(ip, duration);
+        // 先过护栏：被拦立刻返回原因，不进入审批。
+        // 用"策略派生"口径预判（与下面最终下发的时长档位一致），避免预判和实际执行用两套上限
+        BlockPolicy.Decision decision = blockPolicy.decide(duration, reason, riskHint);
+        String guardReason = responseGuard.validateBlock(ip, decision.getMinutes(),
+                decision.isPolicyDerived());
         if (guardReason != null) {
-            ActiveResponseResult blocked = actionService.blockIp(ip, duration, reason, actor);
+            // 交给服务层统一写"被护栏拦截"的审计并返回标准结果（不要在这里重复造审计）
+            ActiveResponseResult blocked = actionService.blockIp(
+                    request(ip, duration, reason, actor, riskHint, dryRun));
             return ok(wrap(blocked, false, false), "已被护栏拦截");
         }
 
-        int dur = duration == null ? responseGuard.getDefaultDurationMinutes() : duration;
+        int dur = decision.getMinutes();
         String risk = dur > LONG_BLOCK_MINUTES ? "HIGH" : "LOW";
-        boolean needApproval = "HIGH".equals(risk) && highRiskRequireApproval;
+        boolean needApproval = "HIGH".equals(risk) && highRiskRequireApproval && !dryRun;
         if (needApproval) {
             Map<String, Object> params = new LinkedHashMap<>();
             params.put("ip", ip);
             params.put("durationMinutes", dur);
+            // 这两个标记是给审批回放用的：策略派生的时长必须回放"派生"语义，
+            // 否则 7 天的利用类封禁在审批通过后会被人工上限截成 1 天
+            params.put("policyDerived", decision.isPolicyDerived());
+            params.put("dryRun", dryRun);
             ApprovalService.Order order = approvalService.create("block-ip", ip, reason, risk, params, actor);
             return ok(wrap(null, true, true, order), "超长封禁为高危，已转人工审批");
         }
-        ActiveResponseResult r = actionService.blockIp(ip, dur, reason, actor);
-        return ok(wrap(r, false, true, null), "执行完成");
+        ActiveResponseResult r = actionService.blockIp(
+                request(ip, duration, reason, actor, riskHint, dryRun));
+        String msg = dryRun ? "演练完成（未真正下发）" : "执行完成";
+        return ok(wrap(r, false, true, null), msg);
+    }
+
+    /** 组装封禁请求（把 riskLevel 提示与 dryRun 一起带下去，服务层只做一次决策） */
+    private static BlockRequest request(String ip, Integer duration, String reason, String actor,
+                                        String riskHint, boolean dryRun) {
+        BlockRequest r = new BlockRequest();
+        r.setIp(ip);
+        r.setDurationMinutes(duration);
+        r.setReason(reason);
+        r.setActor(actor);
+        r.setSource("手动");
+        r.setRiskLevel(riskHint);
+        r.setDryRun(dryRun);
+        return r;
+    }
+
+    // ===== 解封 / 回滚（误封止血） =====
+
+    /**
+     * 手动解封单个 IP（不经过审批：解封是"减少伤害"方向的动作，卡它只会延长误封）。
+     */
+    @PostMapping("/unblock")
+    public Map<String, Object> unblock(@RequestBody Map<String, Object> body, HttpServletRequest req) {
+        String ip = str(body.get("ip"));
+        ActiveResponseResult r = actionService.unblockIp(ip, actor(req), "手动");
+        return ok(wrap(r, false, true), r.isSuccess() ? "已解封" : "解封失败");
+    }
+
+    /**
+     * 一键回滚封禁。
+     *
+     * <p>请求体 {@code {"flush": true}} = 清空服务端 secagent_block / secagent_block6 两个集合
+     * （以及无 ipset 时的回退规则）；{@code false} 或不填 = 只逐条解封当前生效中的记录。
+     * flush 更快（一条命令），逐条更保守（不会误伤不属于本次会话的条目）。
+     */
+    @PostMapping("/rollback")
+    public Map<String, Object> rollback(@RequestBody(required = false) Map<String, Object> body,
+                                        HttpServletRequest req) {
+        boolean flush = body != null && Boolean.parseBoolean(String.valueOf(body.get("flush")));
+        Map<String, Object> r = actionService.rollback(flush, actor(req));
+        boolean okFlag = Boolean.TRUE.equals(r.get("success"));
+        return ok(r, okFlag ? String.valueOf(r.get("message")) : "回滚部分失败，详见 failedTargets");
     }
 
     @PostMapping("/lock")
@@ -325,6 +422,10 @@ public class ResponseController {
             m.put("unblocked", r.isUnblocked());
             m.put("unblockedAt", r.getUnblockedAt());
             m.put("unblockMode", r.getUnblockMode());
+            // 新增三列是为了排障：封了多久的、按哪档定的、走的是 ipset 还是 iptables 回退
+            m.put("threatClass", r.getThreatClass());
+            m.put("policyDerived", r.isPolicyDerived());
+            m.put("backend", r.getBackend());
             m.put("status", r.isUnblocked() ? "UNBLOCKED" : "BLOCKED");
             // 距到期分钟数（已解封记 0；时间解析失败记 -1）
             long remainingMinutes = -1;

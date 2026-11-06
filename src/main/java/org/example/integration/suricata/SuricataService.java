@@ -10,12 +10,15 @@ import org.example.integration.SuricataGateway;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.io.RandomAccessFile;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
@@ -26,10 +29,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Suricata 对接服务：逐行读取 eve.json，抽取 event_type=alert 的网络告警。
+ * Suricata 对接服务：读取 eve.json 里的 alert / flow / http / dns / tls / netflow 事件。
  *
  * <p>文件不存在 / 不可读 / 解析失败 → 自动降级 MOCK，返回内置网络告警样本
  * （ET SCAN 端口扫描、ET POLICY 可疑外联），保证开箱可演示。
+ *
+ * <h3>为什么读文件分两条路径</h3>
+ * <p>告警接口（{@link #recentNetworkAlerts}）要的是"最新若干条"，且调用方 Expect 一次调用就能看到文件里
+ * 已经存在的全部历史；而反查接口要跨事件类型聚合，必须常驻内存。两者混用会把"每次重读文件"的成本
+ * 摊到每个反查请求上，所以这里保留原直读路径不动，另起一个 {@code @Scheduled} 增量摄取把事件放进
+ * 有界环形缓冲。这样告警通路的行为、以及"没有 eve.json 就返回样本"的现有语义都不受影响。
  */
 @Service
 public class SuricataService implements SuricataGateway {
@@ -38,6 +47,11 @@ public class SuricataService implements SuricataGateway {
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     /** 内存中最多保留多少条 alert 事件（防止 eve.json 巨大时占满内存） */
     private static final int MAX_CACHE = 200;
+    /** 单轮增量读取上限：追赶积压时也只在一次调度里读 4MB，避免瞬时占满堆 */
+    private static final int MAX_BYTES_PER_INGEST = 4 * 1024 * 1024;
+    /** 首次摄取从文件尾部回溯的字节数：启动时不需要上一次运行留下的全部历史 */
+    private static final long INITIAL_TAIL_BYTES = 8L * 1024 * 1024;
+    private static final int DEFAULT_BUFFER_CAPACITY = 50000;
 
     @Value("${integration.suricata.enabled:true}")
     private boolean enabled;
@@ -45,12 +59,27 @@ public class SuricataService implements SuricataGateway {
     private String eveJsonPath;
     @Value("${integration.suricata.timeout:5}")
     private int timeout;
+    /** 环形缓冲每类的容量上限；eve.json 是持续追加的，必须有界（容器 512MiB，曾因无界缓存 OOM） */
+    @Value("${integration.suricata.buffer-capacity:50000}")
+    private int bufferCapacity;
 
     private final ObjectMapper mapper = new ObjectMapper();
+    private final EveEventParser parser = new EveEventParser(mapper);
+
+    private volatile SuricataEventStore store;
     private volatile boolean available;
+
+    /** 已消费到的字节偏移。跨调度周期保留，靠它做增量而不是每轮重扫全文件 */
+    private long ingestOffset;
+    /** 是否已经确定过起始偏移（首轮要用"文件尾部"而不是 0） */
+    private boolean ingestInitialized;
+    /** 上一块结尾是半行：下一块开头要跳到第一个换行之后再解析 */
+    private boolean skippingPartialLine;
 
     @PostConstruct
     public void init() {
+        // 无论是否启用都先建好缓冲：查询入口不必到处判空，模式变化也不用重建
+        store();
         if (!enabled) {
             logger.info("Suricata 对接未启用，使用内置样本");
             return;
@@ -67,6 +96,9 @@ public class SuricataService implements SuricataGateway {
             // 所以改成 INFO 并把口径写清楚。
             logger.info("未挂载 Suricata eve.json（{}）—— 属预期：网络告警经 Wazuh agent → indexer 通路返回，"
                     + "本进程不使用本地样本（该降级仅影响本进程内的本地文件直读模式）", eveJsonPath);
+        }
+        if (available) {
+            logger.info("Suricata 事件缓冲：每类 {} 条（有界，满后覆盖最旧）", store().capacity());
         }
     }
 
@@ -96,19 +128,223 @@ public class SuricataService implements SuricataGateway {
         return builtinAlerts(limit);
     }
 
-    /** 逐行读 eve.json，只保留 event_type=alert 的最后若干条。 */
+    // ==================== 全事件摄取 ====================
+
+    /**
+     * 定时把 eve.json 的新增行解析进环形缓冲。
+     *
+     * <p>用固定延迟而不是固定频率：一旦积压，下一轮会自然推后，不会把线程池堆满。
+     * 首次调度延迟 15s，给启动期的其他初始化让路（磁盘/容器可能还没挂好）。
+     *
+     * <p>任何异常都只降级为 debug 日志：反查是"锦上添花"的能力，不能因为它让进程或告警通路出问题。
+     */
+    @Scheduled(initialDelayString = "${integration.suricata.ingest-initial-delay-ms:15000}",
+            fixedDelayString = "${integration.suricata.ingest-interval-ms:10000}")
+    public void ingestNewEvents() {
+        if (!enabled) {
+            return;
+        }
+        File f = new File(eveJsonPath);
+        if (!f.isFile() || !f.canRead()) {
+            // 文件不在（几乎总是"未挂载"）：保持当前模式，不报错
+            return;
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            long len = raf.length();
+            if (len < ingestOffset) {
+                // 文件变短只有两种可能：轮转或截断。旧偏移已无意义，重置后重读
+                logger.info("eve.json 长度 {} 小于已读偏移 {}，视为轮转/截断，从头重新读取", len, ingestOffset);
+                ingestOffset = 0;
+                ingestInitialized = false;
+                skippingPartialLine = false;
+            }
+            if (!ingestInitialized) {
+                // 首轮只回溯文件尾部一段：启动时把几 GB 历史全量回放既慢又不必要
+                ingestOffset = Math.max(0, len - INITIAL_TAIL_BYTES);
+                skippingPartialLine = ingestOffset > 0;
+                ingestInitialized = true;
+                logger.info("eve.json 增量读取起点：{}（文件长度 {}）", ingestOffset, len);
+            }
+            if (ingestOffset >= len) {
+                return;
+            }
+            long start = ingestOffset;
+            int toRead = (int) Math.min(MAX_BYTES_PER_INGEST, len - start);
+            byte[] buf = new byte[toRead];
+            raf.seek(start);
+            raf.readFully(buf);
+
+            int from = 0;
+            if (skippingPartialLine) {
+                // 起点可能落在某一行中间，那半个 JSON 不能解析，必须跳过一个换行
+                int nl = indexOfNewline(buf, 0);
+                if (nl < 0) {
+                    // 整块都没有换行：还没等到那一行的结尾
+                    if (toRead < MAX_BYTES_PER_INGEST) {
+                        return; // 到文件尾了，偏移不动，下轮再找
+                    }
+                    // 单行超过一轮读取上限：只能丢掉，否则每轮都在原地重读、永远追不上
+                    ingestOffset = start + toRead;
+                    return;
+                }
+                from = nl + 1;
+            }
+            int lastNl = lastIndexOfNewline(buf);
+            if (lastNl < from) {
+                // 块里没有完整的一行：文件还在追加，半行不能丢，偏移保持不动等下一轮
+                if (toRead < MAX_BYTES_PER_INGEST) {
+                    return;
+                }
+                ingestOffset = start + toRead;
+                return;
+            }
+            // 到这里才确认"半行已越过、且有完整行可处理"，可以收起跳行标记
+            skippingPartialLine = false;
+
+            int added = 0;
+            int lineStart = from;
+            for (int i = from; i <= lastNl; i++) {
+                if (buf[i] != '\n') {
+                    continue;
+                }
+                if (i > lineStart) {
+                    String line = new String(buf, lineStart, i - lineStart, StandardCharsets.UTF_8).trim();
+                    if (!line.isEmpty()) {
+                        EveEvent event = parser.parseLine(line);
+                        if (event != null) {
+                            store().add(event);
+                            added++;
+                        }
+                    }
+                }
+                lineStart = i + 1;
+            }
+            // 只把偏移推进到最后一个完整行之后：结尾的半行下轮再拼
+            ingestOffset = start + lastNl + 1;
+            if (!available) {
+                // 启动时文件还不在、后来才挂上：以最近一次成功读取为准切到 REAL
+                available = true;
+                logger.info("eve.json 已可读，Suricata 模式切换为 REAL");
+            }
+            if (added > 0) {
+                logger.debug("Suricata 摄取 {} 条事件，偏移推进到 {}", added, ingestOffset);
+            }
+        } catch (Exception e) {
+            // 反查失败不应该影响告警通路，也不该刷屏
+            logger.debug("Suricata eve.json 增量读取中断（不影响告警通路）：{}", e.getMessage());
+        }
+    }
+
+    private static int indexOfNewline(byte[] buf, int from) {
+        for (int i = from; i < buf.length; i++) {
+            if (buf[i] == '\n') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int lastIndexOfNewline(byte[] buf) {
+        for (int i = buf.length - 1; i >= 0; i--) {
+            if (buf[i] == '\n') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    // ==================== 反查 ====================
+
+    @Override
+    public List<FlowEvent> connectionsByIp(String ip, int limit) {
+        try {
+            return store().connectionsByIp(ip, limit);
+        } catch (Exception e) {
+            logger.debug("按 IP 反查连接失败（返回空）：{}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    @Override
+    public List<PortCount> topDestPorts(int minutes, int limit) {
+        try {
+            return store().topDestPorts(minutes, limit);
+        } catch (Exception e) {
+            logger.debug("目标端口统计失败（返回空）：{}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    @Override
+    public List<SniCount> topSni(int minutes, int limit) {
+        try {
+            return store().topSni(minutes, limit);
+        } catch (Exception e) {
+            logger.debug("SNI 统计失败（返回空）：{}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    @Override
+    public List<Ja3Count> ja3Stats(int minutes, int limit) {
+        try {
+            return store().ja3Stats(minutes, limit);
+        } catch (Exception e) {
+            logger.debug("JA3 统计失败（返回空）：{}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** 缓冲只建一次：多个调度周期/查询并发到达时用双重检查避免重复分配 */
+    private SuricataEventStore store() {
+        SuricataEventStore s = store;
+        if (s != null) {
+            return s;
+        }
+        synchronized (this) {
+            if (store == null) {
+                int cap = bufferCapacity > 0 ? bufferCapacity : DEFAULT_BUFFER_CAPACITY;
+                store = new SuricataEventStore(cap);
+            }
+            return store;
+        }
+    }
+
+    /** 供测试与运维观测使用：当前缓冲里各类事件的条数。 */
+    public Map<String, Object> bufferStats() {
+        SuricataEventStore s = store();
+        Map<String, Object> out = new HashMap<>();
+        out.put("capacity", s.capacity());
+        out.put("flows", s.flowCount());
+        out.put("tls", s.tlsCount());
+        out.put("ingested", s.totalIngested());
+        out.put("offset", ingestOffset);
+        return out;
+    }
+
+    /**
+     * 逐行读 eve.json，只保留 event_type=alert 的最后若干条。
+     *
+     * <p>和增量摄取不同，这里仍然每次重读全文件：现有 /api/alerts 的语义就是"以文件当前内容为准"，
+     * 改成读缓冲会让刚追加的告警延迟一个调度周期才可见。但内存上只留最后 MAX_CACHE 条（同原实现），
+     * 不会因为文件大而吃满堆。
+     */
     private List<SecurityAlert> readFromEve(int limit) throws Exception {
         Deque<JsonNode> alerts = new ArrayDeque<>();
         try (BufferedReader br = new BufferedReader(new FileReader(eveJsonPath))) {
             String line;
             while ((line = br.readLine()) != null) {
                 line = line.trim();
-                if (line.isEmpty()) continue;
+                if (line.isEmpty()) {
+                    continue;
+                }
                 try {
                     JsonNode n = mapper.readTree(line);
                     if ("alert".equalsIgnoreCase(n.path("event_type").asText())) {
                         alerts.addLast(n);
-                        if (alerts.size() > MAX_CACHE) alerts.removeFirst();
+                        if (alerts.size() > MAX_CACHE) {
+                            alerts.removeFirst();
+                        }
                     }
                 } catch (Exception parseErr) {
                     // 坏行跳过，不影响整体
@@ -120,41 +356,12 @@ public class SuricataService implements SuricataGateway {
         int skip = Math.max(0, alerts.size() - Math.min(limit, alerts.size()));
         int i = 0;
         for (JsonNode n : alerts) {
-            if (i++ < skip) continue;
-            out.add(toAlert(n, "suricata-eve-" + out.size()));
+            if (i++ < skip) {
+                continue;
+            }
+            out.add(parser.toSecurityAlert(n, "suricata-eve-" + out.size()));
         }
         return out;
-    }
-
-    private SecurityAlert toAlert(JsonNode n, String fallbackId) {
-        String signature = n.path("alert").path("signature").asText("suricata-alert");
-        String category = n.path("alert").path("category").asText("");
-        int severity = n.path("alert").path("severity").asInt(2);
-        String srcIp = n.path("src_ip").asText("");
-        String dstIp = n.path("dest_ip").asText("");
-        int dstPort = n.path("dest_port").asInt(0);
-        String proto = n.path("proto").asText("");
-        String timestamp = n.path("timestamp").asText("");
-
-        SecurityAlert a = new SecurityAlert(fallbackId, signature,
-                AlertSeverity.parse(severity),
-                AlertType.guess(signature + " " + category),
-                AlertSource.SURICATA);
-        a.setRuleName(signature);
-        a.setSrcIp(srcIp);
-        a.setDstIp(dstIp);
-        a.setDstAsset(dstIp);
-        a.setDstPort(dstPort > 0 ? dstPort : null);
-        a.setService(proto);
-        a.setDescription("[" + category + "] " + signature);
-        a.setRawLog(n.toString());
-        a.setOccurredAt(normalizeTime(timestamp));
-        Map<String, Object> extra = new HashMap<>();
-        extra.put("category", category);
-        extra.put("severity", severity);
-        extra.put("proto", proto);
-        a.setExtra(extra);
-        return a;
     }
 
     // ==================== 内置网络样本（MOCK） ====================
@@ -197,7 +404,7 @@ public class SuricataService implements SuricataGateway {
                 320));
 
         int n = Math.min(limit, all.size());
-        return new ArrayList<>(all.subList(0, n));
+        return new ArrayList<>(all.subList(0, Math.max(0, n)));
     }
 
     private SecurityAlert make(String id, String signature, String category, int severity,
@@ -225,20 +432,5 @@ public class SuricataService implements SuricataGateway {
         extra.put("mock", true);
         a.setExtra(extra);
         return a;
-    }
-
-    private static String normalizeTime(String iso) {
-        if (iso == null || iso.isBlank()) {
-            return LocalDateTime.now().format(FMT);
-        }
-        try {
-            String s = iso.trim().replace('T', ' ');
-            int dot = s.indexOf('.');
-            if (dot > 0) s = s.substring(0, dot);
-            s = s.replaceAll("[Zz]\\s*$", "").trim();
-            return LocalDateTime.parse(s, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")).format(FMT);
-        } catch (Exception e) {
-            return iso;
-        }
     }
 }

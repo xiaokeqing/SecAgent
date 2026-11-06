@@ -596,8 +596,20 @@ app:
     # 部署时通过 SECAGENT_SELF_ASSETS 填，例如：
     #   SECAGENT_SELF_ASSETS=47.96.106.187,203.0.113.10
     self-assets: ${SECAGENT_SELF_ASSETS:}
+    # 本机对外公网 IP（逗号分隔）。误封自检的分工是这样的：
+    #   whitelist/self-assets = "不该封的地址"
+    #   machine-public-ips    = "封了会把本机自己锁死/切流量的地址"
+    # 单独一项而不是塞进 whitelist，是因为两者的处置语义不同：
+    # 命中本项时运维需要看到明确原因（"你封的是自己"），而不是笼统的"命中白名单"。
+    machine-public-ips: ${SECAGENT_MACHINE_PUBLIC_IPS:}
+    # 健康检查/负载均衡探测源（逗号分隔 IP/CIDR）。封了它们 = 服务被判死、被摘流量，
+    # 这是"自我 DoS 的第二种形态"，必须与白名单一样硬拦截。
+    healthcheck-sources: ${SECAGENT_HEALTHCHECK_SOURCES:}
     default-duration-minutes: 60
     max-duration-minutes: 1440
+    # 自动处置（策略派生）时长的上限。必须比人工上限大：
+    # 利用类按策略封 7 天(10080)，若拿人工上限 1440 去卡，长封禁会被静默截成 1 天。
+    policy-max-duration-minutes: 10080
   # 跨域：默认只允许本机来源，不再使用通配符 "*"
   cors:
     allowed-origins: http://localhost:9900,http://127.0.0.1:9900
@@ -674,6 +686,12 @@ integration:
     enabled: true
     eve-json: ${SURICATA_EVE:/var/log/suricata/eve.json}
     timeout: 5
+    # 全事件（flow/http/dns/tls/alert）的环形缓冲：每类事件最多保留多少条。
+    # 必须有限：eve.json 是持续追加的日志，无界缓存会把 512MiB 的容器打穿（真实发生过 OOM）。
+    buffer-capacity: ${SURICATA_BUFFER_CAPACITY:50000}
+    # 增量摄取周期（毫秒）与首次延迟：只把新追加的行解析进缓冲，不每轮重扫全文件。
+    ingest-interval-ms: ${SURICATA_INGEST_INTERVAL_MS:10000}
+    ingest-initial-delay-ms: ${SURICATA_INGEST_INITIAL_DELAY_MS:15000}
 
 # ===== 人在回路分级自动响应 =====
 response:
@@ -683,6 +701,20 @@ response:
   high-risk-require-approval: true         # 高危动作（锁账号/杀进程/长封禁）强制人工确认门
   audit-file: data/response-audit.json     # 全部处置动作留痕（可审计）
   blocks-file: data/blocked-ips.json       # 生效中的封禁 IP 记录（带到期时间，到期自动解封）
+  # 演练模式总开关：true 时所有封禁只计算"本应执行的命令"并写审计，绝不下发。
+  # 为什么要有它：集合式封禁是服务器侧全局生效的，误封会打断正常业务；
+  # 上线/换服务器时先进演练模式看一遍命令，比事后回滚便宜得多。
+  dry-run: ${RESPONSE_DRY_RUN:false}
+  # ===== 分级封禁时长（分钟）=====
+  # 为什么按时长分档而不是一刀切：扫描是"噪声"（封 30 分钟足够降温），
+  # 爆破是"持续意图"（24 小时），利用是"已突破尝试"（7 天）。
+  # 时长来自攻防经验值，可按环境调整；人工显式传入的 durationMinutes 优先级更高。
+  ttl:
+    scan-minutes: 30                       # 扫描/探测
+    brute-force-minutes: 1440              # 暴力破解（24h）
+    exploit-minutes: 10080                 # 漏洞利用（7d）
+    default-minutes: 60                    # 无法归类时
+    high-risk-minutes: 1440                # 只有风险等级、没有类别时的兜底
   unblock:
     enabled: true                          # 到期自动解封总开关；false 时调度器不扫描
     interval-ms: 60000                     # 调度扫描周期（毫秒，默认 60s）
