@@ -216,6 +216,18 @@ services:
       APP_MAIL_STARTTLS: "${APP_MAIL_STARTTLS:-false}"
       APP_REPORT_ENABLED: "${APP_REPORT_ENABLED:-false}"
 
+      # ===== 自动处置护栏（2026-11-07 站主口径：切真封）=====
+      # 背景：application.yml 里 `response.dry-run: ${RESPONSE_DRY_RUN:false}` 的**默认值就是 false**
+      #      ⇒ 这台机器一直是"真封"状态，只是从没配过白名单。真封必须先把"不该封的"填满，
+      #      否则一条误报就能把自己的公网 IP / 健康检查源封掉（自我 DoS）。
+      #   SECAGENT_SELF_ASSETS         自有资产：两台服务器的公网 IP + 内网地址
+      #   SECAGENT_MACHINE_PUBLIC_IPS  本机出口 IP：命中时要报"你封的是自己"，而不是笼统的"命中白名单"
+      #   SECAGENT_HEALTHCHECK_SOURCES 健康检查/探测源：封了会被判死、摘流量
+      SECAGENT_SELF_ASSETS: "${SECAGENT_SELF_ASSETS:-47.96.106.187,43.143.114.79,10.0.0.10,127.0.0.1}"
+      SECAGENT_MACHINE_PUBLIC_IPS: "${SECAGENT_MACHINE_PUBLIC_IPS:-47.96.106.187,43.143.114.79}"
+      SECAGENT_HEALTHCHECK_SOURCES: "${SECAGENT_HEALTHCHECK_SOURCES:-47.96.106.187,43.143.114.79,127.0.0.1}"
+      RESPONSE_DRY_RUN: "${RESPONSE_DRY_RUN:-false}"
+
       # ===== 混合检索参数（两路召回 + RRF + 轻量重排，RUNBOOK §25）=====
       # 与额度同理：这段必须显式透传，否则"在 .env 里加一行"不会生效而它不报错。
       # 全部可留空（留空即用代码默认值，与改造前行为兼容）。
