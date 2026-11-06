@@ -17,6 +17,7 @@ import jakarta.annotation.PostConstruct;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
@@ -52,6 +53,8 @@ public class SuricataService implements SuricataGateway {
     /** 首次摄取从文件尾部回溯的字节数：启动时不需要上一次运行留下的全部历史 */
     private static final long INITIAL_TAIL_BYTES = 8L * 1024 * 1024;
     private static final int DEFAULT_BUFFER_CAPACITY = 50000;
+    /** 启动回填时从文件尾部倒读的块大小：只控制单次 IO，不决定内存（内存由行数上限决定） */
+    private static final int BACKFILL_CHUNK_BYTES = 64 * 1024;
 
     @Value("${integration.suricata.enabled:true}")
     private boolean enabled;
@@ -62,12 +65,20 @@ public class SuricataService implements SuricataGateway {
     /** 环形缓冲每类的容量上限；eve.json 是持续追加的，必须有界（容器 512MiB，曾因无界缓存 OOM） */
     @Value("${integration.suricata.buffer-capacity:50000}")
     private int bufferCapacity;
+    /**
+     * 启动回填行数：缓冲是纯内存的，进程/容器一重启就空，端点要等新流量才有数据。
+     * 从 eve.json 尾部回溯最近 N 行填进缓冲；0 表示关闭回填（增量摄取行为保持不变）。
+     */
+    @Value("${integration.suricata.backfill-lines:20000}")
+    private int backfillLines;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final EveEventParser parser = new EveEventParser(mapper);
 
     private volatile SuricataEventStore store;
     private volatile boolean available;
+    /** 最近一次启动回填的统计；未回填时为全 0 */
+    private volatile BackfillResult lastBackfill = BackfillResult.NONE;
 
     /** 已消费到的字节偏移。跨调度周期保留，靠它做增量而不是每轮重扫全文件 */
     private long ingestOffset;
@@ -99,7 +110,178 @@ public class SuricataService implements SuricataGateway {
         }
         if (available) {
             logger.info("Suricata 事件缓冲：每类 {} 条（有界，满后覆盖最旧）", store().capacity());
+            // 为什么放在 @PostConstruct 的 init() 里（而不是 ApplicationRunner）：
+            // ① 它和 available/store 的初始化在同一处，顺序天然确定，不需要再引入一个 Bean；
+            // ② @PostConstruct 在 Web 容器开始接收请求之前执行，端点不会有一段"重启后返回空"的窗口；
+            //    ApplicationRunner 跑在 context refresh 之后，此时端口通常已经 listen，早到的请求会看到空缓冲；
+            // ③ 增量摄取的首次调度有 15s 延迟，回填先完成时 ingestOffset 已指向文件当前长度，不会重复读；
+            // ④ 单测可以直接 new + init() 走这条路径，不必启动 Spring 上下文。
+            if (backfillLines > 0) {
+                backfillFromTail();
+            }
         }
+    }
+
+    // ==================== 启动回填 ====================
+
+    /**
+     * 从 eve.json 尾部回填最近 {@link #backfillLines} 行到环形缓冲。
+     *
+     * <h3>为什么不 readAllLines</h3>
+     * <p>线上 eve.json 约 300MB，全量读进内存再取尾部既慢又吃堆（容器只有 512MiB）。
+     * 这里用 {@link RandomAccessFile} 从文件末尾按 64KB 块倒着找换行，只保留
+     * "最后 N 行 + 它们之前那一个换行"的字节窗口；内存由行数上限而不是文件大小决定。
+     *
+     * <h3>首行半行</h3>
+     * <p>跨机同步是先 tail 尾部 8MB 再追加，文件第一行可能从某条 JSON 中间开始。
+     * 窗口起点落在换行之后时首行天然完整；只有窗口一直倒读到文件头（文件比窗口小）时
+     * 才可能撞上这个半行，交给解析器返回 null 后计入"跳过"，不抛异常。
+     *
+     * <h3>偏移</h3>
+     * <p>回填完成后把增量偏移定位到文件当前长度：回填过的部分不再被 {@link #ingestNewEvents()}
+     * 重复解析，之后新追加的行照常增量读取。
+     *
+     * <p>文件不存在/不可读/读取中断都只返回 0 并保持现有 MOCK/增量语义，绝不影响启动与告警通路。
+     */
+    public BackfillResult backfillFromTail() {
+        long begin = System.nanoTime();
+        int maxLines = backfillLines;
+        if (maxLines <= 0) {
+            return BackfillResult.NONE;
+        }
+        File f = new File(eveJsonPath);
+        if (!f.isFile() || !f.canRead()) {
+            return BackfillResult.NONE;
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(f, "r")) {
+            long len = raf.length();
+            long startOffset = findBackfillStart(raf, len, maxLines);
+            byte[] window = new byte[(int) (len - startOffset)];
+            raf.seek(startOffset);
+            raf.readFully(window);
+
+            int added = 0;
+            int skipped = 0;
+            // 窗口里可能多出 1 行（文件末尾没有换行时，倒读切点会多带一行），只取最后 maxLines 行
+            int dropFirst = Math.max(0, countLines(window) - maxLines);
+            int lineIndex = 0;
+            int lineStart = 0;
+            for (int i = 0; i < window.length; i++) {
+                if (window[i] != '\n') {
+                    continue;
+                }
+                if (lineIndex++ < dropFirst) {
+                    lineStart = i + 1;
+                    continue;
+                }
+                int parsed = parseWindowLine(window, lineStart, i);
+                if (parsed > 0) {
+                    added += parsed;
+                } else if (parsed < 0) {
+                    skipped++;
+                }
+                lineStart = i + 1;
+            }
+            // 文件最后一行没有换行：它仍然是一条完整事件（Suricata 正常会写换行，这里只是兜底）
+            if (lineStart < window.length && lineIndex >= dropFirst) {
+                int parsed = parseWindowLine(window, lineStart, window.length);
+                if (parsed > 0) {
+                    added += parsed;
+                } else if (parsed < 0) {
+                    skipped++;
+                }
+            }
+
+            // 回填过的字节不再重复读取：偏移直接落到回填结束时的文件长度
+            this.ingestOffset = len;
+            this.ingestInitialized = true;
+            this.skippingPartialLine = false;
+
+            long ms = (System.nanoTime() - begin) / 1_000_000;
+            BackfillResult r = new BackfillResult(added, skipped, len, startOffset, ms);
+            lastBackfill = r;
+            logger.info("Suricata eve.json 启动回填完成：{} 行（跳过 {} 行），耗时 {} ms，文件大小 {} 字节"
+                            + "（{} MiB），窗口起点 {}，增量偏移 {}",
+                    added, skipped, ms, len, Math.round(len / 104857.6) / 10.0, startOffset, ingestOffset);
+            return r;
+        } catch (Exception e) {
+            long ms = (System.nanoTime() - begin) / 1_000_000;
+            logger.warn("Suricata eve.json 启动回填失败（不影响增量摄取与告警通路）：{}", e.toString());
+            BackfillResult r = new BackfillResult(0, 0, 0, 0, ms);
+            lastBackfill = r;
+            return r;
+        }
+    }
+
+    /**
+     * 从文件末尾倒着找第 maxLines+1 个换行，返回它之后的位置。
+     *
+     * <p>文件以换行结尾时，窗口 [起点, 末尾) 正好是最后 maxLines 行；
+     * 文件不以换行结尾时末尾那段也算一行，调用方会按行数再截一次。
+     * 找不到足够换行（文件比窗口小）时返回 0，代表一直读到文件头。
+     */
+    private static long findBackfillStart(RandomAccessFile raf, long len, int maxLines) throws IOException {
+        long pos = len;
+        int newlines = 0;
+        byte[] chunk = new byte[BACKFILL_CHUNK_BYTES];
+        while (pos > 0) {
+            int toRead = (int) Math.min(chunk.length, pos);
+            pos -= toRead;
+            raf.seek(pos);
+            raf.readFully(chunk, 0, toRead);
+            for (int i = toRead - 1; i >= 0; i--) {
+                if (chunk[i] == '\n') {
+                    newlines++;
+                    if (newlines > maxLines) {
+                        return pos + i + 1;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    /** 窗口内的行数：换行数 + 末尾没有换行时的那一行。 */
+    private static int countLines(byte[] window) {
+        int lines = 0;
+        for (byte b : window) {
+            if (b == '\n') {
+                lines++;
+            }
+        }
+        if (window.length > 0 && window[window.length - 1] != '\n') {
+            lines++;
+        }
+        return lines;
+    }
+
+    /**
+     * 解析窗口里 [from, to) 的一段。
+     *
+     * @return 1=解析成功并入缓冲；0=空行（既不算成功也不算跳过）；-1=坏行/半行（计入跳过，不抛）
+     */
+    private int parseWindowLine(byte[] window, int from, int to) {
+        String line = new String(window, from, to - from, StandardCharsets.UTF_8).trim();
+        if (line.isEmpty()) {
+            return 0;
+        }
+        EveEvent event = parser.parseLine(line);
+        if (event == null) {
+            return -1;
+        }
+        store().add(event);
+        return 1;
+    }
+
+    /** 一次性回填的统计：成功行数、跳过行数、文件大小、窗口起点、耗时。 */
+    public record BackfillResult(int lines, int skipped, long fileSize, long startOffset, long durationMs) {
+        /** 未启用/无文件/关闭回填时使用 */
+        public static final BackfillResult NONE = new BackfillResult(0, 0, 0, 0, 0);
+    }
+
+    /** 供测试与运维观测：最近一次启动回填的统计。 */
+    public BackfillResult lastBackfill() {
+        return lastBackfill;
     }
 
     @Override
@@ -319,6 +501,9 @@ public class SuricataService implements SuricataGateway {
         out.put("tls", s.tlsCount());
         out.put("ingested", s.totalIngested());
         out.put("offset", ingestOffset);
+        BackfillResult bf = lastBackfill;
+        out.put("backfilled", bf.lines());
+        out.put("backfillSkipped", bf.skipped());
         return out;
     }
 

@@ -692,6 +692,10 @@ integration:
     # 增量摄取周期（毫秒）与首次延迟：只把新追加的行解析进缓冲，不每轮重扫全文件。
     ingest-interval-ms: ${SURICATA_INGEST_INTERVAL_MS:10000}
     ingest-initial-delay-ms: ${SURICATA_INGEST_INITIAL_DELAY_MS:15000}
+    # 启动回填：缓冲是纯内存的，重启后就空了，/api/sec/conn/top-ports 等端点要等新流量才有数据。
+    # 启动时从 eve.json 尾部倒读最近 N 行填进缓冲（RandomAccessFile 按块倒读，不 readAllLines
+    # 整个 300MB 文件），回填完把增量偏移落到当前文件长度，不会重复回填。0 = 关闭回填。
+    backfill-lines: ${SURICATA_BACKFILL_LINES:20000}
 
 # ===== 人在回路分级自动响应 =====
 response:
