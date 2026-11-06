@@ -86,6 +86,8 @@ public class SuricataService implements SuricataGateway {
     private boolean ingestInitialized;
     /** 上一块结尾是半行：下一块开头要跳到第一个换行之后再解析 */
     private boolean skippingPartialLine;
+    /** 首次成功摄取是否已打过 INFO：之后按 debug 记，避免每轮刷日志 */
+    private volatile boolean firstIngestLogged;
 
     @PostConstruct
     public void init() {
@@ -118,6 +120,13 @@ public class SuricataService implements SuricataGateway {
             // ④ 单测可以直接 new + init() 走这条路径，不必启动 Spring 上下文。
             if (backfillLines > 0) {
                 backfillFromTail();
+            }
+            if (!ingestInitialized) {
+                // 回填被关闭或失败时 ingestInitialized 仍为 false：这里立刻同步读一次。
+                // 否则 mode() 已经是 REAL，而缓冲要等首次调度（默认 15s）才有数据；这段空窗里
+                // top-ports / by-ip 返回空列表，看起来像"采集坏了"。线上 srv1 那次
+                // mode=REAL + total=0 就是"REAL 但缓冲还空"的状态，而不是时间戳解析错误。
+                ingestNewEvents();
             }
         }
     }
@@ -409,7 +418,14 @@ public class SuricataService implements SuricataGateway {
                 logger.info("eve.json 已可读，Suricata 模式切换为 REAL");
             }
             if (added > 0) {
-                logger.debug("Suricata 摄取 {} 条事件，偏移推进到 {}", added, ingestOffset);
+                if (!firstIngestLogged) {
+                    firstIngestLogged = true;
+                    // 首次摄取打 INFO：排障时"读到了多少条"是关键证据，
+                    // 全放 debug 会让"端点空"分不清是没读到还是时间窗里真没有
+                    logger.info("Suricata 首次摄取 {} 条事件（偏移 {}）", added, ingestOffset);
+                } else {
+                    logger.debug("Suricata 摄取 {} 条事件，偏移推进到 {}", added, ingestOffset);
+                }
             }
         } catch (Exception e) {
             // 反查失败不应该影响告警通路，也不该刷屏

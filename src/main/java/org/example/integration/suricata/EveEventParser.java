@@ -221,6 +221,11 @@ public final class EveEventParser {
      * <p>兼容三种真实形态：
      * {@code 2026-11-06T22:24:47.123456+0800}（偏移无冒号）、
      * {@code ...Z} / {@code ...+08:00}、以及不带时区的裸本地时间。
+     *
+     * <p>口径：**带偏移的时间戳一律按偏移换算成瞬时**（+0000 与 Z 等价），绝不走无时区的
+     * {@code LocalDateTime}。原因：Suricata 在 UTC 主机上写的是 {@code 16:11:02.911209+0000}，
+     * 若把这个偏移丢掉、按 JVM 时区（+08）解释成 16:11 本地，事件会凭空早 8 小时，
+     * 于是"最近 60 分钟"这类窗口一条都命中不到 —— 端点返回空列表却不报任何错。
      */
     public static Instant parseTime(String iso) {
         if (iso == null) {
@@ -230,20 +235,24 @@ public final class EveEventParser {
         if (s.isEmpty()) {
             return null;
         }
-        // eve.json 常见 "+0800"：ISO 解析器要求 "+08:00"，先补冒号
+        // eve.json 常见 "+0800"：ISO 解析器要求 "+08:00"，先补冒号。
+        // 这一步必须保留，否则带偏移的字符串会落进下面的裸本地时间分支
         if (s.matches(".*[+-]\\d{4}$")) {
             s = s.substring(0, s.length() - 2) + ":" + s.substring(s.length() - 2);
+        }
+        // 先按"带偏移"解析：OffsetDateTime 同时接受 +08:00 与 Z，
+        // 且转换结果就是绝对瞬时，不受 JVM 默认时区影响
+        try {
+            return OffsetDateTime.parse(s).toInstant();
+        } catch (Exception ignored) {
+            // 继续尝试 Instant 的严格形态
         }
         try {
             return Instant.parse(s);
         } catch (Exception ignored) {
-            // 继续尝试带偏移的形态
-        }
-        try {
-            return OffsetDateTime.parse(s).toInstant();
-        } catch (Exception ignored) {
             // 继续尝试裸本地时间
         }
+        // 只有完全不带偏移时才按 JVM 时区解释：eve.json 不产这种形态，留作兜底
         try {
             return LocalDateTime.parse(s.replace(' ', 'T'))
                     .atZone(ZoneId.systemDefault()).toInstant();

@@ -110,7 +110,7 @@ class SuricataBackfillTest {
     // ==================== ④ 关闭回填 ====================
 
     @Test
-    @DisplayName("backfill-lines=0：不回填，但增量摄取照常工作")
+    @DisplayName("backfill-lines=0：不做尾部回填，但 init() 仍立刻读一次，端点不会空")
     void zeroLinesDisablesBackfill() throws Exception {
         Path eve = eve("disabled.json", List.of(
                 flow("10.0.0.1", 3001, 3001),
@@ -121,9 +121,11 @@ class SuricataBackfillTest {
 
         assertEquals("REAL", svc.mode());
         assertEquals(0, svc.lastBackfill().lines());
-        assertEquals(0, svc.bufferStats().get("flows"), "关闭回填后启动时缓冲应为空");
+        // 关闭回填 ≠ 启动时缓冲为空：mode 已是 REAL 时缓冲必须有数据，
+        // 否则重启后到首次调度之间端点恒返回空列表（线上 srv1 的 mode=REAL,total=0 就是这个状态）
+        assertEquals(4, svc.bufferStats().get("flows"), "init() 必须补读一次，REAL 模式下不留空窗");
 
-        // 增量路径不受影响：首次调度仍然会读文件（短文件从 0 开始）
+        // 增量路径不受影响：再跑一轮只认新行，不重复计数
         svc.ingestNewEvents();
         assertEquals(4, svc.bufferStats().get("flows"));
     }
