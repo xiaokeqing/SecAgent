@@ -188,15 +188,15 @@ class PublicAskSpeakJaTest {
     }
 
     private MockMvc mvc(PublicAskService svc) {
-        PublicApiController controller = new PublicApiController();
-        ReflectionTestUtils.setField(controller, "rateLimiter", new PublicRateLimiter());
-        ReflectionTestUtils.setField(controller, "publicAskRateLimiter", new PublicAskRateLimiter(6));
-        ReflectionTestUtils.setField(controller, "publicConcurrencyGuard", new PublicConcurrencyGuard());
-        ReflectionTestUtils.setField(controller, "publicAskService", svc);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        PublicApiTestAssembly api = new PublicApiTestAssembly();
+        ReflectionTestUtils.setField(api.support, "rateLimiter", new PublicRateLimiter());
+        ReflectionTestUtils.setField(api.support, "publicAskRateLimiter", new PublicAskRateLimiter(6));
+        ReflectionTestUtils.setField(api.support, "publicConcurrencyGuard", new PublicConcurrencyGuard());
+        ReflectionTestUtils.setField(api.support, "publicAskService", svc);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
+        return api.mvc();
     }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();

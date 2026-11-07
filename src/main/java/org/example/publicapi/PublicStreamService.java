@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * 作战室实时攻击流的 <b>SSE 推送器</b>（{@code /api/public/stream} 的实现）。
  *
- * <h3>为什么单独一个类，而不是塞进 {@code PublicApiController}</h3>
+ * <h3>为什么单独一个类，而不是塞进公开面的 god controller</h3>
  * <ul>
  *   <li>那个控制器已经两千多行，且所有方法都是"一次请求 → 一份 JSON 信封"的短生命周期；
  *       SSE 是长连接 + 自己的调度线程 + 注册表，生命周期与 REST 完全不同，混在一起最容易
@@ -63,7 +63,7 @@ public class PublicStreamService {
 
     private static final Logger logger = LoggerFactory.getLogger(PublicStreamService.class);
 
-    /** 与 {@code PublicApiController} 同一口径，前端可直接展示 */
+    /** 与公开面同一口径，前端可直接展示 */
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     /** 心跳注释行：15 秒一次，防止 Cloudflare/nginx 把空闲连接当死连接掐掉 */

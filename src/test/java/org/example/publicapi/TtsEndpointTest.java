@@ -73,7 +73,7 @@ class TtsEndpointTest {
     private final AtomicInteger stubCalls = new AtomicInteger();
     private volatile int stubCode = 200;
     private volatile byte[] stubBody = AUDIO;
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -118,16 +118,16 @@ class TtsEndpointTest {
 
     /** 与既有公开端点测试同一套最小装配（站内不启 Spring 上下文） */
     private void baseController(TtsService tts, int perMinute) {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", perMinute);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
         wireSource();
         if (tts != null) {
-            ReflectionTestUtils.setField(controller, "ttsService", tts);
+            ReflectionTestUtils.setField(api.support, "ttsService", tts);
         }
     }
 
@@ -146,11 +146,11 @@ class TtsEndpointTest {
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator",
                 new org.example.aggregation.AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.mvc();
     }
 
     private static String json(Object... kv) throws Exception {

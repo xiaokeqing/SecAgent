@@ -212,7 +212,7 @@ public class OutboundSelfCheck {
                 wazuhTimeouts.getReadTimeoutMs() + "ms",
                 wazuhTimeouts.getCallTimeoutMs() + "ms",
                 wazuhCircuit,
-                "PublicApiController→PublicAlertSource→WazuhGateway→WazuhClient（复用 wazuh-indexer 客户端与冷却）"));
+                "PublicAlertController→PublicAlertSource→WazuhGateway→WazuhClient（复用 wazuh-indexer 客户端与冷却）"));
 
         // ---- 5) SSH 直连处置 ----
         OutboundTimeouts sshTimeouts = (sshExecutor != null) ? sshExecutor.effectiveTimeouts() : timeouts;

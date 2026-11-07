@@ -46,20 +46,20 @@ class PublicApiPasswordEndpointTest {
     @TempDir
     Path tmp;
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     /** 与既有端点测试同一套装配：直接 new 控制器 + ReflectionTestUtils 填字段 */
     private void baseController(int passwordPerMinute) {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
-        ReflectionTestUtils.setField(controller, "passwordRequestsPerMinute", passwordPerMinute);
-        ReflectionTestUtils.setField(controller, "passwordCacheSeconds", 300);
-        ReflectionTestUtils.setField(controller, "passwordMaxHashes", 200);
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "passwordRequestsPerMinute", passwordPerMinute);
+        ReflectionTestUtils.setField(api.support, "passwordCacheSeconds", 300);
+        ReflectionTestUtils.setField(api.support, "passwordMaxHashes", 200);
     }
 
     /** 把控制器指向一个新建的字典文件；返回该文件的路径 */
@@ -68,7 +68,7 @@ class PublicApiPasswordEndpointTest {
         Files.writeString(file, json, StandardCharsets.UTF_8);
         PasswordDictionaryService svc = new PasswordDictionaryService();
         ReflectionTestUtils.setField(svc, "dictFile", file.toString());
-        ReflectionTestUtils.setField(controller, "passwordDict", svc);
+        ReflectionTestUtils.setField(api.support, "passwordDict", svc);
         return file;
     }
 
@@ -86,7 +86,7 @@ class PublicApiPasswordEndpointTest {
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.builder().build();
     }
 
     @Test
@@ -115,7 +115,7 @@ class PublicApiPasswordEndpointTest {
         baseController(30);
         PasswordDictionaryService svc = new PasswordDictionaryService();
         ReflectionTestUtils.setField(svc, "dictFile", tmp.resolve("nope.json").toString());
-        ReflectionTestUtils.setField(controller, "passwordDict", svc);
+        ReflectionTestUtils.setField(api.support, "passwordDict", svc);
 
         MockHttpServletResponse res = mvc().perform(get("/api/public/password?p=a1b2c"))
                 .andExpect(status().isOk())

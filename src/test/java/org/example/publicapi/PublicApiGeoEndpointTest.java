@@ -46,23 +46,23 @@ class PublicApiGeoEndpointTest {
     @TempDir
     Path tmp;
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     private void baseController() {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
-        ReflectionTestUtils.setField(controller, "geoMinCount", 3);
-        ReflectionTestUtils.setField(controller, "geoMinSharePercent", 1.0d);
-        ReflectionTestUtils.setField(controller, "geoTopIps", 1000);
-        ReflectionTestUtils.setField(controller, "geoTopCountries", 20);
-        ReflectionTestUtils.setField(controller, "geoTopProvinces", 10);
-        ReflectionTestUtils.setField(controller, "geoTopAsns", 10);
-        ReflectionTestUtils.setField(controller, "geoSelfIps", "");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "geoMinCount", 3);
+        ReflectionTestUtils.setField(api.support, "geoMinSharePercent", 1.0d);
+        ReflectionTestUtils.setField(api.support, "geoTopIps", 1000);
+        ReflectionTestUtils.setField(api.support, "geoTopCountries", 20);
+        ReflectionTestUtils.setField(api.support, "geoTopProvinces", 10);
+        ReflectionTestUtils.setField(api.support, "geoTopAsns", 10);
+        ReflectionTestUtils.setField(api.support, "geoSelfIps", "");
     }
 
     /** 夹具库：1.0.0.0/24=AU、1.0.1.0/24=CN浙江、1.0.2.0/24=CN福建、1.0.3.0/24=US */
@@ -96,7 +96,7 @@ class PublicApiGeoEndpointTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private static GeoWindow window(long total, GeoAggregator.IpCount... counts) {
@@ -109,14 +109,14 @@ class PublicApiGeoEndpointTest {
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.mvc();
     }
 
     @Test
     @DisplayName("正常：200 + 既有信封 + 国家/省份/ASN/趋势 + 分母披露 + 限流与缓存头")
     void returnsAggregatesWhenEverythingIsUp() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", window(1000,
                 new GeoAggregator.IpCount("1.0.1.1", 100),
                 new GeoAggregator.IpCount("1.0.1.2", 60),
@@ -187,7 +187,7 @@ class PublicApiGeoEndpointTest {
         ReflectionTestUtils.setField(geo, "ipv6Enabled", true);
         geo.init();
         geo.loadBlocking();
-        ReflectionTestUtils.setField(controller, "geoIpService", geo);
+        ReflectionTestUtils.setField(api.support, "geoIpService", geo);
         wireSource("REAL", window(10, new GeoAggregator.IpCount("1.0.1.1", 10)));
 
         mvc().perform(get("/api/public/geo"))
@@ -200,7 +200,7 @@ class PublicApiGeoEndpointTest {
     @DisplayName("数据源不可用（MOCK）：available=false + DATA_SOURCE_UNAVAILABLE")
     void dataSourceUnavailableIsReported() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("MOCK", GeoWindow.unavailable("DATA_SOURCE_UNAVAILABLE"));
 
         mvc().perform(get("/api/public/geo"))
@@ -213,7 +213,7 @@ class PublicApiGeoEndpointTest {
     @DisplayName("数据源可用但窗口内没有带来源 IP 的告警：available=true + NO_DATA_IN_WINDOW（不是故障）")
     void emptyWindowIsNotAnError() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", GeoWindow.empty(111031));
 
         mvc().perform(get("/api/public/geo"))
@@ -228,7 +228,7 @@ class PublicApiGeoEndpointTest {
     @DisplayName("小时 × 国家：有 per-IP 小时桶 → 24 点真实交叉；拿不到 → available:false 且不摊分")
     void byCountryHourIsRealCrossOrHonestlyUnavailable() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
 
         // 25 个整点标签（与真实响应同形：extended_bounds 给出首尾两个边界桶，末尾那个是"当前小时"）
         List<GeoAggregator.TrendPoint> trend = new java.util.ArrayList<>();
@@ -260,7 +260,7 @@ class PublicApiGeoEndpointTest {
 
         // 拿不到交叉数据（旧解析/子聚合缺失）：整块 available:false，且**不拿合计摊到小时**
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", new GeoWindow(true, "OK", null, 1000, 16, false,
                 List.of(new GeoAggregator.IpCount("1.0.1.1", 12),
                         new GeoAggregator.IpCount("1.0.3.1", 4)),
@@ -283,8 +283,8 @@ class PublicApiGeoEndpointTest {
         baseController();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 1);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", window(10, new GeoAggregator.IpCount("1.0.1.1", 10)));
 
         mvc().perform(get("/api/public/geo")).andExpect(status().isOk());
@@ -298,8 +298,8 @@ class PublicApiGeoEndpointTest {
     @DisplayName("我方 IP 配置生效：配置里的自用 IP 不进任何榜")
     void selfIpsFromConfigAreExcluded() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
-        ReflectionTestUtils.setField(controller, "geoSelfIps", "1.0.1.1 , 1.0.1.2");
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoSelfIps", "1.0.1.1 , 1.0.1.2");
         wireSource("REAL", window(100,
                 new GeoAggregator.IpCount("1.0.1.1", 90),
                 new GeoAggregator.IpCount("1.0.3.1", 10)));
@@ -313,9 +313,9 @@ class PublicApiGeoEndpointTest {
     @DisplayName("配置兜底：门槛被设成 0 时按 1 兜底（不能因为没注入就变成'什么都上榜'）")
     void toleratesUnsetConfig() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoMinCount", 0);
-        ReflectionTestUtils.setField(controller, "geoTopCountries", 0);
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoMinCount", 0);
+        ReflectionTestUtils.setField(api.support, "geoTopCountries", 0);
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", window(10, new GeoAggregator.IpCount("1.0.1.1", 10)));
 
         mvc().perform(get("/api/public/geo"))
@@ -327,11 +327,11 @@ class PublicApiGeoEndpointTest {
     @DisplayName("公开面只增字段：既有的 /api/public/latest 仍走同一个信封与缓存头（没有被新端点影响）")
     void existingEndpointsUnaffected() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "geoIpService", fixtureGeo());
+        ReflectionTestUtils.setField(api.support, "geoIpService", fixtureGeo());
         wireSource("REAL", window(10, new GeoAggregator.IpCount("1.0.1.1", 10)));
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", tmp.toString());
-        ReflectionTestUtils.setField(controller, "auditReader", reader);
+        ReflectionTestUtils.setField(api.support, "auditReader", reader);
 
         mvc().perform(get("/api/public/geo")).andExpect(status().isOk());
         mvc().perform(get("/api/public/latest")).andExpect(status().isOk())
@@ -341,9 +341,9 @@ class PublicApiGeoEndpointTest {
     @Test
     @DisplayName("默认没有配置自用 IP：集合为空而不是 null（空集合不该被当成'排除一切'）")
     void defaultSelfIpsIsEmptySet() {
-        assertEquals(Set.of(), PublicApiController.parseSelfIps(""));
-        assertEquals(Set.of(), PublicApiController.parseSelfIps(null));
-        assertEquals(Set.of("1.1.1.1"), PublicApiController.parseSelfIps(" 1.1.1.1 , "));
+        assertEquals(Set.of(), PublicGeoController.parseSelfIps(""));
+        assertEquals(Set.of(), PublicGeoController.parseSelfIps(null));
+        assertEquals(Set.of("1.1.1.1"), PublicGeoController.parseSelfIps(" 1.1.1.1 , "));
     }
 
     /** 公开面出参不允许出现任何 IP 形态字符串（IPv4 与 IPv6 各一条正则） */

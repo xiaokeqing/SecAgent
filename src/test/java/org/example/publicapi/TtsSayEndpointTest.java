@@ -69,7 +69,7 @@ class TtsSayEndpointTest {
     private String baseUrl;
     /** 只数"合成请求"（/synth），不数下游取音频（/audio.wav） */
     private final AtomicInteger synthCalls = new AtomicInteger();
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -125,20 +125,20 @@ class TtsSayEndpointTest {
     }
 
     private MockMvc mvc(TtsService tts, int sayPerIpDaily, int sayGlobalDaily) {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
-        ReflectionTestUtils.setField(controller, "ttsSayPerIpDaily", sayPerIpDaily);
-        ReflectionTestUtils.setField(controller, "ttsSayGlobalDaily", sayGlobalDaily);
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "ttsSayPerIpDaily", sayPerIpDaily);
+        ReflectionTestUtils.setField(api.support, "ttsSayGlobalDaily", sayGlobalDaily);
         wireSource();
         if (tts != null) {
-            ReflectionTestUtils.setField(controller, "ttsService", tts);
+            ReflectionTestUtils.setField(api.support, "ttsService", tts);
         }
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.mvc();
     }
 
     /** 与既有公开端点测试同一套最小装配（站内不启 Spring 上下文） */
@@ -157,7 +157,7 @@ class TtsSayEndpointTest {
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator",
                 new org.example.aggregation.AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private static String json(Object... kv) throws Exception {

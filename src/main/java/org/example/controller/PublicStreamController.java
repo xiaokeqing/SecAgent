@@ -19,7 +19,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * <b>不走</b> {@code {code,message,data}} REST 信封 —— EventSource 只按行解析，
  * 包一层 envelope 前端就没法复用列表页的渲染函数了。
  *
- * <p>为什么新建控制器而不是塞进 {@code PublicApiController}：
+ * <p>为什么新建控制器而不是塞进公开面的 god controller：
  * 那个类已经两千多行、且所有方法都是"短请求 + 一次 JSON"；SSE 的注册/断连/心跳
  * 生命周期完全不同，混在一起最容易在 {@code onCompletion} 漏清理。这里只做
  * "建连接 + 下响应头"，推送逻辑全在 {@link PublicStreamService}。

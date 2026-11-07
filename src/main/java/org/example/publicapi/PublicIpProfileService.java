@@ -32,7 +32,7 @@ import java.util.Set;
  * <ol>
  *   <li><b>取不到就 null + {@code notes[]} 说明</b>：绝不把"读不到"写成 0，
  *       也不拿别的 IP 的数据顶（{@code query} 之外的任何字段都不含别人的 IP）；</li>
- *   <li><b>口令只给结构</b>：{@link PublicApiController#credentialShapes} 把 {@code root / 123456}
+ *   <li><b>口令只给结构</b>：{@link PublicAlertController#credentialShapes} 把 {@code root / 123456}
  *       换成 {@code root / 6 位·纯数字·弱口令}；<b>原文字符一个都不出现</b>（出关闸门
  *       {@code scrubText} 还会再隐一遍，属于双重保险）；</li>
  *   <li><b>精确值 vs 样本口径必须分开写</b>：{@code events} / {@code firstSeen} / {@code lastSeen} /
@@ -200,7 +200,7 @@ public class PublicIpProfileService {
         pay.put("byKind", indexerOk ? kindMap(indexer.get("byKind")) : null);
         pay.put("ports", indexerOk ? portList(indexer.get("ports")) : null);
         pay.put("credStructure", indexerOk
-                ? PublicApiController.credentialShapes(indexer.get("topCredentials")) : null);
+                ? PublicAlertController.credentialShapes(indexer.get("topCredentials")) : null);
         pay.put("threat", threat.toMap());
         pay.put("geo", geo);
         pay.put("banned", banned);

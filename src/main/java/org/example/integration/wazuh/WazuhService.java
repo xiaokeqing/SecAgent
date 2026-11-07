@@ -1339,7 +1339,7 @@ public class WazuhService implements WazuhGateway {
             a.setSrcIp(srcIp);
             // ===== 离线地理富化（任务 2）：只填 srcGeo 这一个既有字段，不改任何现有字段语义 =====
             // 形状：国家ISO2|一级行政区|城市|ASN|AS组织（未知段写 "-"）；定位不到时为 null。
-            // 刻意【不】在公开面输出它（PublicApiController 里显式置 null）：
+            // 刻意【不】在公开面输出它（公网端点里显式置 null）：
             // 逐条的地理+ASN 等于把"某个攻击者属于哪个机构"搬到公网页面，
             // 公开面只允许国家/省份级聚合（见 GeoAggregator）。
             // 库不可用/未启用时 geoIpService 为 null 或 ready()=false → srcGeo 保持 null，如实"未知"。

@@ -40,22 +40,22 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 class PublicApiLatestEndpointTest {
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     @TempDir
     Path dataDir;
 
     @BeforeEach
     void setUp() throws Exception {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         // 无 Spring 上下文时 @Value 不生效，字段是 0 → limitPerMinute() 兜底成 1。
         // 显式设成与 application.yml 一致的 20，才能断言"响应头里的限流值与线上一致"。
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
 
         // 用真实的 PublicAuditReader，喂一个临时数据目录：
         // 于是"封禁记录怎么被掩码、怎么被挑字段"也是真跑出来的，而不是我手写的期望值
@@ -66,11 +66,11 @@ class PublicApiLatestEndpointTest {
                         + "\"source\":\"智能体\",\"actor\":\"admin\",\"auditId\":\"AUD-1\","
                         + "\"createdAt\":\"2026-10-13 12:00:00\",\"expiresAt\":\"2026-10-13 13:00:00\","
                         + "\"unblocked\":false}]", StandardCharsets.UTF_8);
-        ReflectionTestUtils.setField(controller, "auditReader", reader);
+        ReflectionTestUtils.setField(api.support, "auditReader", reader);
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.builder().build();
     }
 
     private void wireSource(String mode, List<SecurityAlert> alerts) {
@@ -87,7 +87,7 @@ class PublicApiLatestEndpointTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private static SecurityAlert alert(String id, AlertSeverity sev, String ip, String at) {

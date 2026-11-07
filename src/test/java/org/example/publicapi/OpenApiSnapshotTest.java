@@ -45,9 +45,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * {@code requestMappingHandlerMapping} 注册进 {@code StubWebApplicationContext}，
  * 所以拿到的就是"已注册的 mapping"本身，成本却只有毫秒级。
  *
- * <h3>这里只装两个控制器</h3>
- * <p>只注册 {@code PublicApiController} 与 {@code HealthController} —— 公开面就是这两者的并集，
- * 别的控制器（受保护面）不该出现在这份清单里，也不该被这个测试枚举到。
+ * <h3>这里只装公网面的控制器</h3>
+ * <p>只注册五个按域 controller（alert/home/kb/geo/misc）与 {@code HealthController} ——
+ * 公开面就是这六者的并集，别的控制器（受保护面）不该出现在这份清单里，也不该被这个测试枚举到。
  */
 class OpenApiSnapshotTest {
 
@@ -204,7 +204,10 @@ class OpenApiSnapshotTest {
      * （standalone 默认用 {@link PathPatternParser}，但显式 setUseTrailingSlashMatch 之类的定制会让另一套生效）。
      */
     private static Set<String> registeredPaths() {
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(new PublicApiController(), new HealthController()).build();
+        PublicApiTestAssembly api = new PublicApiTestAssembly();
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(
+                api.alertController, api.homeController, api.kbController, api.geoController,
+                api.miscController, new HealthController()).build();
         RequestMappingHandlerMapping mapping = mvc.getDispatcherServlet()
                 .getWebApplicationContext()
                 .getBean(RequestMappingHandlerMapping.class);

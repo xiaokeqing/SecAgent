@@ -52,19 +52,19 @@ class AttackStoryGoldenGenerator {
         ReflectionTestUtils.setField(svc, "maxLimit", 20);
         ReflectionTestUtils.setField(svc, "selfIps", AttackStoryFixtures.IP_SELF);
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", policy);
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", reader);
-        ReflectionTestUtils.setField(c, "attackStoryService", svc);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", policy);
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", svc);
 
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(c).build();
+        MockMvc mvc = c.mvc();
         Path out = Path.of("src/test/resources/publicapi");
         Files.createDirectories(out);
 

@@ -28,15 +28,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PublicSnapshotWarmerTest {
 
-    /** 便于构造：{@code Snapshot} 是控制器的包内可见静态嵌套类 */
-    private static PublicApiController.Snapshot snapshot() {
-        return new PublicApiController.Snapshot();
+    /** 便于构造：{@code Snapshot} 是 {@link PublicApiSupport} 的包内可见静态嵌套类 */
+    private static PublicApiSupport.Snapshot snapshot() {
+        return new PublicApiSupport.Snapshot();
     }
 
     @Test
     @DisplayName("TTL 内第二次请求不触发重算（否则缓存等于没做）")
     void secondRequestWithinTtlDoesNotReload() {
-        PublicApiController.Snapshot s = snapshot();
+        PublicApiSupport.Snapshot s = snapshot();
         AtomicInteger loads = new AtomicInteger();
 
         Map<String, Object> first = s.get(45, () -> Map.of("n", loads.incrementAndGet()));
@@ -49,7 +49,7 @@ class PublicSnapshotWarmerTest {
     @Test
     @DisplayName("★过期且有人在算：另一个请求立刻拿旧值，绝不阻塞等待现算")
     void staleValueIsServedWithoutBlockingWhileAnotherThreadRefreshes() throws Exception {
-        PublicApiController.Snapshot s = snapshot();
+        PublicApiSupport.Snapshot s = snapshot();
         // ttl=0 ⇒ 先建一份"立即过期"的初值（这样后面的 get 才会真的尝试刷新）
         s.get(0, () -> Map.of("v", 1));
 
@@ -84,7 +84,7 @@ class PublicSnapshotWarmerTest {
     @Test
     @DisplayName("预聚合：没到年龄阈值不刷，到了就刷（且会推进快照时刻）")
     void refreshIfOlderThanRespectsThreshold() throws Exception {
-        PublicApiController.Snapshot s = snapshot();
+        PublicApiSupport.Snapshot s = snapshot();
         AtomicInteger loads = new AtomicInteger();
         s.get(45, () -> Map.of("n", loads.incrementAndGet()));
         assertEquals(1, loads.get());
@@ -111,7 +111,7 @@ class PublicSnapshotWarmerTest {
     @Test
     @DisplayName("没有旧值 + 刷新失败：仍然 fail-closed 抛错（不返回空白 200）")
     void firstLoadFailureStillFailsClosed() {
-        PublicApiController.Snapshot s = snapshot();
+        PublicApiSupport.Snapshot s = snapshot();
         try {
             s.get(45, () -> {
                 throw new IllegalStateException("上游挂了");
@@ -125,7 +125,7 @@ class PublicSnapshotWarmerTest {
     @Test
     @DisplayName("有旧值 + 刷新失败：继续用旧值（不抛错、不把页面变成空白）")
     void refreshFailureKeepsStaleValue() {
-        PublicApiController.Snapshot s = snapshot();
+        PublicApiSupport.Snapshot s = snapshot();
         s.get(0, () -> Map.of("v", 1));   // ttl=0 ⇒ 立即过期，下面的 get 才会真的去刷新
         Map<String, Object> out = s.get(0, () -> {
             throw new IllegalStateException("上游挂了");
@@ -136,10 +136,10 @@ class PublicSnapshotWarmerTest {
     @Test
     @DisplayName("预聚合方法本身绝不能被上游异常打断（协作对象全缺也不能抛）")
     void warmPublicSnapshotsNeverThrows() {
-        PublicApiController controller = new PublicApiController();
+        PublicApiTestAssembly api = new PublicApiTestAssembly();
         // 刻意不注入任何协作对象（source / geoip / accesslog 都是 null）：
         // 预聚合必须把它们当作"这一轮刷不了"，而不是把异常抛给定时线程。
-        controller.warmPublicSnapshots();
-        controller.warmPublicSnapshots();
+        api.snapshotWarmer.warmPublicSnapshots();
+        api.snapshotWarmer.warmPublicSnapshots();
     }
 }

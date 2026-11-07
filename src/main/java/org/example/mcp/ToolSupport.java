@@ -26,7 +26,7 @@ public final class ToolSupport {
     /** 输出时间戳：带偏移的 ISO-8601（客户端好排序、好比时区）。 */
     public static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssXXX");
 
-    /** 平台内部时间口径（PublicApiController 的 FMT 同款），口径必须与上游一致才能正确比较窗口。 */
+    /** 平台内部时间口径（PublicApiSupport 的 FMT 同款），口径必须与上游一致才能正确比较窗口。 */
     public static final DateTimeFormatter PLATFORM_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     /** 口令「结构串」的合法形状：{@code 6 位·纯数字·弱口令} / {@code 12 位·字母+数字·非弱口令}。 */

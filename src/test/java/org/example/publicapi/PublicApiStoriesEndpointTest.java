@@ -78,7 +78,7 @@ class PublicApiStoriesEndpointTest {
             "generatedAt", "cacheSeconds", "window", "windowHours", "available", "reason",
             "limit", "candidates", "sourceCount", "stageLabels", "sources", "coverage", "limits", "note");
 
-    private PublicApiController controller(String mode, boolean honeypotWired, boolean maskIps,
+    private PublicApiTestAssembly controller(String mode, boolean honeypotWired, boolean maskIps,
                                            boolean withAudit) throws Exception {
         if (withAudit) {
             // 只取一次"现在"：写进夹具与算期望值必须用同一个基准，否则断言会抖
@@ -108,25 +108,25 @@ class PublicApiStoriesEndpointTest {
         ReflectionTestUtils.setField(svc, "maxLimit", 20);
         ReflectionTestUtils.setField(svc, "selfIps", AttackStoryFixtures.IP_SELF);
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", policy);
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", reader);
-        ReflectionTestUtils.setField(c, "attackStoryService", svc);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", policy);
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", svc);
         return c;
     }
 
-    private MockMvc mvc(PublicApiController c) {
-        return MockMvcBuilders.standaloneSetup(c).addFilters(new PublicEtagFilter()).build();
+    private MockMvc mvc(PublicApiTestAssembly c) {
+        return c.builder().addFilters(new PublicEtagFilter()).build();
     }
 
-    private String body(PublicApiController c, String url) throws Exception {
+    private String body(PublicApiTestAssembly c, String url) throws Exception {
         return mvc(c).perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
@@ -150,7 +150,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("正常：按剧本完整度排序 + 四段计数 + gaps + coverage + 排除内网与我方 IP")
     void recommendsSourcesByCompleteness() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
 
         MvcResult result = mvc(c).perform(get("/api/public/stories"))
                 .andExpect(status().isOk())
@@ -223,7 +223,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("缺阶段：该段数据源未接入时，gaps 与 coverage.stageStatus 都要如实说'未接入'")
     void notWiredStageIsReportedAsNotWired() throws Exception {
-        PublicApiController c = controller("REAL", false, false, false);
+        PublicApiTestAssembly c = controller("REAL", false, false, false);
 
         String json = body(c, "/api/public/stories");
 
@@ -254,7 +254,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("空窗口：数据源可用但没有候选来源 → available=true + NO_DATA_IN_WINDOW（不是故障）")
     void emptyWindowIsNotAnError() throws Exception {
-        PublicApiController c = controller("REAL", true, false, false);
+        PublicApiTestAssembly c = controller("REAL", true, false, false);
         WazuhGateway empty = (WazuhGateway) java.lang.reflect.Proxy.newProxyInstance(
                 WazuhGateway.class.getClassLoader(), new Class<?>[]{WazuhGateway.class},
                 (proxy, method, args) -> switch (method.getName()) {
@@ -276,8 +276,8 @@ class PublicApiStoriesEndpointTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", empty);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(ReflectionTestUtils.getField(c, "attackStoryService"), "source", source);
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(ReflectionTestUtils.getField(c.support, "attackStoryService"), "source", source);
 
         mvc(c).perform(get("/api/public/stories"))
                 .andExpect(status().isOk())
@@ -293,7 +293,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("fail-closed：数据源不是 REAL → available=false + DATA_SOURCE_UNAVAILABLE（绝不给内置样本）")
     void mockModeIsFailClosed() throws Exception {
-        PublicApiController c = controller("MOCK", true, false, true);
+        PublicApiTestAssembly c = controller("MOCK", true, false, true);
 
         String json = body(c, "/api/public/stories");
         JsonNode data = mapper.readTree(json).get("data");
@@ -307,8 +307,8 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("服务未装配（裁剪部署/单测）：available=false + STORY_DISABLED，不返回任何来源")
     void missingServiceIsReported() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
-        ReflectionTestUtils.setField(c, "attackStoryService", null);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", null);
 
         mvc(c).perform(get("/api/public/stories"))
                 .andExpect(status().isOk())
@@ -321,7 +321,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("不支持的 window：400 + WINDOW_NOT_SUPPORTED（不悄悄按 24h 处理）")
     void unsupportedWindowIsRejected() throws Exception {
-        PublicApiController c = controller("REAL", true, false, false);
+        PublicApiTestAssembly c = controller("REAL", true, false, false);
 
         mvc(c).perform(get("/api/public/stories").param("window", "2h"))
                 .andExpect(status().isBadRequest())
@@ -335,7 +335,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("分页/上限：limit 截断候选、candidates 不变；limit 非法或超大一律夹回 [1, maxLimit]")
     void limitIsClampedAndReported() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
 
         String one = body(c, "/api/public/stories?limit=1");
         assertEquals(1, mapper.readTree(one).get("data").get("sourceCount").asInt());
@@ -355,7 +355,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("窗口参数：1h/6h/24h/72h 都接受，且回显规范化的 window")
     void supportedWindowsAreAccepted() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
 
         for (String w : new String[]{"1h", "6h", "24h", "72h"}) {
             String json = body(c, "/api/public/stories?window=" + w);
@@ -370,10 +370,10 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("限流：与其余公开端点同一个桶（20 次/分钟），超了就是 429 + Retry-After")
     void rateLimited() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 1);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
 
         mvc(c).perform(get("/api/public/stories")).andExpect(status().isOk());
         mvc(c).perform(get("/api/public/stories"))
@@ -384,7 +384,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("ETag：同一份快照内两次请求逐字节相同，带 If-None-Match 的第二次是 304")
     void etagIsStableWithinSnapshot() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
 
         MvcResult first = mvc(c).perform(get("/api/public/stories")).andExpect(status().isOk()).andReturn();
         String body1 = first.getResponse().getContentAsString(StandardCharsets.UTF_8);
@@ -404,7 +404,7 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("掩码回归：开关为 true 时两个端点都回到掩码口径，且载荷逐字节等于冻结串")
     void maskedPayloadMatchesGolden() throws Exception {
-        PublicApiController c = controller("REAL", true, true, false);
+        PublicApiTestAssembly c = controller("REAL", true, true, false);
 
         String stories = normalize(body(c, "/api/public/stories"));
         assertEquals(golden("masked-golden-stories.json"), stories);
@@ -416,10 +416,10 @@ class PublicApiStoriesEndpointTest {
     @Test
     @DisplayName("两种口径只差 IP 相关字段：字段集合完全一致，真实态给真实地址、掩码态给网段")
     void realAndMaskedDifferOnlyInIpFields() throws Exception {
-        PublicApiController real = controller("REAL", true, false, false);
+        PublicApiTestAssembly real = controller("REAL", true, false, false);
         String realJson = body(real, "/api/public/stories");
 
-        PublicApiController masked = controller("REAL", true, true, false);
+        PublicApiTestAssembly masked = controller("REAL", true, true, false);
         String maskedJson = body(masked, "/api/public/stories");
 
         assertTrue(realJson.contains(AttackStoryFixtures.IP_DECOY), "真实态必须显示观测到的真实来源地址");
@@ -444,7 +444,7 @@ class PublicApiStoriesEndpointTest {
     @DisplayName("【核心】响应体里除了'该有的来源 IP'，零敏感项（口令/内部资产名/内网地址/原始日志/规则正则）")
     void responseHasZeroSensitiveItems() throws Exception {
         // 蜜罐那一段必须接上，才会把带口令的规则描述带进管线
-        PublicApiController c = controller("REAL", true, false, true);
+        PublicApiTestAssembly c = controller("REAL", true, false, true);
         String json = body(c, "/api/public/stories");
 
         assertNoIpLeak(json, Set.of(AttackStoryFixtures.IP_DECOY, AttackStoryFixtures.IP_HONEYPOT,

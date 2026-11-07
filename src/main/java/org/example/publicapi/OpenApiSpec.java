@@ -50,7 +50,7 @@ public class OpenApiSpec {
      * 20 个基础端点（含 3 个 POST 与 1 个带路径参数的 GET）。
      *
      * <p>注意有一条<b>不在最初那张 19 条清单里</b>：{@code /api/public/tts/say}。它是控制器里实打实的
-     * 第 20 个公开端点（自由文本语音，见 {@code PublicApiController#ttsSay}），清单漏写它会让
+     * 第 20 个公开端点（自由文本语音，见 {@code PublicKbController#ttsSay}），清单漏写它会让
      * "机器可读的公开面"少一条 —— 正是这个端点让人以为"公开面没有吃自由文本的地方"。
      * 所以按真实 mapping 收录，并在 {@code info.description} 里写明这个差异。
      */

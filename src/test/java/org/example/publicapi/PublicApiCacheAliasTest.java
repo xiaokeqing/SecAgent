@@ -42,18 +42,18 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 class PublicApiCacheAliasTest {
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
     private PublicCorsInterceptor cors;
 
     @BeforeEach
     void setUp() {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 45);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 45);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
 
         WazuhGateway gateway = (WazuhGateway) Proxy.newProxyInstance(
                 WazuhGateway.class.getClassLoader(),
@@ -68,7 +68,7 @@ class PublicApiCacheAliasTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
 
         cors = new PublicCorsInterceptor();
         ReflectionTestUtils.setField(cors, "allowedOriginsConfig",
@@ -84,7 +84,7 @@ class PublicApiCacheAliasTest {
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).addInterceptors(cors).build();
+        return api.builder().addInterceptors(cors).build();
     }
 
     @Test

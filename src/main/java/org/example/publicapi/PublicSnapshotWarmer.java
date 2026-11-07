@@ -46,7 +46,7 @@ import org.springframework.stereotype.Component;
 import org.springframework.scheduling.annotation.Scheduled;
 
 /**
- * 公网快照的定时预聚合（原 {@code PublicApiController#warmPublicSnapshots} 的独立组件形态）。
+ * 公网快照的定时预聚合（原单文件 god controller 里 {@code warmPublicSnapshots} 的独立组件形态）。
  *
  * <p>拆分后仍然只有<b>一个</b> {@code @Scheduled} 方法：五个按域 controller 若各自带一个定时器，
  * 同一轮会重复查上游、且 {@code /home} 的最后刷新顺序会失效。

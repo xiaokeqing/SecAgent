@@ -1,7 +1,10 @@
 # 拆分 `PublicApiController` 为按域 controller —— 最终形态与迁移清单
 
-> 状态：**已完成**（2026-11-07）。路径、参数名、响应 JSON 字段、状态码、缓存头、限流注解全部不变；
-> `mvn.cmd -o clean test` → `Tests run: 893, Failures: 0, Errors: 0, Skipped: 4`（基线 892 + 1 条并行的 `/story?id=` 测试）。
+> 状态：**已收尾**（2026-11-07）。两阶段完成：先拆出五个按域 controller + 委托门面，再把门面
+> `PublicApiController` 整体删除 —— 现在测试直接组装五个域 controller（测试源新增 `PublicApiTestAssembly`），
+> 生产代码里**不存在**任何门面或兼容壳，`legacy-facade-bean` 开关也随之移除。
+> 路径、参数名、响应 JSON 字段、状态码、缓存头、限流注解全部不变。
+> 最终 `mvn.cmd -o -q clean test` → `Tests run: 903, Failures: 0, Errors: 0, Skipped: 4`（899 是更早基线；HEAD 上 `2b6ea1c` 新增 `/indices`、`/conn` 两个公共端点的 4 条测试，故当前总数为 903）。
 > 未做任何 git commit。
 
 ## 1. 实测事实（与任务描述不一致处以实测为准）
@@ -17,23 +20,25 @@
 
 ```
 org.example.publicapi
-├── PublicApiSupport        (883) @Component   共享状态（字段/常量/Snapshot/工具）+ 唯一一处缓存实现
-├── PublicAlertController   (730) @RestController  /overview /alerts /alerts/{aggId} /honeypot /audit /latest
-├── PublicHomeController    (240) @RestController  /home /deploy
-├── PublicKbController      (431) @RestController  /ask /kb /tts /tts/say
-├── PublicGeoController     (259) @RestController  /geo /ip
-├── PublicMiscController    (799) @RestController  /eval /password /webstats /stories /story(2 条)
-├── PublicSnapshotWarmer    (137) @Component   唯一的 @Scheduled 预聚合
-└── PublicApiController     (696) @RestController + @ConditionalOnProperty（默认关）  委托门面，专供历史单测
+├── PublicApiSupport        (869) @Component   共享状态（字段/常量/Snapshot/工具）+ 唯一一处缓存实现
+├── PublicAlertController   (729) @RestController  /overview /alerts /alerts/{aggId} /honeypot /audit /latest
+├── PublicHomeController    (239) @RestController  /home /deploy
+├── PublicKbController      (430) @RestController  /ask /kb /tts /tts/say
+├── PublicGeoController     (258) @RestController  /geo /ip
+├── PublicMiscController    (864) @RestController  /eval /password /webstats /stories /story(2 条)
+└── PublicSnapshotWarmer    (136) @Component   唯一的 @Scheduled 预聚合
 ```
 
-拆分前：单文件 3063 行。拆分后：门面 696 行（其中 20 个方法各只有一行 `return xxxController.yyy(...)`），
-端点实现全部在五个按域 controller 里，共享状态与工具全部在 `PublicApiSupport` 里。
+拆分前：单文件 3063 行。收尾后：端点实现全部在五个按域 controller 里，共享状态与工具全部在
+`PublicApiSupport` 里；**门面 `PublicApiController` 已删除**，生产 `main` 下不再有任何"注释 + 一行转发"的壳。
+测试源另有一个装配器 `src/test/java/org/example/publicapi/PublicApiTestAssembly.java`（55 行），
+是五个 controller 在单测里的唯一组装点。
 
-## 3. 为什么旧类必须保留"委托门面"（这是本次拆分最反直觉的地方，必读）
+## 3. 门面的来龙去脉（已删除；这一节留作复盘）
 
+拆分第一步曾在 `PublicApiController` 里保留一层"注解 + 一行转发"的委托门面，原因只有一个：**历史单测**。
 本仓库**没有任何 `@SpringBootTest`**（`DeepSeekWiringTest`、`GlobalCorsExposeHeaderTest`、`TtsConfigContractTest`
-的注释都明确写了这一点）。约 19 个测试类全部是这个形态：
+的注释都明确写了这一点）。当时约 19 个测试类都是这个形态：
 
 ```java
 PublicApiController c = new PublicApiController();
@@ -42,40 +47,46 @@ ReflectionTestUtils.setField(c, "cacheSeconds", 15);
 MockMvcBuilders.standaloneSetup(c).build();
 ```
 
-`standaloneSetup(c)` **只注册 `c` 这个对象自己声明的 `@RequestMapping` 方法**，域 controller 在测试里根本不会被注册。
-所以门面必须：
+`standaloneSetup(c)` **只注册 `c` 这个对象自己声明的 `@RequestMapping` 方法**。所以门面当时必须
+`extends PublicApiSupport` 并保留全部 20 个带原注解的 handler（方法体一行转发），测试才能零改动继续跑。
 
-1. `extends PublicApiSupport` —— 40+ 私有字段、`Snapshot`、静态工具都在同一实例上，
-   `ReflectionTestUtils.setField` 会沿父类逐级查找字段，**测试零改动**；
-2. 保留全部 **20 个带原注解**的 handler 方法，方法体只有一行转发；
-3. 构造函数里 `new` 五个域 controller 并传 `this`（同一个 support 实例，共享同一批 `Snapshot`）；
-4. 保留测试用 `getDeclaredMethod` 反身引用的私有壳（见 §6）。
-
-### 3.1 实测踩坑：`@RestController` 不能省，但也不能"真正生效"
+### 3.1 当时踩到的坑（记录价值）
 
 - 第一版门面**只留 `@RequestMapping("/api/public")`、去掉 `@RestController`** → 全量测试 **120 个用例报 404**
   （`Status expected:<200> but was:<404>`）。`standaloneSetup` 的 handler 检测要求类上有
   `@Controller`/`@RestController`，仅类级 `@RequestMapping` 不够。
 - 但把 `@RestController` 加回去，门面就会被组件扫描成 Bean，和五个域 controller 注册**同一批 20 条路径** →
-  生产启动 `Ambiguous mapping`。
+  生产启动 `Ambiguous mapping`。当时的解法是 `@ConditionalOnProperty(prefix="app.public-api", name="legacy-facade-bean")`
+  默认关闭；该条件已随门面一起删除（`application*.yml` 里从未出现过这个属性）。
 
-### 3.2 最终解法：条件化的门面 Bean
+### 3.2 收尾：测试改为直接组装域 controller（当前形态）
+
+门面删除后，测试源新增 `PublicApiTestAssembly` 承担原来的组装职责：
 
 ```java
-@RestController
-@RequestMapping("/api/public")
-@ConditionalOnProperty(prefix = "app.public-api", name = "legacy-facade-bean", havingValue = "true")
-public class PublicApiController extends PublicApiSupport { ... }
+final PublicApiSupport support = new PublicApiSupport();
+final PublicAlertController alertController = new PublicAlertController(support);
+final PublicGeoController geoController = new PublicGeoController(support);
+final PublicHomeController homeController = new PublicHomeController(support, alertController, geoController);
+final PublicKbController kbController = new PublicKbController(support);
+final PublicMiscController miscController = new PublicMiscController(support);
+final PublicSnapshotWarmer snapshotWarmer =
+        new PublicSnapshotWarmer(support, alertController, homeController, geoController, miscController);
+
+MockMvc mvc() {
+    return MockMvcBuilders
+            .standaloneSetup(alertController, homeController, kbController, geoController, miscController)
+            .build();
+}
 ```
 
-- `app.public-api.legacy-facade-bean` **默认不存在** ⇒ 组件扫描跳过门面 ⇒ 生产里只有五个域 controller 是 Bean，
-  路径不冲突；
-- 单测是手工 `new PublicApiController()`，条件注解只在 Spring 容器里生效，**完全不影响** `standaloneSetup`；
-- 条件开启（设为 `true`）时门面会被注册 —— 仅在"临时回退到单类形态"时才这么做，且必须同时让五个域 controller 下线，
-  否则路径重复。
+**构造顺序不可换**：`PublicHomeController` 依赖 `PublicAlertController` 与 `PublicGeoController`，
+必须 alert → geo → home → kb → misc。各测试类的改法：`new PublicApiController()` → `new PublicApiTestAssembly()`，
+`ReflectionTestUtils.setField(c, …)` → `setField(assembly.support, …)`，`standaloneSetup(x)` → `x.mvc()`
+（需要额外 filter/interceptor 的用 `x.builder().addFilters(...)/.addInterceptors(...)`）。
 
-**实测生产启动**（打包后 `java -jar target/sec-agent-1.0-SNAPSHOT.jar --server.port=18082`）：
-`Started Main in 6.241 seconds`，日志**没有** `Ambiguous mapping`；20 条路径冒烟全部返回预期状态码
+当初那次"打包后真实启动 + 20 端点冒烟"验证的是拆分后的生产形态本身，与门面无关，结论仍然成立：
+`Started Main in 6.241 seconds`，无 `Ambiguous mapping`，
 （`/overview`…`/webstats` 200、`/story`（缺 src）400、`/alerts/xyz` 404、`/tts` 503（未配 key）、`/story?id=` 200）。
 
 ## 4. 20 条 mapping → 目标 controller（逐条）
@@ -111,8 +122,8 @@ public class PublicApiController extends PublicApiSupport { ... }
 
 所有字段（含 Geo / WebStats / 密码域）都留在 `PublicApiSupport`，原因有三：
 
-1. `ReflectionTestUtils.setField(controller, "geoMinCount", 3)` 打的是 `new PublicApiController()`，
-   靠继承在父类找到字段；
+1. `ReflectionTestUtils.setField(assembly.support, "geoMinCount", 3)` 直接打在 `PublicApiSupport` 实例上，
+   不再需要"靠门面继承在父类找字段"；
 2. `/home` 必须读到与 `/alerts`、`/geo`、`/honeypot`、`/audit` **同一个** `Snapshot` 实例
    （`PublicApiHomeEndpointTest.aggregateBlocksAreFieldForFieldIdentical` 逐字段比较），
    所以 10 个 Snapshot 只能在一个地方；
@@ -135,23 +146,24 @@ public class PublicApiController extends PublicApiSupport { ... }
   `passwordMaxHashes(200)`、`fallbackPasswordRateLimiter`、`webStatsService`、`webStatsMinCount(5)`、
   `webStatsTopCategories(10)`、`webStatsTopUas(5)`、`attackStoryService`。
 
-## 6. 被反射/静态引用、因此必须声明在旧类自身上的成员
+## 6. 曾被反射/静态引用的成员：门面删除后各自归位
 
 `ReflectionTestUtils.invokeMethod` 走 `ReflectionUtils.findMethod`（**会向上找父类**），但
-`getClass().getDeclaredMethod(...)` / `PublicApiController.class.getDeclaredMethod(...)` **只找本类声明**。
+`getClass().getDeclaredMethod(...)` **只找本类声明** —— 这正是当初门面留转发壳的原因。
+收尾时逐个改指真实归属，现在每个成员只在自己所在的类上声明一次：
 
-| 成员 | 引用点 | 处理 |
+| 成员 | 原引用点 | 收尾后 |
 |---|---|---|
-| `private ship(Map)` | `PublicMaskedRegressionTest.java:213` | 门面保留一行 `return super.ship(data);` |
-| `private buildHoneypot()` | `PublicMaskedRegressionTest.java:150-154/180/210` | 门面保留转发壳 |
-| `private buildAudit()` | `PublicMaskedRegressionTest.java:190` | 门面保留转发壳 |
-| `public warmPublicSnapshots()` | `PublicSnapshotWarmerTest.java:139-143`（调两次，断言不抛） | 门面保留一行转发到 `snapshotWarmer` |
-| `Snapshot` 嵌套类 | `PublicSnapshotWarmerTest.java:32/33` `new PublicApiController.Snapshot()` | 门面保留 `static final class Snapshot extends PublicApiSupport.Snapshot` |
-| `static parseSelfIps` | `PublicApiGeoEndpointTest.java:344-346`；主代码 `AttackStoryService.java:298` | 门面 static 转发 |
-| `static buildLatest`（7 参与 8 参） | `PublicApiLatestTest` | 门面 static 转发 |
-| `static buildWebStatsAvailable/Unavailable`、`webStatsSharePercent` | `PublicApiWebstatsEndpointTest.java:368-391` | 门面 static 转发 |
-| `static credentialShapes` | 主代码 `PublicIpProfileService.java:203` | 门面 static 转发 |
-| `scrubText(String)` | `PublicFreeTextIpGateTest.java:298-316`（`invokeMethod`，可继承） | 继承自 Support，未额外声明 |
+| `ship(Map)` | `PublicMaskedRegressionTest` | `PublicApiSupport.class.getDeclaredMethod("ship", Map.class)`，再 `invoke(assembly.support, …)` |
+| `buildHoneypot()` | `PublicMaskedRegressionTest` | 反射打在 `assembly.alertController`（方法本就在 `PublicAlertController`） |
+| `buildAudit()` | `PublicMaskedRegressionTest` | 同上，`assembly.alertController` |
+| `warmPublicSnapshots()` | `PublicSnapshotWarmerTest`（调两次，断言不抛） | `assembly.snapshotWarmer.warmPublicSnapshots()` |
+| `Snapshot` 嵌套类 | `PublicSnapshotWarmerTest`、`PublicFreeTextIpGateTest` 等 | `PublicApiSupport.Snapshot` |
+| `static parseSelfIps` | `PublicApiGeoEndpointTest`；主代码 `AttackStoryService.java:298` | `PublicGeoController.parseSelfIps` |
+| `static buildLatest`（7 参与 8 参） | `PublicApiLatestTest` | `PublicAlertController.buildLatest` |
+| `static buildWebStatsAvailable/Unavailable`、`webStatsSharePercent` | `PublicApiWebstatsEndpointTest` | `PublicMiscController.*` |
+| `static credentialShapes` | 主代码 `PublicIpProfileService.java:203` | `PublicAlertController.credentialShapes` |
+| `scrubText(String)` | `PublicFreeTextIpGateTest`（`invokeMethod`，可继承） | 继承自 `PublicApiSupport`，未额外声明 |
 
 ## 7. 定时预聚合收敛为一处
 
@@ -172,14 +184,17 @@ Alert/Home/Geo/Misc 四个 controller，kb 不参与预热），**全仓只剩�
   以及并行子任务的 `windowSpec`。没有任何一条业务语句只存在于拆分前。
 - 路径、`@RequestParam`/`@PathVariable` 参数名、响应字段名、状态码、缓存头、ETag、限流注解**一律未改**。
 - 中文类注释与关键注释（含原 god controller 的"为什么"段落、`/home` P50 事故注释）随成员一起搬走，未改写。
-- 验证：`mvn.cmd -o clean test` → 893 tests / 0 failures / 0 errors / 4 skipped；打包后真实启动 + 20 端点冒烟。
+- 验证：拆分完成时 `mvn.cmd -o clean test` → 893 tests / 0 failures / 0 errors / 4 skipped，并打包后真实启动 + 20 端点冒烟；
+  门面收尾后（测试改为直连域 controller）`mvn.cmd -o -q clean test` → **903 tests / 0 failures / 0 errors / 4 skipped**。
 
-## 9. 保留未动 / 风险点
+## 9. 已收尾：门面已删除，测试直连域 controller
 
-- **门面是"测试专用"的**：改它的方法名、参数名或注解会直接打挂 ~19 个测试类；它不是生产 Bean，
-  但没有它 `standaloneSetup` 就覆盖不到域 controller。
-- **条件属性不要随手打开**：`app.public-api.legacy-facade-bean=true` 会与五个域 controller 重复注册
-  同一批路径（`Ambiguous mapping`）。
+- **没有任何兼容壳**：`PublicApiController.java`（695 行）整文件删除，20 个一行转发 handler、10 个静态转发、
+  `ship`/`buildHoneypot`/`buildAudit`/`warmPublicSnapshots` 四个壳、以及 `legacy-facade-bean` 条件
+  全部消失；`application*.yml` 从未定义过该属性，无需清理配置。
+- **装配顺序是硬约束**：`PublicApiTestAssembly` 必须 alert → geo → home → kb → misc
+  （`PublicHomeController` 构造依赖 alert 与 geo）。新增域 controller 时只改装配器一处即可，
+  但别忘了 `PublicSnapshotWarmer` 的构造参数也要同步。
 - **`/home` 的逐字段一致**依赖"同一 Snapshot + 同一 `ship`"：`homeCache` 里的 alerts/geo/honeypot/audit 块
   必须来自 `alertController`/`geoController` 的同一批缓存，别改成各建缓存。
 - **ETag/缓存头逐字不变**：`Cache-Control: public, max-age=45, stale-while-revalidate=300`、
@@ -189,5 +204,17 @@ Alert/Home/Geo/Misc 四个 controller，kb 不参与预热），**全仓只剩�
   没有因为拆分多建实例（否则计数翻倍、限流口径漂移）。
 - **`/story` 双映射**：`?src=` 与 `params="id"` 两条 mapping 的 `params` 条件原样保留，否则路由歧义。
 - **`/daily` 不在本文件**：不要为它新建 controller，也不要移动 `report/DailyReportController`。
-- **Support 现在 883 行**（字段 + 工具 + Snapshot），体量偏大；后续若要再拆字段组，必须先解决
-  `ReflectionTestUtils.setField` 按字段名注入的耦合（风险高于收益，本次不做）。
+- **`PublicApiSupport` 现在 869 行**（字段 + 工具 + Snapshot），体量仍偏大；后续若要再拆字段组，
+  必须先解决 `ReflectionTestUtils.setField` 按字段名注入的耦合（风险高于收益，本次不做）。
+
+## 10. 收尾改动统计（相对拆分完成时）
+
+| 项 | 数值 |
+|---|---|
+| 删除的类 | `PublicApiController.java` **695 行**（类注释 + 5 个 controller 字段 + 构造器 + 20 个一行转发 handler + 10 个静态转发 + 4 个兼容壳） |
+| `PublicApiSupport` | 882 → **869 行**（改 logger 类名、删 14 个不再使用的 import、重写类注释，逻辑零改动） |
+| 迁移的测试类 | **22 个**（19 个 `new PublicApiController()` 的直接使用者 + 同批引用者），另 2 个探针 `AttackStoryRealDataProbe`/`AttackStoryGoldenGenerator` |
+| 测试源新增 | `PublicApiTestAssembly.java`（55 行，五个 controller 的唯一组装点） |
+| 主代码静态调用改指 | `AttackStoryService.java:298` → `PublicGeoController.parseSelfIps`；`PublicIpProfileService.java:203` → `PublicAlertController.credentialShapes` |
+| 文档/注释 | 5 个域 controller 类注释 + 15 处 javadoc `{@link}` 改指真实类 |
+| 最终验证 | `mvn.cmd -o -q clean test` → `Tests run: 903, Failures: 0, Errors: 0, Skipped: 4`（未新增/删减测试方法：`@Test`/`@ParameterizedTest` 注解数 HEAD 与收尾后同为 897） |

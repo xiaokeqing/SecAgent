@@ -4,10 +4,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
-import org.example.core.model.AlertSeverity;
-import org.example.core.model.AlertSource;
-import org.example.core.model.AlertType;
-import org.example.core.model.SecurityAlert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -17,26 +13,16 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import java.time.Instant;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,26 +34,27 @@ import org.springframework.stereotype.Component;
  * {@code /api/public/**} 各域 controller 的共享状态与通用工具。
  *
  * <h3>为什么要有它</h3>
- * 原 {@code PublicApiController} 是单文件 god controller，但它的状态天生跨端点共享：
+ * 公开面原先是单文件 god controller，但它的状态天生跨端点共享：
  * 快照缓存（overview/alerts/honeypot/audit/latest/home/deploy/eval/geo/webstats）必须<b>唯一实例</b>
  * （{@code /home} 直接组合其它端点同一批快照，{@code home.data.alerts} 要与 {@code alerts.data} 逐字段相同），
  * 出关脱敏口径（{@code ship/scrubText}）与响应信封（{@code ok/tooMany/badRequest}）也必须只有一份。
  * 所以这些状态与工具下沉到本类，按域拆出去的是<b>端点与端点私有的 builder</b>。
  *
- * <h3>为什么旧类还在</h3>
- * 本仓库没有 {@code @SpringBootTest}：约 19 个测试类直接 {@code new PublicApiController()} +
- * {@code MockMvcBuilders.standaloneSetup(controller)}，并用 {@code ReflectionTestUtils} 往这个实例上塞
- * 40+ 私有字段，还直接引用 {@code PublicApiController.Snapshot} 与若干静态方法。字段因此必须留在
- * 旧类的继承链上（旧类 {@code extends PublicApiSupport}），旧类退化成"注解 + 一行转发"的委托门面。
+ * <h3>测试怎么装配</h3>
+ * 本仓库没有 {@code @SpringBootTest}：测试统一用 {@code new PublicApiTestAssembly()}
+ * （测试源里的装配器）一次性拼出本类 + 五个按域 controller，再
+ * {@code MockMvcBuilders.standaloneSetup(...)} 注册全部 controller；注入字段仍走
+ * {@code ReflectionTestUtils.setField(assembly.support, …)}。历史门面
+ * {@code PublicApiController} 已删除，不再有"注解 + 一行转发"的委托层。
  *
- * <p>本类刻意<b>不</b>是任何端点的 owner：它不持有 {@code @RequestMapping}，
+ * <p>本类刻意<b>不是</b>任何端点的 owner：它不持有 {@code @RequestMapping}，
  * 端点注解在五个按域 controller 上（{@code PublicAlertController}/{@code PublicHomeController}/
  * {@code PublicKbController}/{@code PublicGeoController}/{@code PublicMiscController}）。
  */
 @Component
 public class PublicApiSupport {
 
-    static final Logger logger = LoggerFactory.getLogger(PublicApiController.class);
+    static final Logger logger = LoggerFactory.getLogger(PublicApiSupport.class);
 
     static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -79,7 +66,7 @@ public class PublicApiSupport {
     /** 时间线端点数据源不可用时的统一 reason（与既有公开端点的"不编数据"口径一致）。 */
     static final String TIMELINE_REASON_UNAVAILABLE = "数据源不可用";
 
-    /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link #tts}） */
+    /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link PublicKbController#tts}） */
     static final MediaType TTS_AUDIO = MediaType.parseMediaType("audio/mpeg");
 
     /** CosyVoice 返回 wav（24 kHz / mono / 16-bit）：媒体类型不能报 mpeg */

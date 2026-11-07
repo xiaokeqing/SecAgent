@@ -134,24 +134,24 @@ class PublicAlertsCredentialLeakTest {
     }
 
     /** 走真实装配：真跑 MVC 路由 + 真的聚合服务 + 真的出口闸门 */
-    private PublicApiController controller() throws Exception {
+    private PublicApiTestAssembly controller() throws Exception {
         Files.writeString(dataDir.resolve("blocked-ips.json"), "[]", StandardCharsets.UTF_8);
         Files.writeString(dataDir.resolve("response-audit.json"), "[]", StandardCharsets.UTF_8);
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         // 用例要连发多次请求（列表 + 下钻），限流器放宽到不至于自伤
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 200);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.of(false));
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.of(false));
 
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", dataDir.toString());
         ReflectionTestUtils.setField(reader, "ipPolicy", PublicIpPolicy.of(false));
-        ReflectionTestUtils.setField(c, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
 
         List<SecurityAlert> alerts = List.of(
                 honeypotAlert("a1", PLAINTEXT),
@@ -171,12 +171,12 @@ class PublicAlertsCredentialLeakTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(c, "source", source);
+        ReflectionTestUtils.setField(c.support, "source", source);
         return c;
     }
 
-    private String body(PublicApiController c, String url) throws Exception {
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(c).build();
+    private String body(PublicApiTestAssembly c, String url) throws Exception {
+        MockMvc mvc = c.mvc();
         return mvc.perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
@@ -258,7 +258,7 @@ class PublicAlertsCredentialLeakTest {
     @Test
     @DisplayName("【红线】/alerts/{aggId} 下钻：明细里的 title / ruleName 同样不含明文口令")
     void alertsDrillDownNeverCarriesPlaintextPassword() throws Exception {
-        PublicApiController c = controller();
+        PublicApiTestAssembly c = controller();
 
         // 从列表里取真实的 aggId（聚合 id 由成员与源地址派生，不硬编码）
         Map<String, Object> listData = data(body(c, "/api/public/alerts"));
@@ -296,7 +296,7 @@ class PublicAlertsCredentialLeakTest {
     @Test
     @DisplayName("【闸门】/honeypot 与 /alerts 的隐藏形态一致（同一个 PASSWORD_HIDDEN 常量）")
     void hiddenFormIsTheSameOnBothEndpoints() throws Exception {
-        PublicApiController c = controller();
+        PublicApiTestAssembly c = controller();
         String honeypot = body(c, "/api/public/honeypot");
         String alerts = body(c, "/api/public/alerts");
 

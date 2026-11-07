@@ -50,7 +50,7 @@ class PublicApiLatestTest {
         alerts.add(alert("a3", AlertSeverity.CRITICAL, "203.0.113.9", "2026-10-13 12:30:00"));
         alerts.add(alert("a4", AlertSeverity.MEDIUM, "198.51.100.7", "2026-10-13 09:00:00"));
 
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 alerts, true, "REAL", 200, 15, "2026-10-13 13:00:00", List.of());
 
         assertEquals(true, out.get("available"));
@@ -83,7 +83,7 @@ class PublicApiLatestTest {
     void payloadNeverLeaksInternalFields() {
         List<SecurityAlert> alerts = List.of(
                 alert("a1", AlertSeverity.CRITICAL, "45.83.91.12", "2026-10-13 12:30:00"));
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 alerts, true, "REAL", 200, 15, "2026-10-13 13:00:00", List.of());
 
         assertFalse(flat(out).contains("标题不该出现在公网出参里"), flat(out));
@@ -98,7 +98,7 @@ class PublicApiLatestTest {
     @Test
     @DisplayName("数据源不可用：available=false + DATA_SOURCE_UNAVAILABLE，且绝不用 0 冒充太平")
     void unavailableIsHonest() {
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 List.of(), false, "MOCK", 200, 15, "2026-10-13 13:00:00", List.of());
 
         assertEquals(false, out.get("available"));
@@ -114,7 +114,7 @@ class PublicApiLatestTest {
     @Test
     @DisplayName("数据源可用但窗口内确实没有告警：区分成 NO_DATA_IN_WINDOW（不是故障）")
     void emptyButHealthyIsDifferentFromUnavailable() {
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 List.of(), false, "REAL", 200, 15, "2026-10-13 13:00:00", List.of());
 
         assertEquals(false, out.get("available"));
@@ -129,7 +129,7 @@ class PublicApiLatestTest {
         alerts.add(alert("bad", AlertSeverity.CRITICAL, "45.83.91.12", "不是时间"));
         alerts.add(alert("good", AlertSeverity.HIGH, "45.83.91.12", "2026-10-13 11:00:00"));
 
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 alerts, true, "REAL", 200, 15, "2026-10-13 13:00:00", List.of());
 
         @SuppressWarnings("unchecked")
@@ -146,7 +146,7 @@ class PublicApiLatestTest {
         block.put("ip", "45.83.***.***");
         block.put("source", "智能体");
 
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 List.of(alert("a1", AlertSeverity.HIGH, "45.83.91.12", "2026-10-13 11:00:00")),
                 true, "REAL", 200, 15, "2026-10-13 13:00:00", List.of(block));
 

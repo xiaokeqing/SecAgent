@@ -39,7 +39,7 @@ import java.util.Map;
  * 这一条与开关无关，永远不会被打开。
  *
  * <h3>缺 bean 时为什么按"掩码"兜底（fail-closed）</h3>
- * 单测里经常直接 {@code new PublicApiController()} / {@code new PublicOutputGuard()}，
+ * 单测里经常直接 {@code new PublicApiTestAssembly()} / {@code new PublicOutputGuard()}，
  * 没有 Spring 注入。此时字段初值是 {@code maskIps = true}（掩码），
  * 也就是说<b>代码层的兜底方向是"少给"</b>，而<b>配置层的默认值是"给全"</b>
  * （{@code app.public.mask-ips} 缺省 = {@code false}）。

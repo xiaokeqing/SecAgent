@@ -108,7 +108,7 @@ class PublicMaskedRegressionTest {
         return m;
     }
 
-    private PublicApiController maskedController() throws Exception {
+    private PublicApiTestAssembly maskedController() throws Exception {
         Files.writeString(dataDir.resolve("blocked-ips.json"),
                 "[{\"id\":\"BLK-1\",\"ip\":\"45.83.91.12\",\"durationMinutes\":60,\"source\":\"智能体\","
                         + "\"actor\":\"admin\",\"auditId\":\"AUD-1\",\"createdAt\":\"2026-10-13 12:00:00\","
@@ -118,16 +118,16 @@ class PublicMaskedRegressionTest {
                         + "\"target\":\"45.83.91.12\",\"reason\":\"来源 106.37.205.248 高频失败\","
                         + "\"riskLevel\":\"HIGH\",\"mode\":\"REAL\",\"success\":true}]", StandardCharsets.UTF_8);
 
-        PublicApiController c = new PublicApiController();
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.masking());
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.masking());
 
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", dataDir.toString());
         ReflectionTestUtils.setField(reader, "ipPolicy", PublicIpPolicy.masking());
-        ReflectionTestUtils.setField(c, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
 
         Map<String, Object> honeypot = honeypotRawFixture();
         List<SecurityAlert> alerts = alerts();
@@ -143,7 +143,7 @@ class PublicMaskedRegressionTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(c, "source", source);
+        ReflectionTestUtils.setField(c.support, "source", source);
         return c;
     }
 
@@ -167,7 +167,7 @@ class PublicMaskedRegressionTest {
     @Test
     @DisplayName("【回归】/latest 掩码态载荷逐字节等于冻结串")
     void latestMaskedPayloadIsByteIdenticalToLegacy() throws Exception {
-        Map<String, Object> out = PublicApiController.buildLatest(
+        Map<String, Object> out = PublicAlertController.buildLatest(
                 alerts(), true, "REAL", 200, 15, "2026-10-13 13:00:00", List.of());
 
         assertEquals(golden("masked-golden-latest.json"), MAPPER.writeValueAsString(out),
@@ -177,7 +177,7 @@ class PublicMaskedRegressionTest {
     @Test
     @DisplayName("【回归】/honeypot 掩码态载荷逐字节等于冻结串（仅 generatedAt 归一）")
     void honeypotGolden() throws Exception {
-        String actual = frozen(invoke(maskedController(), "buildHoneypot"));
+        String actual = frozen(invoke(maskedController().alertController, "buildHoneypot"));
         assertEquals(golden("masked-golden-honeypot.json"), actual);
         // 与改造前的有意差异只有"口令 Top 结构化"这一处，且与开关无关
         assertEquals(-1, actual.indexOf("123456"), "口令原文永远不该出现：" + actual);
@@ -187,7 +187,7 @@ class PublicMaskedRegressionTest {
     @Test
     @DisplayName("【回归】/audit 掩码态载荷逐字节等于冻结串（仅 generatedAt 归一）")
     void auditGolden() throws Exception {
-        String actual = frozen(invoke(maskedController(), "buildAudit"));
+        String actual = frozen(invoke(maskedController().alertController, "buildAudit"));
         assertEquals(golden("masked-golden-audit.json"), actual);
     }
 
@@ -206,13 +206,13 @@ class PublicMaskedRegressionTest {
     @Test
     @DisplayName("【回归】/honeypot 经 ship()+scrubDeep() 出口闸门后仍逐字节等于冻结串")
     void honeypotPayloadSurvivesTheScrubDeepGateByteIdentically() throws Exception {
-        PublicApiController c = maskedController();
-        Object built = invoke(c, "buildHoneypot");
+        PublicApiTestAssembly c = maskedController();
+        Object built = invoke(c.alertController, "buildHoneypot");
 
         // ship() 直接在入参 map 上补 ipDisclosure（不改键名、不改既有值）；它是实例方法
-        Method ship = PublicApiController.class.getDeclaredMethod("ship", Map.class);
+        Method ship = PublicApiSupport.class.getDeclaredMethod("ship", Map.class);
         ship.setAccessible(true);
-        Map<String, Object> shipped = (Map<String, Object>) ship.invoke(c, built);
+        Map<String, Object> shipped = (Map<String, Object>) ship.invoke(c.support, built);
 
         assertTrue(shipped.containsKey(PublicIpPolicy.DISCLOSURE_FIELD),
                 "ship() 应补上统一口径字段 " + PublicIpPolicy.DISCLOSURE_FIELD);

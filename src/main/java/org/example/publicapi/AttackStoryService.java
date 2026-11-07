@@ -52,7 +52,7 @@ import java.util.Set;
  * <h3>复用既有外壳，一个新机制都不加</h3>
  * 限流（同一个 {@link PublicRateLimiter}，20 次/分钟）、CORS（{@link PublicCorsInterceptor}）、
  * ETag/304（{@link PublicEtagFilter}）、15 秒快照（本类的 {@link #cached}）、
- * 出参信封与资产名过滤（{@code PublicApiController.ok(...)}）全部沿用既有实现。
+ * 出参信封与资产名过滤（{@code PublicApiSupport.ok(...)}）全部沿用既有实现。
  */
 @Component
 public class AttackStoryService {
@@ -295,7 +295,7 @@ public class AttackStoryService {
         stageStatus.put(STAGE_DECOY, wiring(raw, STAGE_DECOY, "NOT_WIRED"));
         stageStatus.put(STAGE_HONEYPOT, wiring(raw, STAGE_HONEYPOT, "NOT_WIRED"));
 
-        Set<String> self = PublicApiController.parseSelfIps(selfIps);
+        Set<String> self = PublicGeoController.parseSelfIps(selfIps);
         // 按【来源个数】计数，不按记录条数：同一个内网地址在四段里各出现一次也只算一个来源，
         // 否则 coverage.excludedInternal 会随着"它在几段里有数据"而变，没人能解释这个数字
         Set<String> excludedSelfIps = new LinkedHashSet<>();

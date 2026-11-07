@@ -46,10 +46,10 @@ import java.util.function.Supplier;
 /**
  * 告警、蜜罐、审计与"最新态势"域：/overview、/alerts、/alerts/{aggId}、/honeypot、/audit、/latest。
  *
- * <p>本类是 {@code PublicApiController} 拆分出的按域 controller 之一：只做搬移，路径、参数、
+ * <p>本类是原 {@code PublicApiController}（已删除的委托门面）拆分出的按域 controller 之一：只做搬移，路径、参数、
  * 响应字段、状态码、缓存头与限流口径与原 god controller 逐字一致。
  * 共享状态与通用工具（快照缓存、出关脱敏、信封/缓存头）在 {@link PublicApiSupport} 里，
- * 由构造器注入；旧类 {@code PublicApiController} 保留为委托门面（历史单测直接 new 它）。
+ * 由构造器注入；历史门面 {@code PublicApiController} 已删除，测试改为直接装配这些 controller。
  */
 @RestController
 @RequestMapping("/api/public")

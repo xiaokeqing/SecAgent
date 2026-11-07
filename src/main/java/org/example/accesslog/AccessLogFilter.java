@@ -250,7 +250,7 @@ public class AccessLogFilter extends OncePerRequestFilter {
     /**
      * 取调用方 IP：优先 {@code CF-Connecting-IP}，否则 {@code remoteAddr}。
      *
-     * <p>与 {@code PublicApiController#clientIp} 的口径一致，但多了一道
+     * <p>与 {@code PublicApiSupport#clientIp} 的口径一致，但多了一道
      * <b>必须是合法 IP 字面量</b>的校验：
      * <ul>
      *   <li>这个值会<b>落盘</b>并被 fail2ban 拿去封禁，不能接受任意字符串

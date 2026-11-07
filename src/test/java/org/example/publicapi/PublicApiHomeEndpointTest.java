@@ -49,7 +49,7 @@ class PublicApiHomeEndpointTest {
 
     private static final ObjectMapper M = new ObjectMapper();
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
     private PublicCorsInterceptor cors;
 
     /** 审计块的数据目录（空目录 = 零封禁、零动作；不建任何假文件，避免污染其它断言） */
@@ -58,16 +58,16 @@ class PublicApiHomeEndpointTest {
 
     @BeforeEach
     void setUp() {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 45);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "testsha");
-        ReflectionTestUtils.setField(controller, "buildSourceSha", "sourcesha");
-        ReflectionTestUtils.setField(controller, "buildArtifactMd5", "md5md5");
-        ReflectionTestUtils.setField(controller, "buildTime", "2026-10-16T20:00:00Z");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 45);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "testsha");
+        ReflectionTestUtils.setField(api.support, "buildSourceSha", "sourcesha");
+        ReflectionTestUtils.setField(api.support, "buildArtifactMd5", "md5md5");
+        ReflectionTestUtils.setField(api.support, "buildTime", "2026-10-16T20:00:00Z");
 
         WazuhGateway gateway = (WazuhGateway) Proxy.newProxyInstance(
                 WazuhGateway.class.getClassLoader(),
@@ -82,7 +82,7 @@ class PublicApiHomeEndpointTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
 
         /* 2026-10-18：审计块进了聚合（home.data.audit）。这里必须给它一个**真实**的 reader，
            不能留 null —— 留 null 会让 buildAudit 抛 NPE，而聚合的降级逻辑会把 audit 整块吞掉，
@@ -90,7 +90,7 @@ class PublicApiHomeEndpointTest {
            dataDir 指向空目录：summary 全 0、blocks/actions 空列表 —— 既不抛也不编造。 */
         PublicAuditReader audit = new PublicAuditReader();
         ReflectionTestUtils.setField(audit, "dataDir", auditDir.toString());
-        ReflectionTestUtils.setField(controller, "auditReader", audit);
+        ReflectionTestUtils.setField(api.support, "auditReader", audit);
 
         cors = new PublicCorsInterceptor();
         ReflectionTestUtils.setField(cors, "allowedOriginsConfig",
@@ -106,7 +106,7 @@ class PublicApiHomeEndpointTest {
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).addInterceptors(cors).build();
+        return api.builder().addInterceptors(cors).build();
     }
 
     private JsonNode data(String path) throws Exception {
@@ -213,7 +213,7 @@ class PublicApiHomeEndpointTest {
     void aggregateConsumesOneTokenPerRequest() throws Exception {
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
         for (int i = 0; i < 20; i++) {
             mvc().perform(get("/api/public/home")).andExpect(status().isOk());
         }
@@ -254,8 +254,8 @@ class PublicApiHomeEndpointTest {
                 + "\"keyPointHitRate\":0.698,\"refusalRate\":0.947,\"strictRate\":0.725,"
                 + "\"citationRate\":1.0,\"personaCatchphraseRate\":0.0,\"tabooRate\":0.475,"
                 + "\"internalNote\":\"不该出现\"}", StandardCharsets.UTF_8);
-        ReflectionTestUtils.setField(controller, "deployFile", deployFile.toString());
-        ReflectionTestUtils.setField(controller, "evalReportFile", evalFile.toString());
+        ReflectionTestUtils.setField(api.support, "deployFile", deployFile.toString());
+        ReflectionTestUtils.setField(api.support, "evalReportFile", evalFile.toString());
 
         String deploy = mvc().perform(get("/api/public/deploy"))
                 .andExpect(jsonPath("$.data.release.available").value(true))
@@ -273,8 +273,8 @@ class PublicApiHomeEndpointTest {
         assertFalse(eval.contains("internalNote"), "评测报告里的非白名单键不得透传：" + eval);
 
         // 坏路径 / 文件不存在，且**冷缓存** ⇒ 如实说读不到（不是 500，也不是空 200）
-        ReflectionTestUtils.setField(controller, "evalCache", new PublicApiController.Snapshot());
-        ReflectionTestUtils.setField(controller, "evalReportFile", deployFile + ".does-not-exist");
+        ReflectionTestUtils.setField(api.support, "evalCache", new PublicApiSupport.Snapshot());
+        ReflectionTestUtils.setField(api.support, "evalReportFile", deployFile + ".does-not-exist");
         mvc().perform(get("/api/public/eval"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.available").value(false))
@@ -286,7 +286,7 @@ class PublicApiHomeEndpointTest {
     void staleOnErrorKeepsLastGoodValue() throws Exception {
         Path evalFile = Files.createTempFile("xk-eval-stale", ".json");
         Files.writeString(evalFile, "{\"sampleSize\":96,\"keyPointHitRate\":0.698}", StandardCharsets.UTF_8);
-        ReflectionTestUtils.setField(controller, "evalReportFile", evalFile.toString());
+        ReflectionTestUtils.setField(api.support, "evalReportFile", evalFile.toString());
 
         // ① 冷缓存 + 文件在 ⇒ 真值
         mvc().perform(get("/api/public/eval"))
@@ -305,7 +305,7 @@ class PublicApiHomeEndpointTest {
                 .andExpect(jsonPath("$.snapshotAt").exists());
 
         // ③ 冷缓存再打（模拟 TTL 过期后重启的进程）⇒ 立刻如实说读不到
-        ReflectionTestUtils.setField(controller, "evalCache", new PublicApiController.Snapshot());
+        ReflectionTestUtils.setField(api.support, "evalCache", new PublicApiSupport.Snapshot());
         mvc().perform(get("/api/public/eval"))
                 .andExpect(jsonPath("$.data.available").value(false))
                 .andExpect(jsonPath("$.data.reason").value("EVAL_REPORT_UNREADABLE"));

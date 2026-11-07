@@ -76,19 +76,19 @@ class AttackStoryRealDataProbe {
         ReflectionTestUtils.setField(story, "maxLimit", 20);
         ReflectionTestUtils.setField(story, "selfIps", System.getenv().getOrDefault("STORY_SELF_IPS", ""));
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 200);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "probe");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.revealing());
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", audit);
-        ReflectionTestUtils.setField(c, "attackStoryService", story);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "probe");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.revealing());
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "auditReader", audit);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", story);
 
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(c).build();
+        MockMvc mvc = c.mvc();
 
         String stories = call(mvc, "/api/public/stories?limit=5&window=24h");
         System.out.println("=== GET /api/public/stories?limit=5&window=24h ===");

@@ -10,11 +10,11 @@ package org.example.publicapi;
  *
  * <p>而"这份数据是什么时候生成的"只有两处知道：
  * <ul>
- *   <li>走 {@link PublicApiController.Snapshot} 的端点 ⇒ 快照实际加载的那一刻；</li>
+ *   <li>走 {@link PublicApiSupport.Snapshot} 的端点 ⇒ 快照实际加载的那一刻；</li>
  *   <li>不走快照的端点（如 {@code /kb}：它体内有秒级的 {@code generatedAt}）⇒ 本次请求处理的那一刻。</li>
  * </ul>
  * 两者都在<b>同一个请求线程</b>上发生，所以用一个 {@link ThreadLocal} 记录、由
- * {@link PublicApiController#ok(Map, jakarta.servlet.http.HttpServletResponse)} 读取即可，
+ * {@link PublicApiSupport#ok(Map, jakarta.servlet.http.HttpServletResponse)} 读取即可，
  * 不需要改任何端点的签名。
  *
  * <h3>时序（谁清、谁写、谁读）</h3>

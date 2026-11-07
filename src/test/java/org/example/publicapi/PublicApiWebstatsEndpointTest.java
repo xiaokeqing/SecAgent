@@ -58,7 +58,7 @@ class PublicApiWebstatsEndpointTest {
     private final ObjectMapper mapper = new ObjectMapper();
     private final List<WebStatsService> startedServices = new ArrayList<>();
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     /** IPv4 形态（点分四段） */
     private static final Pattern IPV4 = Pattern.compile("\\d{1,3}(?:\\.\\d{1,3}){3}");
@@ -72,16 +72,16 @@ class PublicApiWebstatsEndpointTest {
     }
 
     private void baseController() {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
-        ReflectionTestUtils.setField(controller, "webStatsMinCount", 5);
-        ReflectionTestUtils.setField(controller, "webStatsTopCategories", 10);
-        ReflectionTestUtils.setField(controller, "webStatsTopUas", 5);
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "webStatsMinCount", 5);
+        ReflectionTestUtils.setField(api.support, "webStatsTopCategories", 10);
+        ReflectionTestUtils.setField(api.support, "webStatsTopUas", 5);
         wireSource();
     }
 
@@ -103,7 +103,7 @@ class PublicApiWebstatsEndpointTest {
             s.beginBackfill(dir);
         }
         startedServices.add(s);
-        ReflectionTestUtils.setField(controller, "webStatsService", s);
+        ReflectionTestUtils.setField(api.support, "webStatsService", s);
         return s;
     }
 
@@ -122,11 +122,11 @@ class PublicApiWebstatsEndpointTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.builder().build();
     }
 
     /** 造一份真实形态的访问日志：含扫描路径、脚本标签、查询串哨兵、以及"UA 里塞 IP" */
@@ -233,7 +233,7 @@ class PublicApiWebstatsEndpointTest {
     @DisplayName("没有装配数据面：available=false + WEBSTATS_DISABLED（不是'空分布'）")
     void disabledWhenNoService() throws Exception {
         baseController();
-        ReflectionTestUtils.setField(controller, "webStatsService", null);
+        ReflectionTestUtils.setField(api.support, "webStatsService", null);
 
         mvc().perform(get("/api/public/webstats"))
                 .andExpect(status().isOk())
@@ -320,7 +320,7 @@ class PublicApiWebstatsEndpointTest {
         baseController();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 1);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
         serviceFor(Files.createDirectory(tmp.resolve("log")), true);
 
         mvc().perform(get("/api/public/webstats")).andExpect(status().isOk());
@@ -336,7 +336,7 @@ class PublicApiWebstatsEndpointTest {
         serviceFor(fixtureLog(), true);
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", tmp.toString());
-        ReflectionTestUtils.setField(controller, "auditReader", reader);
+        ReflectionTestUtils.setField(api.support, "auditReader", reader);
 
         mvc().perform(get("/api/public/webstats")).andExpect(status().isOk());
         mvc().perform(get("/api/public/latest"))
@@ -365,8 +365,8 @@ class PublicApiWebstatsEndpointTest {
         WebStatsService.Status st = svc.status();
         WebStatsAggregator.Thresholds th = WebStatsAggregator.Thresholds.defaults();
 
-        String a = mapper.writeValueAsString(PublicApiController.buildWebStatsAvailable(snap, st, 15, "2026-10-14 12:00:00", th));
-        String b = mapper.writeValueAsString(PublicApiController.buildWebStatsAvailable(snap, st, 15, "2026-10-14 12:00:00", th));
+        String a = mapper.writeValueAsString(PublicMiscController.buildWebStatsAvailable(snap, st, 15, "2026-10-14 12:00:00", th));
+        String b = mapper.writeValueAsString(PublicMiscController.buildWebStatsAvailable(snap, st, 15, "2026-10-14 12:00:00", th));
         assertEquals(a, b);
     }
 
@@ -377,8 +377,8 @@ class PublicApiWebstatsEndpointTest {
         assertEquals(1, t.minCount());
         assertEquals(1, t.topCategories());
         assertEquals(0, t.topUas());
-        assertEquals(33.33d, PublicApiController.webStatsSharePercent(1, 3), 0.001d);
-        assertEquals(0d, PublicApiController.webStatsSharePercent(1, 0));
+        assertEquals(33.33d, PublicMiscController.webStatsSharePercent(1, 3), 0.001d);
+        assertEquals(0d, PublicMiscController.webStatsSharePercent(1, 0));
     }
 
     @Test
@@ -387,8 +387,8 @@ class PublicApiWebstatsEndpointTest {
         Set<String> expected = new LinkedHashSet<>(List.of("generatedAt", "cacheSeconds", "window", "available",
                 "reason", "totals", "topCategories", "topUas", "byDay", "heatmap", "thresholds", "coverage", "note"));
         assertEquals(expected, new LinkedHashSet<>(
-                PublicApiController.buildWebStatsUnavailable("X", "note", 15, "now").keySet()));
-        assertEquals(expected, new LinkedHashSet<>(PublicApiController.buildWebStatsAvailable(
+                PublicMiscController.buildWebStatsUnavailable("X", "note", 15, "now").keySet()));
+        assertEquals(expected, new LinkedHashSet<>(PublicMiscController.buildWebStatsAvailable(
                 WebStatsAggregator.Snapshot.empty(), null, 15, "now",
                 WebStatsAggregator.Thresholds.defaults()).keySet()));
     }

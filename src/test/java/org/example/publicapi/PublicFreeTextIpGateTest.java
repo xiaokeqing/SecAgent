@@ -105,23 +105,23 @@ class PublicFreeTextIpGateTest {
     }
 
     /** 走真实装配：真跑 MVC 路由 + 真的聚合服务 + 真的出口闸门（{@code ship → scrubDeep → scrubText}） */
-    private PublicApiController controller(boolean masked) throws Exception {
+    private PublicApiTestAssembly controller(boolean masked) throws Exception {
         Files.writeString(dataDir.resolve("blocked-ips.json"), "[]", StandardCharsets.UTF_8);
         Files.writeString(dataDir.resolve("response-audit.json"), "[]", StandardCharsets.UTF_8);
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 200);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.of(masked));
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.of(masked));
 
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", dataDir.toString());
         ReflectionTestUtils.setField(reader, "ipPolicy", PublicIpPolicy.of(masked));
-        ReflectionTestUtils.setField(c, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
 
         List<SecurityAlert> alerts = List.of(
                 alert("a1", dionaeaRuleText(INTERNAL), INTERNAL),
@@ -140,12 +140,12 @@ class PublicFreeTextIpGateTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(c, "source", source);
+        ReflectionTestUtils.setField(c.support, "source", source);
         return c;
     }
 
-    private String body(PublicApiController c, String url) throws Exception {
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(c).build();
+    private String body(PublicApiTestAssembly c, String url) throws Exception {
+        MockMvc mvc = c.mvc();
         return mvc.perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
@@ -237,7 +237,7 @@ class PublicFreeTextIpGateTest {
     @Test
     @DisplayName("【红线】真实态 /alerts/{aggId} 下钻：明细 title / ruleName 同样不含内网原文")
     void revealingModeDrillDownNeverCarriesInternalAddress() throws Exception {
-        PublicApiController c = controller(false);
+        PublicApiTestAssembly c = controller(false);
 
         Map<String, Object> listData = data(body(c, "/api/public/alerts"));
         @SuppressWarnings("unchecked")
@@ -295,25 +295,25 @@ class PublicFreeTextIpGateTest {
     @Test
     @DisplayName("【闸门幂等】已按口径处理过的文本再过一遍逐字节不变（不把已有输出改坏）")
     void gateIsIdempotent() {
-        PublicApiController revealing = new PublicApiController();
-        ReflectionTestUtils.setField(revealing, "ipPolicy", PublicIpPolicy.of(false));
-        PublicApiController masking = new PublicApiController();
-        ReflectionTestUtils.setField(masking, "ipPolicy", PublicIpPolicy.of(true));
+        PublicApiTestAssembly revealing = new PublicApiTestAssembly();
+        ReflectionTestUtils.setField(revealing.support, "ipPolicy", PublicIpPolicy.of(false));
+        PublicApiTestAssembly masking = new PublicApiTestAssembly();
+        ReflectionTestUtils.setField(masking.support, "ipPolicy", PublicIpPolicy.of(true));
 
         // 真实态：结构化字段的产物（公网原样 / 内网已换标签）再过一遍必须不变
         assertEquals(PUBLIC_ATTACKER,
-                ReflectionTestUtils.invokeMethod(revealing, "scrubText", PUBLIC_ATTACKER),
+                ReflectionTestUtils.invokeMethod(revealing.support, "scrubText", PUBLIC_ATTACKER),
                 "真实态下公网地址第二次过闸门必须逐字节不变");
         assertEquals("内网/未知",
-                ReflectionTestUtils.invokeMethod(revealing, "scrubText", "内网/未知"),
+                ReflectionTestUtils.invokeMethod(revealing.support, "scrubText", "内网/未知"),
                 "「内网/未知」这个标签本身不能再被改写");
 
         // 掩码态：display() 的产物形如 45.83.***.***，maskAll 不该再动它
         assertEquals("45.83.***.***",
-                ReflectionTestUtils.invokeMethod(masking, "scrubText", "45.83.***.***"),
+                ReflectionTestUtils.invokeMethod(masking.support, "scrubText", "45.83.***.***"),
                 "掩码态下已掩过的形态第二次过闸门必须逐字节不变");
         assertEquals("内部地址",
-                ReflectionTestUtils.invokeMethod(masking, "scrubText", "内部地址"),
+                ReflectionTestUtils.invokeMethod(masking.support, "scrubText", "内部地址"),
                 "「内部地址」这个标签本身不能再被改写");
     }
 }

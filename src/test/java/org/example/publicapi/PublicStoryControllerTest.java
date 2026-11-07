@@ -50,7 +50,7 @@ class PublicStoryControllerTest {
     @TempDir
     Path tmp;
 
-    private PublicApiController controller(boolean withStoryService, String mode) throws Exception {
+    private PublicApiTestAssembly controller(boolean withStoryService, String mode) throws Exception {
         return controller(withStoryService ? defaultStoryService(mode) : null, mode);
     }
 
@@ -60,7 +60,7 @@ class PublicStoryControllerTest {
      * <p>缓存用例必须拿到同一个服务实例：只比对两次响应体是否相同，证明不了"第二次没有回源"
      * （上游本来就是确定性的），所以要用计数子类把回源次数钉死。
      */
-    private PublicApiController controller(AttackStoryService storyService, String mode) throws Exception {
+    private PublicApiTestAssembly controller(AttackStoryService storyService, String mode) throws Exception {
         AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
         PublicIpPolicy policy = PublicIpPolicy.of(false);
 
@@ -72,17 +72,17 @@ class PublicStoryControllerTest {
         ReflectionTestUtils.setField(source, "wazuhGateway", AttackStoryFixtures.gateway(mode, true));
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", policy);
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", reader);
-        ReflectionTestUtils.setField(c, "attackStoryService", storyService);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", policy);
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", storyService);
         return c;
     }
 
@@ -110,11 +110,11 @@ class PublicStoryControllerTest {
         return svc;
     }
 
-    private MockMvc mvc(PublicApiController c) {
-        return MockMvcBuilders.standaloneSetup(c).addFilters(new PublicEtagFilter()).build();
+    private MockMvc mvc(PublicApiTestAssembly c) {
+        return c.builder().addFilters(new PublicEtagFilter()).build();
     }
 
-    private JsonNode performOK(PublicApiController c, String url) throws Exception {
+    private JsonNode performOK(PublicApiTestAssembly c, String url) throws Exception {
         MvcResult result = mvc(c).perform(get(url))
                 .andExpect(status().isOk())
                 .andReturn();
@@ -177,7 +177,7 @@ class PublicStoryControllerTest {
     @Test
     @DisplayName("【400】缺 id / 形状非法 / 内网地址都不进数据通路")
     void invalidIpIsRejected() throws Exception {
-        PublicApiController c = controller(true, "REAL");
+        PublicApiTestAssembly c = controller(true, "REAL");
         MockMvc mvc = mvc(c);
 
         mvc.perform(get("/api/public/story?id="))
@@ -277,7 +277,7 @@ class PublicStoryControllerTest {
     @Test
     @DisplayName("【缓存】带 If-None-Match 的第二次请求返回 304")
     void etagSupportsConditionalGet() throws Exception {
-        PublicApiController c = controller(true, "REAL");
+        PublicApiTestAssembly c = controller(true, "REAL");
         String etag = mvc(c).perform(get("/api/public/story?id=" + IP))
                 .andExpect(status().isOk())
                 .andReturn().getResponse().getHeader("ETag");
@@ -293,7 +293,7 @@ class PublicStoryControllerTest {
     @DisplayName("【缓存】同参数第二次请求命中 60s 缓存：不再回源，条件请求 304")
     void repeatedRequestHitsStoryCache() throws Exception {
         CountingStoryService counting = new CountingStoryService();
-        PublicApiController c = controller(counting, "REAL");
+        PublicApiTestAssembly c = controller(counting, "REAL");
         String url = "/api/public/story?id=" + IP + "&window=24";
 
         String etag = mvc(c).perform(get(url))
@@ -320,7 +320,7 @@ class PublicStoryControllerTest {
     @DisplayName("【缓存】不同 window 各自独立：6h 与 24h 不串缓存，且互不顶掉")
     void differentWindowsAreCachedSeparately() throws Exception {
         CountingStoryService counting = new CountingStoryService();
-        PublicApiController c = controller(counting, "REAL");
+        PublicApiTestAssembly c = controller(counting, "REAL");
 
         JsonNode d24 = performOK(c, "/api/public/story?id=" + IP + "&window=24").get("data");
         JsonNode d6 = performOK(c, "/api/public/story?id=" + IP + "&window=6").get("data");

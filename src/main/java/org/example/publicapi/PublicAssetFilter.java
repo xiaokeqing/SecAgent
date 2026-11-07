@@ -22,7 +22,7 @@ import java.util.regex.Pattern;
  *   <li>告警标题 / 规则名 / 蜜罐时间线 detail 里同样可能带资产名。</li>
  * </ul>
  * 字段白名单解决不了"文本里出现了什么"，所以这里再加一层词表过滤，
- * 并且做成 <b>deep-scrub</b>：{@code PublicApiController} 出海前对整棵响应树扫一遍
+ * 并且做成 <b>deep-scrub</b>：{@code PublicApiSupport} 出海前对整棵响应树扫一遍
  * （见其 {@code ship(...)}），公开包里的每个端点自动获得这层保护，
  * 将来新增端点也不会因为"忘了调过滤"而漏。
  *

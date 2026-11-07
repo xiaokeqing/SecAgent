@@ -41,20 +41,20 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 class PublicApiGeoLeakTest {
 
-    private PublicApiController controller;
+    private PublicApiTestAssembly api;
 
     @TempDir
     Path dataDir;
 
     @BeforeEach
     void setUp() {
-        controller = new PublicApiController();
+        api = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(controller, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(controller, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(controller, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(controller, "buildSha", "test");
+        ReflectionTestUtils.setField(api.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(api.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(api.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(api.support, "buildSha", "test");
     }
 
     /** 造一条"已经被地理富化过"的真实告警（srcGeo 是内部形状） */
@@ -86,11 +86,11 @@ class PublicApiGeoLeakTest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(controller, "source", source);
+        ReflectionTestUtils.setField(api.support, "source", source);
     }
 
     private MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(controller).build();
+        return api.mvc();
     }
 
     @Test
@@ -137,7 +137,7 @@ class PublicApiGeoLeakTest {
         wire(List.of(enriched("a1", "45.83.91.12", "CN|Zhejiang|Hangzhou|4134|CHINANET-BACKBONE")));
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", dataDir.toString());
-        ReflectionTestUtils.setField(controller, "auditReader", reader);
+        ReflectionTestUtils.setField(api.support, "auditReader", reader);
 
         String body = mvc().perform(get("/api/public/latest")).andExpect(status().isOk())
                 .andReturn().getResponse().getContentAsString();

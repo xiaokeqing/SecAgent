@@ -53,7 +53,7 @@ class PublicApiStoryEndpointTest {
             "firstSeen", "lastSeen", "severityMax", "severityMaxLabel", "gaps", "stages", "events",
             "eventCount", "truncated", "coverage", "commandsAvailable", "commandsNote", "limits", "note");
 
-    private PublicApiController controller(String mode, boolean honeypotWired, boolean maskIps,
+    private PublicApiTestAssembly controller(String mode, boolean honeypotWired, boolean maskIps,
                                            boolean withAudit, int maxEventsPerStage) throws Exception {
         if (withAudit) {
             AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
@@ -81,31 +81,31 @@ class PublicApiStoryEndpointTest {
         ReflectionTestUtils.setField(svc, "maxLimit", 20);
         ReflectionTestUtils.setField(svc, "selfIps", AttackStoryFixtures.IP_SELF);
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", policy);
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", reader);
-        ReflectionTestUtils.setField(c, "attackStoryService", svc);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", policy);
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", svc);
         return c;
     }
 
-    private MockMvc mvc(PublicApiController c) {
-        return MockMvcBuilders.standaloneSetup(c).addFilters(new PublicEtagFilter()).build();
+    private MockMvc mvc(PublicApiTestAssembly c) {
+        return c.builder().addFilters(new PublicEtagFilter()).build();
     }
 
-    private String body(PublicApiController c, String url) throws Exception {
+    private String body(PublicApiTestAssembly c, String url) throws Exception {
         return mvc(c).perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
 
     private String storyOf(String ip, String query) throws Exception {
-        PublicApiController c = controller("REAL", true, false, true, 40);
+        PublicApiTestAssembly c = controller("REAL", true, false, true, 40);
         return body(c, "/api/public/story?src=" + ip + (query == null ? "" : query));
     }
 
@@ -201,7 +201,7 @@ class PublicApiStoryEndpointTest {
         assertEquals(40, cov.get("maxEventsPerStage").asInt());
 
         // 未接入的段：状态必须与"接入但这段没有数据"区分开
-        PublicApiController c = controller("REAL", false, false, true, 40);
+        PublicApiTestAssembly c = controller("REAL", false, false, true, 40);
         JsonNode cov2 = mapper.readTree(body(c, "/api/public/story?src=" + AttackStoryFixtures.IP_DECOY))
                 .get("data").get("coverage");
         assertEquals("NOT_WIRED", cov2.get("honeypotLogins").get("status").asText());
@@ -229,7 +229,7 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("不在候选池 / 非法地址 / 缺参数：三种边界各有自己的 code 与 reason")
     void boundaryCases() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true, 40);
+        PublicApiTestAssembly c = controller("REAL", true, false, true, 40);
 
         // 不在池里：404（刻意不服务池外来源，避免这个端点变成"某 IP 有没有打过我们"的查询器）
         mvc(c).perform(get("/api/public/story?src=" + AttackStoryFixtures.IP_OUTSIDE_POOL))
@@ -258,7 +258,7 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("数据源不是 REAL：available=false + DATA_SOURCE_UNAVAILABLE（不返回空事件流冒充'没干过'）")
     void failClosedWhenSourceIsDown() throws Exception {
-        PublicApiController c = controller("MOCK", true, false, true, 40);
+        PublicApiTestAssembly c = controller("MOCK", true, false, true, 40);
 
         String json = body(c, "/api/public/story?src=" + AttackStoryFixtures.IP_DECOY);
         JsonNode data = mapper.readTree(json).get("data");
@@ -273,8 +273,8 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("服务未装配：available=false + STORY_DISABLED")
     void missingServiceIsReported() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true, 40);
-        ReflectionTestUtils.setField(c, "attackStoryService", null);
+        PublicApiTestAssembly c = controller("REAL", true, false, true, 40);
+        ReflectionTestUtils.setField(c.support, "attackStoryService", null);
 
         mvc(c).perform(get("/api/public/story?src=" + AttackStoryFixtures.IP_DECOY))
                 .andExpect(status().isOk())
@@ -286,7 +286,7 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("单来源事件上限：每段各自限量 → truncated=true，事件明显少于该段总量")
     void perStageCapIsEnforced() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true, 1);
+        PublicApiTestAssembly c = controller("REAL", true, false, true, 1);
 
         String json = body(c, "/api/public/story?src=" + AttackStoryFixtures.IP_HONEYPOT);
         JsonNode data = mapper.readTree(json).get("data");
@@ -303,10 +303,10 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("限流 + ETag：同一个桶、同一份快照内第二次 304")
     void rateLimitAndEtag() throws Exception {
-        PublicApiController c = controller("REAL", true, false, true, 40);
+        PublicApiTestAssembly c = controller("REAL", true, false, true, 40);
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 1);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
 
         var first = mvc(c).perform(get("/api/public/story?src=" + AttackStoryFixtures.IP_DECOY))
                 .andExpect(status().isOk())
@@ -324,7 +324,7 @@ class PublicApiStoryEndpointTest {
         // 换一个"更宽"的限流桶，验证 304 本身
         PublicRateLimiter wide = new PublicRateLimiter();
         ReflectionTestUtils.setField(wide, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", wide);
+        ReflectionTestUtils.setField(c.support, "rateLimiter", wide);
         var second = mvc(c).perform(get("/api/public/story?src=" + AttackStoryFixtures.IP_DECOY)
                         .header("If-None-Match", etag))
                 .andExpect(status().isNotModified()).andReturn();
@@ -361,7 +361,7 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("超长规则描述被截断（只给摘要，不把整段原文搬到公网）")
     void summaryIsTruncated() throws Exception {
-        PublicApiController c = controller("REAL", true, false, false, 40);
+        PublicApiTestAssembly c = controller("REAL", true, false, false, 40);
         AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
         String json = body(c, "/api/public/story?src=" + AttackStoryFixtures.IP_ALERTS_ONLY);
 
@@ -377,7 +377,7 @@ class PublicApiStoryEndpointTest {
     @Test
     @DisplayName("掩码回归：事件流里的来源地址（含文本里的）全部掩码到网段，且冻结串一致")
     void maskedTimelineMatchesGolden() throws Exception {
-        PublicApiController c = controller("REAL", true, true, false, 40);
+        PublicApiTestAssembly c = controller("REAL", true, true, false, 40);
         String json = body(c, "/api/public/story?src=" + AttackStoryFixtures.IP_DECOY);
 
         assertFalse(json.contains(AttackStoryFixtures.IP_DECOY), "掩码态不得出现完整地址：" + json);

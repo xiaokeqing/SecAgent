@@ -119,22 +119,22 @@ class PublicIpDisclosureE2ETest {
                 StandardCharsets.UTF_8);
     }
 
-    private PublicApiController controller(boolean maskIps) throws Exception {
+    private PublicApiTestAssembly controller(boolean maskIps) throws Exception {
         writeAuditFiles();
 
-        PublicApiController c = new PublicApiController();
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.of(maskIps));
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.of(maskIps));
 
         PublicAuditReader reader = new PublicAuditReader();
         ReflectionTestUtils.setField(reader, "dataDir", dataDir.toString());
         ReflectionTestUtils.setField(reader, "ipPolicy", PublicIpPolicy.of(maskIps));
-        ReflectionTestUtils.setField(c, "auditReader", reader);
+        ReflectionTestUtils.setField(c.support, "auditReader", reader);
 
         List<SecurityAlert> alerts = List.of(
                 alert("a1", ATTACKER, "web-01 上的 SSH 暴力破解"),
@@ -155,12 +155,12 @@ class PublicIpDisclosureE2ETest {
         PublicAlertSource source = new PublicAlertSource();
         ReflectionTestUtils.setField(source, "wazuhGateway", gateway);
         ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
-        ReflectionTestUtils.setField(c, "source", source);
+        ReflectionTestUtils.setField(c.support, "source", source);
         return c;
     }
 
-    private String body(PublicApiController c, String url) throws Exception {
-        MockMvc mvc = MockMvcBuilders.standaloneSetup(c).build();
+    private String body(PublicApiTestAssembly c, String url) throws Exception {
+        MockMvc mvc = c.mvc();
         return mvc.perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
     }
@@ -174,7 +174,7 @@ class PublicIpDisclosureE2ETest {
     @Test
     @DisplayName("真实态：四个端点都显示观测到的真实来源地址，且都带 ipDisclosure")
     void realModeShowsObservedAddressesOnEveryEndpoint() throws Exception {
-        PublicApiController c = controller(false);
+        PublicApiTestAssembly c = controller(false);
 
         for (String url : publicUrls()) {
             String json = body(c, url);
@@ -206,7 +206,7 @@ class PublicIpDisclosureE2ETest {
     @Test
     @DisplayName("【回归】掩码态：四个端点都回到改造前的掩码行为，口径字段标 masked=true")
     void maskedModeRestoresLegacyBehaviour() throws Exception {
-        PublicApiController c = controller(true);
+        PublicApiTestAssembly c = controller(true);
 
         for (String url : publicUrls()) {
             String json = body(c, url);
@@ -257,7 +257,7 @@ class PublicIpDisclosureE2ETest {
     @DisplayName("【核心】两种口径下、四个端点里，蜜罐口令原文与口令字段一律不出现在响应里")
     void credentialsNeverReachThePublicPayload() throws Exception {
         for (boolean maskIps : List.of(false, true)) {
-            PublicApiController c = controller(maskIps);
+            PublicApiTestAssembly c = controller(maskIps);
             for (String url : publicUrls()) {
                 String json = body(c, url);
 
@@ -300,7 +300,7 @@ class PublicIpDisclosureE2ETest {
     @Test
     @DisplayName("内部资产名从公开响应里被过滤（含告警标题与知识库引用正文路径）")
     void assetNamesAreScrubbedEverywhere() throws Exception {
-        PublicApiController c = controller(false);
+        PublicApiTestAssembly c = controller(false);
 
         String alerts = body(c, "/api/public/alerts");
         assertFalse(alerts.contains("web-01"), "告警标题里的资产名必须被过滤：" + alerts);

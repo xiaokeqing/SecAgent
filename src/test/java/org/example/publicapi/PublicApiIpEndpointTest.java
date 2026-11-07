@@ -93,26 +93,26 @@ class PublicApiIpEndpointTest {
         return svc;
     }
 
-    private PublicApiController controller(PublicIpProfileService svc, PublicAlertSource source) {
+    private PublicApiTestAssembly controller(PublicIpProfileService svc, PublicAlertSource source) {
         PublicRateLimiter limiter = new PublicRateLimiter();
         ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
 
-        PublicApiController c = new PublicApiController();
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", PublicIpPolicy.of(false));
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "ipProfileService", svc);
+        PublicApiTestAssembly c = new PublicApiTestAssembly();
+        ReflectionTestUtils.setField(c.support, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c.support, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c.support, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c.support, "buildSha", "test");
+        ReflectionTestUtils.setField(c.support, "ipPolicy", PublicIpPolicy.of(false));
+        ReflectionTestUtils.setField(c.support, "source", source);
+        ReflectionTestUtils.setField(c.support, "ipProfileService", svc);
         return c;
     }
 
-    private MockMvc mvc(PublicApiController c) {
-        return MockMvcBuilders.standaloneSetup(c).addFilters(new PublicEtagFilter()).build();
+    private MockMvc mvc(PublicApiTestAssembly c) {
+        return c.builder().addFilters(new PublicEtagFilter()).build();
     }
 
-    private JsonNode data(PublicApiController c, String url) throws Exception {
+    private JsonNode data(PublicApiTestAssembly c, String url) throws Exception {
         String body = mvc(c).perform(get(url)).andExpect(status().isOk()).andReturn()
                 .getResponse().getContentAsString(StandardCharsets.UTF_8);
         return mapper.readTree(body).path("data");
@@ -161,7 +161,7 @@ class PublicApiIpEndpointTest {
                 """);
 
         PublicAlertSource src = sourceStub(activityWithData());
-        PublicApiController c = controller(service(src), src);
+        PublicApiTestAssembly c = controller(service(src), src);
         String body = mvc(c).perform(get("/api/public/ip").param("q", IP))
                 .andExpect(status().isOk())
                 .andExpect(header().string("Cache-Control", "public, max-age=15"))
@@ -222,7 +222,7 @@ class PublicApiIpEndpointTest {
         none.put("note", "Wazuh 网关当前不是 REAL（mode=UNKNOWN）");
 
         PublicAlertSource src = sourceStub(none);
-        PublicApiController c = controller(service(src), src);
+        PublicApiTestAssembly c = controller(service(src), src);
         JsonNode data = data(c, "/api/public/ip?q=" + IP);
 
         assertFalse(data.path("available").asBoolean());
@@ -241,7 +241,7 @@ class PublicApiIpEndpointTest {
     @Test
     @DisplayName("服务未装配：降级载荷 available=false 且全 null，不 500")
     void serviceMissing() throws Exception {
-        PublicApiController c = controller(null, sourceStub(null));
+        PublicApiTestAssembly c = controller(null, sourceStub(null));
         JsonNode data = data(c, "/api/public/ip?q=" + IP);
         assertFalse(data.path("available").asBoolean());
         assertEquals("IP_PROFILE_DISABLED", data.path("reason").asText());
@@ -256,7 +256,7 @@ class PublicApiIpEndpointTest {
     @DisplayName("非法 IP / 内网地址 / 缺参数 → 400，且 no-store")
     void invalidIp() throws Exception {
         PublicAlertSource src = sourceStub(activityWithData());
-        PublicApiController c = controller(service(src), src);
+        PublicApiTestAssembly c = controller(service(src), src);
         MockMvc mvc = mvc(c);
 
         for (String[] tc : new String[][]{
