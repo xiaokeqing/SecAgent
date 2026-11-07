@@ -55,9 +55,23 @@ public class PublicEtagFilter extends OncePerRequestFilter {
     /** 只处理这个前缀下的路径；其余路径连包装都不做（零影响） */
     static final String PUBLIC_PATH_PREFIX = "/api/public/";
 
+    /**
+     * SSE 长连接路径：<b>必须</b>在包装之前排除。
+     *
+     * <p>{@link ContentCachingResponseWrapper} 会先把所有字节攒在内存里，
+     * 直到 {@code copyBodyToResponse()} 才一次性写出 —— 对普通 JSON 是透明的，
+     * 但对 {@code text/event-stream} 等于"把实时流变成了等连接结束才有输出"，
+     * 前端一个事件都收不到。所以这里原样放行，连包装都不做。
+     */
+    static final String STREAM_PATH = "/api/public/stream";
+
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
+        if (STREAM_PATH.equals(request.getRequestURI())) {
+            chain.doFilter(request, response);
+            return;
+        }
         if (!request.getRequestURI().startsWith(PUBLIC_PATH_PREFIX)) {
             chain.doFilter(request, response);
             return;

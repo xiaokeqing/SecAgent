@@ -408,6 +408,14 @@ app:
     # 为什么不复用 app.cors.allowed-origins：公网端点是匿名可达面，
     # "为了本地调试放宽界面来源"不该顺手放宽它 —— 两件事要在配置层就分开。
     allowed-origins: https://xiaokeqing.cn,https://www.xiaokeqing.cn,http://localhost:1313,http://127.0.0.1:1313
+    # ===== 作战室实时推送 /api/public/stream（SSE 长连接） =====
+    # 与上面 20 次/分钟的"请求"限流分离：一次建连只算一个请求，连接会挂很久，
+    # 用请求频率去约束长连接只会把正常用户掐断（见 RateLimitInterceptor 的精确豁免）。
+    stream:
+      tick-ms: 1000             # 调度器多久醒一次（只做"到点了吗"的判断，开销可忽略）
+      poll-ms: 15000            # 多久取一次 Wazuh 快照；与既有 @Scheduled 增量摄取同量级
+      heartbeat-ms: 15000       # 心跳注释行间隔；必须小于 CF/nginx 的空闲超时（通常 60s/100s）
+      max-clients: 200          # 单实例在线连接上限；满了返回 503 + Retry-After，不做无界排队
     # ===== P4：公开 AI 问答 / 公开知识库检索 =====
     # 这两个端点【会花钱】（问答调对话模型、检索调 embedding），所以它们有自己的一套限流，
     # 刻意不复用上面那 20 次/分钟：否则"为了页面刷新率把 20 改成 60"会顺手把花钱的端点也放宽 3 倍。

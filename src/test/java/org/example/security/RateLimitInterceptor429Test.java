@@ -69,6 +69,26 @@ class RateLimitInterceptor429Test {
     }
 
     @Test
+    @DisplayName("【核心】/api/public/stream 长连接不受 60 次/分钟请求限流（否则浏览器重连会被 429 掐断）")
+    void streamPathBypassesRequestLimit() throws Exception {
+        // limit=0 表示"任何计入窗口的请求都会 429"；stream 必须仍然放行
+        RateLimitInterceptor interceptor = interceptor(0);
+
+        MockHttpServletRequest stream = new MockHttpServletRequest("GET", "/api/public/stream");
+        stream.setRemoteAddr("203.0.113.20");
+        for (int i = 0; i < 5; i++) {
+            assertTrue(interceptor.preHandle(stream, new MockHttpServletResponse(), new Object()),
+                    "长连接不能被按分钟请求限流掐死（第 " + (i + 1) + " 次）");
+        }
+
+        // 同 IP 的普通公网端点不受这次豁免影响，仍按 20/60 次每分钟的窗口拒绝
+        MockHttpServletRequest normal = new MockHttpServletRequest("GET", "/api/public/alerts");
+        normal.setRemoteAddr("203.0.113.20");
+        assertFalse(interceptor.preHandle(normal, new MockHttpServletResponse(), new Object()),
+                "豁免只能针对 stream，不能顺手放宽其余公网端点");
+    }
+
+    @Test
     @DisplayName("额度内的请求照常放行（加了头与字段不得改变放行语义）")
     void withinLimitStillPasses() throws Exception {
         RateLimitInterceptor interceptor = interceptor(3);

@@ -41,6 +41,14 @@ public class RateLimitInterceptor implements HandlerInterceptor {
         if (!enabled || "OPTIONS".equalsIgnoreCase(request.getMethod())) {
             return true;
         }
+        // 实时推送（SSE）是长连接：一次建连只产生 1 个请求，但连接会挂几十分钟。
+        // 若把它计入按分钟滑动的请求限流，浏览器重连稍频繁一点就会收到 429，
+        // 而前端拿到的表现是"流莫名断了"——这属于"限流把长连接掐死"。
+        // 容量保护由 PublicStreamService 自己的在线连接上限（max-clients）负责，
+        // 这里精确放行这一个路径，不影响 /api/public/** 其余端点的 20 次/分钟。
+        if ("/api/public/stream".equals(request.getRequestURI())) {
+            return true;
+        }
         String ip = clientIp(request);
         boolean isLogin = request.getRequestURI().endsWith("/api/auth/login");
         int max = isLogin ? loginLimit : limit;

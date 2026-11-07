@@ -6,9 +6,11 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.web.util.ContentCachingResponseWrapper;
 
+import jakarta.servlet.http.HttpServletResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -47,6 +49,26 @@ class PublicEtagFilterTest {
             req.addHeader("If-None-Match", ifNoneMatch);
         }
         return req;
+    }
+
+    @Test
+    @DisplayName("【核心】/api/public/stream 不得被 ContentCachingResponseWrapper 包装（否则实时流被攒住）")
+    void streamIsNotBuffered() throws Exception {
+        AtomicReference<HttpServletResponse> streamResponse = new AtomicReference<>();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", "/api/public/stream"),
+                new MockHttpServletResponse(),
+                (request, response) -> streamResponse.set((HttpServletResponse) response));
+
+        assertFalse(streamResponse.get() instanceof ContentCachingResponseWrapper,
+                "SSE 长连接必须原样放行；被缓存包装后，字节要等连接结束才写出，前端一个事件都收不到");
+
+        // 反向断言：普通公网端点仍然要被包装（否则 ETag 功能被悄悄关掉，测试也发现不了）
+        AtomicReference<HttpServletResponse> normalResponse = new AtomicReference<>();
+        filter.doFilterInternal(new MockHttpServletRequest("GET", "/api/public/alerts"),
+                new MockHttpServletResponse(),
+                (request, response) -> normalResponse.set((HttpServletResponse) response));
+        assertTrue(normalResponse.get() instanceof ContentCachingResponseWrapper,
+                "普通公网端点仍应参与 ETag 缓存");
     }
 
     @Test
