@@ -14,12 +14,14 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
@@ -71,6 +73,15 @@ public class SuricataService implements SuricataGateway {
      */
     @Value("${integration.suricata.backfill-lines:20000}")
     private int backfillLines;
+    /**
+     * 缓冲快照路径（可选）：空 = 纯内存、重启即空（默认行为不变）。
+     * 非空时启动回载、每 {@link #persistIntervalMs} 落一次、优雅关闭再落一次。
+     */
+    @Value("${integration.suricata.persist-path:}")
+    private String persistPath;
+    /** 快照落盘周期（毫秒），默认 5 分钟；只在 persist-path 非空时可观察。 */
+    @Value("${integration.suricata.persist-interval-ms:300000}")
+    private long persistIntervalMs;
 
     private final ObjectMapper mapper = new ObjectMapper();
     private final EveEventParser parser = new EveEventParser(mapper);
@@ -92,11 +103,14 @@ public class SuricataService implements SuricataGateway {
     @PostConstruct
     public void init() {
         // 无论是否启用都先建好缓冲：查询入口不必到处判空，模式变化也不用重建
-        store();
+        SuricataEventStore s = store();
         if (!enabled) {
             logger.info("Suricata 对接未启用，使用内置样本");
             return;
         }
+        // 先回载上次的快照，再判 eve.json、再回填：快照是"上次关闭时的状态"，
+        // 回填补的是之后的新行，顺序反了会把旧事件排到新事件后面。
+        restoreBuffer(s);
         File f = new File(eveJsonPath);
         if (f.exists() && f.isFile() && f.canRead()) {
             this.available = true;
@@ -521,6 +535,56 @@ public class SuricataService implements SuricataGateway {
         out.put("backfilled", bf.lines());
         out.put("backfillSkipped", bf.skipped());
         return out;
+    }
+
+    // ==================== 快照落盘/回载 ====================
+
+    /**
+     * 回载启动快照到 {@code target}（{@code integration.suricata.persist-path}）。
+     *
+     * <p>任何失败（文件损坏、权限、反序列化）都只 WARN 后继续启动：快照是"重启后不必等新流量"
+     * 的锦上添花，绝不能让一个坏文件把摄取/告警链路一起带崩。
+     */
+    void restoreBuffer(SuricataEventStore target) {
+        if (persistPath == null || persistPath.isBlank()) {
+            return;
+        }
+        Path path = Path.of(persistPath.trim());
+        logger.info("Suricata 缓冲快照：{}（每 {} ms 落盘一次，关闭时再落一次）", path, persistIntervalMs);
+        try {
+            int loaded = target.loadSnapshot(path);
+            if (loaded > 0) {
+                logger.info("Suricata 缓冲快照已回载：{} 条（{}）", loaded, path);
+            }
+        } catch (Exception e) {
+            logger.warn("Suricata 缓冲快照回载失败（不影响摄取，忽略）：{} — {}", path, e.toString());
+        }
+    }
+
+    /**
+     * 把有界环快照落盘（定时 + 优雅关闭各一次）。未配置路径时是空操作。
+     *
+     * <p>失败只 WARN：磁盘满/只读/序列化异常都不该反过来影响实时摄取，下一轮再试即可。
+     */
+    @Scheduled(initialDelayString = "${integration.suricata.persist-interval-ms:300000}",
+            fixedDelayString = "${integration.suricata.persist-interval-ms:300000}")
+    public void persistBuffer() {
+        if (persistPath == null || persistPath.isBlank()) {
+            return;
+        }
+        Path path = Path.of(persistPath.trim());
+        try {
+            int saved = store().saveSnapshot(path);
+            logger.debug("Suricata 缓冲快照已落盘：{} 条（{}）", saved, path);
+        } catch (Exception e) {
+            logger.warn("Suricata 缓冲快照落盘失败（不影响摄取，下轮再试）：{} — {}", path, e.toString());
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        // 关闭时再落一次：两次定时落盘之间的最后几分钟不会因为重启而丢
+        persistBuffer();
     }
 
     /**

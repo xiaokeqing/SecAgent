@@ -59,6 +59,25 @@ public class PublicMiscController {
 
     private final PublicApiSupport support;
 
+    /** /story 进程内缓存的 TTL：60 秒（与 /metrics 的 60s 快照同一口径）。 */
+    static final long STORY_CACHE_TTL_MS = 60_000L;
+    /** 缓存格数上限：key = 端点形状 + window + 来源，正常轮换只有十几种。 */
+    static final int STORY_CACHE_MAX_ENTRIES = 32;
+
+    /**
+     * /story 与 /story?id= 共用的进程内缓存：读无锁，写用 volatile 整表替换 + 双检锁。
+     *
+     * <p>为什么整表替换而不是给每个 key 一个锁：读路径是绝大多数请求，必须无锁；写只在
+     * 未命中/过期时发生，表最多 {@value #STORY_CACHE_MAX_ENTRIES} 格，复制一张小表的代价
+     * 远小于每次请求都抢锁。键里带 window 是必须的 —— 不同窗口查的是不同的候选池与事件，
+     * 只按来源存会让 6h 的结果顶掉 24h 的（同 {@code /stories} 不共用一个 Snapshot 的理由）。
+     */
+    private volatile Map<String, StoryCacheEntry> storyCache = Map.of();
+    private final Object storyCacheLock = new Object();
+
+    private record StoryCacheEntry(Map<String, Object> payload, long storedAtMs) {
+    }
+
     public PublicMiscController(PublicApiSupport support) {
         this.support = support;
     }
@@ -201,7 +220,8 @@ public class PublicMiscController {
             return support.badRequest(res, "INVALID_SRC",
                     "src 必须是观测到的公网来源地址（IPv4/IPv6 字面量）；内网/保留地址不进入故事线");
         }
-        Map<String, Object> data = support.attackStoryService.story(ip, hours);
+        Map<String, Object> data = cachedStory(storyCacheKey("story", ip, hours),
+                () -> support.attackStoryService.story(ip, hours));
         if (data == null) {
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("code", 404);
@@ -267,7 +287,11 @@ public class PublicMiscController {
             return support.badRequest(res, "INVALID_IP",
                     "id 必须是公网 IP 字面量（IPv4/IPv6）；内网/保留地址、域名、带端口与网段写法一律不接受");
         }
-        return support.ok(buildStoryTimeline(ip, hours), res);
+        // 连投影结果一起缓存：window.start/end 每次请求都按"现在"算，只缓存上游 data 的话
+        // 响应体每秒都在变，ETag 跟着每秒变 ⇒ 再验证永远拿不到 304。整份缓存 60s 后
+        // 响应体逐字节稳定，PublicEtagFilter 才能把重复请求判成 304。
+        return support.ok(cachedStory(storyCacheKey("timeline", ip, hours),
+                () -> buildStoryTimeline(ip, hours)), res);
     }
 
     /** 把 {@link AttackStoryService#story(String, int)} 的载荷投影成时间线形状；null/不可用一律如实降级。 */
@@ -359,6 +383,48 @@ public class PublicMiscController {
         }
         String s = String.valueOf(raw).trim();
         return s.isEmpty() ? null : s;
+    }
+
+    /**
+     * 60 秒进程内缓存的取数入口：命中直接返回上次的 Map，未命中才调 loader。
+     *
+     * <p>payload 允许为 null（= 该来源不在当前窗口的候选池里）：同一个 404 在窗口内
+     * 也不必反复打索引进而保住"重复请求不打后端"。返回的 Map 不会在本类里被修改
+     * （{@link PublicApiSupport#ok(Map, jakarta.servlet.http.HttpServletResponse)} 的
+     * {@code ship(...)} 做的是深拷贝），所以缓存同一个实例是安全的。
+     *
+     * <p>双检锁：并发未命中时只有一个线程回源，其余线程在锁内看到刚写入的条目后直接返回。
+     */
+    Map<String, Object> cachedStory(String key, Supplier<Map<String, Object>> loader) {
+        long now = System.currentTimeMillis();
+        StoryCacheEntry hit = storyCache.get(key);
+        if (hit != null && now - hit.storedAtMs() < STORY_CACHE_TTL_MS) {
+            return hit.payload();
+        }
+        synchronized (storyCacheLock) {
+            now = System.currentTimeMillis();
+            hit = storyCache.get(key);
+            if (hit != null && now - hit.storedAtMs() < STORY_CACHE_TTL_MS) {
+                return hit.payload();
+            }
+            Map<String, Object> payload = loader.get();
+            Map<String, StoryCacheEntry> next = new LinkedHashMap<>(storyCache);
+            next.remove(key);
+            if (next.size() >= STORY_CACHE_MAX_ENTRIES) {
+                // 丢最早写入的一格：这里不是 LRU（读者无锁，维护访问顺序要抢锁），
+                // 但窗口+来源的组合本来就只有十几种，够用且不会让缓存无界。
+                next.remove(next.keySet().iterator().next());
+            }
+            next.put(key, new StoryCacheEntry(payload, System.currentTimeMillis()));
+            storyCache = Collections.unmodifiableMap(next);
+            return payload;
+        }
+    }
+
+    /** 缓存键：window 用解析后的小时数归一（{@code 24} 与 {@code 24h} 命中同一格），形状区分两个端点。 */
+    static String storyCacheKey(String shape, String ip, int hours) {
+        String normalized = ip == null ? "" : ip.trim().toLowerCase(java.util.Locale.ROOT);
+        return shape + "|" + hours + "|" + normalized;
     }
 
     /**

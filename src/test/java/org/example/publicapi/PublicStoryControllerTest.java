@@ -15,7 +15,10 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,6 +51,42 @@ class PublicStoryControllerTest {
     Path tmp;
 
     private PublicApiController controller(boolean withStoryService, String mode) throws Exception {
+        return controller(withStoryService ? defaultStoryService(mode) : null, mode);
+    }
+
+    /**
+     * 用指定（可能是计数子类）的故事线服务装配控制器。
+     *
+     * <p>缓存用例必须拿到同一个服务实例：只比对两次响应体是否相同，证明不了"第二次没有回源"
+     * （上游本来就是确定性的），所以要用计数子类把回源次数钉死。
+     */
+    private PublicApiController controller(AttackStoryService storyService, String mode) throws Exception {
+        AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
+        PublicIpPolicy policy = PublicIpPolicy.of(false);
+
+        PublicAuditReader reader = new PublicAuditReader();
+        ReflectionTestUtils.setField(reader, "dataDir", tmp.toString());
+        ReflectionTestUtils.setField(reader, "ipPolicy", policy);
+
+        PublicAlertSource source = new PublicAlertSource();
+        ReflectionTestUtils.setField(source, "wazuhGateway", AttackStoryFixtures.gateway(mode, true));
+        ReflectionTestUtils.setField(source, "aggregator", new AlertAggregationService());
+
+        PublicApiController c = new PublicApiController();
+        PublicRateLimiter limiter = new PublicRateLimiter();
+        ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
+        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
+        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
+        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
+        ReflectionTestUtils.setField(c, "buildSha", "test");
+        ReflectionTestUtils.setField(c, "ipPolicy", policy);
+        ReflectionTestUtils.setField(c, "source", source);
+        ReflectionTestUtils.setField(c, "auditReader", reader);
+        ReflectionTestUtils.setField(c, "attackStoryService", storyService);
+        return c;
+    }
+
+    private AttackStoryService defaultStoryService(String mode) throws Exception {
         AttackStoryFixtures.writeAudit(tmp, LocalDateTime.now());
         PublicIpPolicy policy = PublicIpPolicy.of(false);
 
@@ -68,19 +107,7 @@ class PublicStoryControllerTest {
         ReflectionTestUtils.setField(svc, "maxEventsPerStage", 40);
         ReflectionTestUtils.setField(svc, "maxLimit", 20);
         ReflectionTestUtils.setField(svc, "selfIps", AttackStoryFixtures.IP_SELF);
-
-        PublicApiController c = new PublicApiController();
-        PublicRateLimiter limiter = new PublicRateLimiter();
-        ReflectionTestUtils.setField(limiter, "requestsPerMinute", 20);
-        ReflectionTestUtils.setField(c, "rateLimiter", limiter);
-        ReflectionTestUtils.setField(c, "cacheSeconds", 15);
-        ReflectionTestUtils.setField(c, "exposeBuildSha", false);
-        ReflectionTestUtils.setField(c, "buildSha", "test");
-        ReflectionTestUtils.setField(c, "ipPolicy", policy);
-        ReflectionTestUtils.setField(c, "source", source);
-        ReflectionTestUtils.setField(c, "auditReader", reader);
-        ReflectionTestUtils.setField(c, "attackStoryService", withStoryService ? svc : null);
-        return c;
+        return svc;
     }
 
     private MockMvc mvc(PublicApiController c) {
@@ -258,5 +285,81 @@ class PublicStoryControllerTest {
 
         mvc(c).perform(get("/api/public/story?id=" + IP).header("If-None-Match", etag))
                 .andExpect(status().isNotModified());
+    }
+
+    // ==================== 6. 60 秒进程内缓存 ====================
+
+    @Test
+    @DisplayName("【缓存】同参数第二次请求命中 60s 缓存：不再回源，条件请求 304")
+    void repeatedRequestHitsStoryCache() throws Exception {
+        CountingStoryService counting = new CountingStoryService();
+        PublicApiController c = controller(counting, "REAL");
+        String url = "/api/public/story?id=" + IP + "&window=24";
+
+        String etag = mvc(c).perform(get(url))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getHeader("ETag");
+        assertEquals(1, counting.calls(), "第一次请求必须回源一次");
+        assertTrue(etag != null && etag.startsWith("\""), "缓存路径仍要发 ETag：" + etag);
+
+        mvc(c).perform(get(url)).andExpect(status().isOk());
+        assertEquals(1, counting.calls(), "第二次同参数必须命中缓存，不能再打故事线服务");
+
+        mvc(c).perform(get(url).header("If-None-Match", etag))
+                .andExpect(status().isNotModified());
+        assertEquals(1, counting.calls(), "304 响应同样不得回源");
+
+        // 老 ?src= 契约共用同一个缓存器，但键形状不同（各占一格）：同参数两次也只回源一次
+        String legacy = "/api/public/story?src=" + IP + "&window=24";
+        mvc(c).perform(get(legacy)).andExpect(status().isOk());
+        mvc(c).perform(get(legacy)).andExpect(status().isOk());
+        assertEquals(2, counting.calls(), "?src= 变体也必须命中缓存");
+    }
+
+    @Test
+    @DisplayName("【缓存】不同 window 各自独立：6h 与 24h 不串缓存，且互不顶掉")
+    void differentWindowsAreCachedSeparately() throws Exception {
+        CountingStoryService counting = new CountingStoryService();
+        PublicApiController c = controller(counting, "REAL");
+
+        JsonNode d24 = performOK(c, "/api/public/story?id=" + IP + "&window=24").get("data");
+        JsonNode d6 = performOK(c, "/api/public/story?id=" + IP + "&window=6").get("data");
+
+        assertEquals(24, d24.get("window").get("hours").asInt(), "24h 必须按 24h 回源：" + d24);
+        assertEquals(6, d6.get("window").get("hours").asInt(), "6h 必须按 6h 回源：" + d6);
+        assertEquals(2, counting.calls(), "两个窗口各回源一次（若共用一个键，第二次会复用 24h 的数据）");
+
+        // 回头再打 24h：命中的是它自己那格，不拿 6h 的结果、也不再回源
+        JsonNode again = performOK(c, "/api/public/story?id=" + IP + "&window=24").get("data");
+        assertEquals(24, again.get("window").get("hours").asInt());
+        assertEquals(2, counting.calls(), "两个窗口的缓存格里都有值，后续请求都不应回源");
+    }
+
+    /**
+     * 只数回源次数的故事线桩：缓存命中与否在响应体上看不出来（上游本身确定性），
+     * 必须把"有没有真的调用"钉死。载荷形状与 {@code AttackStoryService.story} 一致。
+     */
+    static final class CountingStoryService extends AttackStoryService {
+
+        private final AtomicInteger calls = new AtomicInteger();
+
+        int calls() {
+            return calls.get();
+        }
+
+        @Override
+        public Map<String, Object> story(String srcIp, int windowHours) {
+            calls.incrementAndGet();
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("available", true);
+            out.put("id", srcIp);
+            out.put("total", 0);
+            out.put("events", List.of());
+            out.put("firstSeen", null);
+            out.put("lastSeen", null);
+            // 固定值：响应体不随时间变，ETag 才能稳定（真实实现里 generatedAt 也是写死的）
+            out.put("generatedAt", "2026-01-01 00:00:00");
+            return out;
+        }
     }
 }

@@ -8,6 +8,7 @@
 #   flush                          清空两个集合（误封止血）
 #   status                         查看后端与集合条目
 #   add <ip> / delete <ip>         兼容旧协议（v1 客户端）
+#   gc                             扫状态文件里的过期项并删对应规则（cron 可每 5 分钟跑一次）
 #
 # 为什么用 ipset 而不是逐条 iptables -s：
 #   1) 集合匹配是 O(1) 哈希查找，规则条数与包处理开销无关；
@@ -50,7 +51,7 @@ read -r ACTION A B C D <<< "$RAW"
 
 # ---- action 精确白名单 ----
 case "$ACTION" in
-  block|unblock|flush|status|add|delete) ;;
+  block|unblock|flush|status|add|delete|gc) ;;
   *) deny "非法 action: $ACTION" ;;
 esac
 
@@ -75,7 +76,7 @@ case "$ACTION" in
     ;;
   add)      need_ip; no_extra; IP="$A" ;;
   unblock|delete) need_ip; no_extra; IP="$A" ;;
-  flush|status)
+  flush|status|gc)
     [ -z "${A:-}" ] && [ -z "${B:-}" ] && [ -z "${C:-}" ] && [ -z "${D:-}" ] || deny "参数过多"
     ;;
 esac
@@ -142,6 +143,42 @@ SET=""
 IFC=""
 if [ "$VER" = "6" ]; then SET=$SET_V6; IFC=ip6tables; else SET=$SET_V4; IFC=iptables; fi
 
+# ---- gc：扫状态文件里过期条目，删掉对应的逐条 iptables 规则 ----
+# 为什么要有它：回退路径下每条 -s DROP 都没有内核级 TTL，到期清理原来只发生在
+#   "下一次调用本脚本"时（sweep_fallback）。如果封禁后再也没有新封禁/解封，过期规则就一直留着。
+#   加一条 cron 友好的 gc，清理就不再依赖后续流量。
+# 约束：只删状态文件里登记过的 IP。文件之外的 INPUT DROP 一律不碰 —— 那可能是运维手写的规则，
+#   误删等于在防火墙上开一个洞。没有状态文件时什么都不做（也不创建），退出码 0。
+if [ "$ACTION" = "gc" ]; then
+  now=$(date +%s)
+  expired=0
+  remaining=0
+  if [ -f "$STATE_FILE" ]; then
+    tmp=$(mktemp)
+    while IFS='|' read -r ver ip exp; do
+      [ -n "$ip" ] || continue
+      if [ "${exp:-0}" -le "$now" ] 2>/dev/null; then
+        if [ "$ver" = "6" ]; then
+          ip6tables -D INPUT -s "$ip" -j DROP 2>/dev/null || true
+        else
+          iptables -D INPUT -s "$ip" -j DROP 2>/dev/null || true
+        fi
+        audit "EXPIRE $ip"
+        expired=$((expired + 1))
+      else
+        echo "$ver|$ip|$exp" >> "$tmp"
+        remaining=$((remaining + 1))
+      fi
+    done < "$STATE_FILE"
+    # cat 覆盖而不是 mv：保留原文件的属主与 600 权限
+    cat "$tmp" > "$STATE_FILE"
+    rm -f "$tmp"
+  fi
+  audit "GC expired=$expired remaining=$remaining"
+  echo "OK gc backend=iptables expired=$expired remaining=$remaining"
+  exit 0
+fi
+
 # ---- 无 ipset 时的回退：逐条 -s 规则 + 到期清理 ----
 sweep_fallback() {
   [ -f "$STATE_FILE" ] || return 0
@@ -207,11 +244,13 @@ else
   sweep_fallback
   case "$ACTION" in
     block|add)
-      $IFC -C INPUT -s "$IP" -j DROP 2>/dev/null || $IFC -I INPUT 1 -s "$IP" -j DROP
-      # 去掉旧记录再写新的（同一 IP 续封要更新到期时间）
+      # 顺序很重要：先落状态条目，再插规则。反过来的话，进程在两步之间被杀就会得到
+      # "规则已生效、却没有到期记录"的永久封禁 —— 正是这次要根治的问题。
+      # 反过来失败是安全的：条目先写、规则没插上，到期后 -D 删不到东西也只是空操作。
       grep -vF "|$IP|" "$STATE_FILE" > "$STATE_FILE.tmp" || true
       mv "$STATE_FILE.tmp" "$STATE_FILE"
       echo "$VER|$IP|$(( $(date +%s) + TTL ))" >> "$STATE_FILE"
+      $IFC -C INPUT -s "$IP" -j DROP 2>/dev/null || $IFC -I INPUT 1 -s "$IP" -j DROP
       audit "BLOCK $IP ttl=${TTL}s backend=iptables reason=${REASON:-auto}"
       echo "OK block $IP ttl=${TTL}s backend=iptables"
       ;;
@@ -236,7 +275,10 @@ else
       ;;
     status)
       echo "backend=iptables"
-      echo "active=$(grep -c '|' "$STATE_FILE" 2>/dev/null || true)"
+      # grep -c 在 0 条时退出码是 1：直接塞进 $() 会得到空串（旧版 bug），
+      # 用一个可失败赋值兜底成 0。
+      active=$(grep -c '|' "$STATE_FILE" 2>/dev/null) || active=0
+      echo "active=$active"
       ;;
   esac
 fi

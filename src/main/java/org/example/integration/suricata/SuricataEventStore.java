@@ -1,7 +1,20 @@
 package org.example.integration.suricata;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.example.core.model.SecurityAlert;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -30,6 +43,17 @@ import java.util.function.Function;
  * 这是给 HTTP 层用的，查不到就是查不到，不该变成 500。
  */
 public final class SuricataEventStore {
+
+    private static final Logger logger = LoggerFactory.getLogger(SuricataEventStore.class);
+
+    /**
+     * 快照序列化器：record 直接用 Jackson，Instant 要 JavaTimeModule（默认 ObjectMapper
+     * 不认 java.time，且会把 Instant 写成时间戳 —— 关掉时间戳，快照文件才可读/可 grep）。
+     * 配置完成后 ObjectMapper 是线程安全的，静态共用一个即可。
+     */
+    private static final ObjectMapper SNAPSHOT_MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
     private final int capacity;
     private final BoundedRingBuffer<FlowEvent> flows;
@@ -199,5 +223,114 @@ public final class SuricataEventStore {
             out.add(factory.apply(e.getKey(), e.getValue()));
         }
         return Collections.unmodifiableList(out);
+    }
+
+    // ==================== 快照落盘（重启不空） ====================
+
+    /**
+     * 把五个桶的当前内容写成快照文件，返回写入条数。
+     *
+     * <p>行格式：{@code 类型<TAB>JSON}。类型标签按桶归属取（而不是 {@code eventType()}），
+     * 因为 flow 桶同时装着 "flow" 与 "netflow" 两种事件，回载时只认得同一个类。
+     *
+     * <p>先写同目录 .tmp 再原子替换：进程写到一半被杀，上一次的完整快照仍然可用。
+     */
+    public int saveSnapshot(Path path) throws IOException {
+        List<EveEvent> events = allSnapshot();
+        Path absolute = path.toAbsolutePath();
+        Path parent = absolute.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Path tmp = absolute.resolveSibling(absolute.getFileName() + ".tmp");
+        try (BufferedWriter writer = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
+            for (EveEvent event : events) {
+                writer.write(typeTag(event));
+                writer.write('\t');
+                writer.write(SNAPSHOT_MAPPER.writeValueAsString(event));
+                writer.write('\n');
+            }
+        }
+        try {
+            Files.move(tmp, absolute, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            // 容器 overlay / 某些网络盘不支持原子 rename，退化为普通替换。
+            Files.move(tmp, absolute, StandardCopyOption.REPLACE_EXISTING);
+        }
+        return events.size();
+    }
+
+    /**
+     * 回载快照到本 store，返回成功读入的条数；文件不存在返回 0（首次启动的正常路径）。
+     *
+     * <p>单行坏了只跳过这一行：上次落盘可能正好被杀在最后一行中间，截断的末行不该让
+     * 整份快照作废；未知类型标签同理（旧版本写的标签）。两条路径都只 WARN。
+     */
+    public int loadSnapshot(Path path) throws IOException {
+        if (path == null || !Files.isRegularFile(path)) {
+            return 0;
+        }
+        int loaded = 0;
+        int skipped = 0;
+        try (BufferedReader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isBlank()) {
+                    continue;
+                }
+                int tab = line.indexOf('\t');
+                if (tab <= 0 || tab == line.length() - 1) {
+                    skipped++;
+                    continue;
+                }
+                EveEvent event = decode(line.substring(0, tab), line.substring(tab + 1));
+                if (event == null) {
+                    skipped++;
+                    continue;
+                }
+                add(event);
+                loaded++;
+            }
+        }
+        if (skipped > 0) {
+            logger.warn("Suricata 缓冲快照有 {} 行无法解析，已跳过：{}", skipped, path);
+        }
+        return loaded;
+    }
+
+    /** 快照行的类型标签：按桶归属取名，netflow 与 flow 同桶同标签。 */
+    private static String typeTag(EveEvent event) {
+        if (event instanceof FlowEvent) {
+            return "flow";
+        }
+        if (event instanceof HttpEvent) {
+            return "http";
+        }
+        if (event instanceof DnsEvent) {
+            return "dns";
+        }
+        if (event instanceof TlsEvent) {
+            return "tls";
+        }
+        if (event instanceof AlertEvent) {
+            return "alert";
+        }
+        return "unknown";
+    }
+
+    private static EveEvent decode(String type, String json) {
+        try {
+            return switch (type) {
+                case "flow" -> SNAPSHOT_MAPPER.readValue(json, FlowEvent.class);
+                case "http" -> SNAPSHOT_MAPPER.readValue(json, HttpEvent.class);
+                case "dns" -> SNAPSHOT_MAPPER.readValue(json, DnsEvent.class);
+                case "tls" -> SNAPSHOT_MAPPER.readValue(json, TlsEvent.class);
+                case "alert" -> SNAPSHOT_MAPPER.readValue(json, AlertEvent.class);
+                default -> null;
+            };
+        } catch (IOException e) {
+            logger.warn("Suricata 缓冲快照行反序列化失败（type={}）：{}", type, e.toString());
+            return null;
+        }
     }
 }
