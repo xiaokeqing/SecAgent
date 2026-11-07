@@ -38,6 +38,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +74,12 @@ public class PublicApiController {
     private static final Logger logger = LoggerFactory.getLogger(PublicApiController.class);
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter HOUR_FMT = DateTimeFormatter.ofPattern("HH:mm");
+
+    /** 时间线端点最多返回的事件条数（前端时间线一屏上限；total 仍给窗口内真实条数）。 */
+    private static final int TIMELINE_MAX_EVENTS = 200;
+
+    /** 时间线端点数据源不可用时的统一 reason（与既有公开端点的"不编数据"口径一致）。 */
+    private static final String TIMELINE_REASON_UNAVAILABLE = "数据源不可用";
 
     /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link #tts}） */
     private static final MediaType TTS_AUDIO = MediaType.parseMediaType("audio/mpeg");
@@ -1461,6 +1468,148 @@ public class PublicApiController {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
         }
         return ok(data, res);
+    }
+
+    /**
+     * <b>一个 IP 的攻击链时间线（前端时间线视图专用，{@code ?id=} 变体）</b>。
+     *
+     * <p>与上面 {@code /story?src=} 的关系：同一条数据通路、同一个候选池口径
+     * （{@link AttackStoryService#story(String, int)}），区别只在投影 —— 老端点给
+     * {@code stages/coverage/gaps} 这类"覆盖度"字段，供"攻击故事"详情页解释每段接没接上；
+     * 本变体只给前端时间线要的扁平 {@code events[]}，字段名按时间线约定
+     * （{@code time/kind/rule/src/sev/count/detail}），并附四档严重度计数。
+     *
+     * <h3>形状约定（写进了 {@code PublicStoryControllerTest}）</h3>
+     * <ul>
+     *   <li>事件按时间<b>正序</b>，最多 {@value #TIMELINE_MAX_EVENTS} 条；{@code total} 是窗口内真实条数，
+     *       不因截断而改小；</li>
+     *   <li>数据源不可用 / 服务未装配 → {@code available:false} + {@code reason:"数据源不可用"}，
+     *       {@code total:0}、{@code events:[]}、四档计数全 0 —— 不拿样本或 0 值冒充"没有攻击"；</li>
+     *   <li>{@code id} 按 {@link PublicIpPolicy} 口径显示；{@code src} 用同一个显示值；</li>
+     *   <li>复用同一个限流器、CORS 白名单、ETag 过滤器与 {@code ok(...)}（自动带 {@code ipDisclosure}
+     *       与内部资产名过滤），不新增任何公开面机制。</li>
+     * </ul>
+     *
+     * <p>用 {@code params="id"} 与既有的 {@code /story?src=} 区分：不带 {@code id} 的请求仍走老 handler，
+     * 因此两个契约可以共存于同一路径；显式同时带 {@code id} 与 {@code src} 时本变体优先。
+     */
+    @GetMapping(value = {"/story", "/story.js"}, params = "id")
+    public ResponseEntity<Map<String, Object>> storyTimeline(
+            @RequestParam(value = "id", required = false) String id,
+            @RequestParam(value = "window", required = false) String window,
+            HttpServletRequest req, HttpServletResponse res) {
+        if (!rateLimiter.allow(clientIp(req))) {
+            return tooMany(res);
+        }
+        Integer hours = AttackStoryService.parseWindowHours(window);
+        if (hours == null) {
+            return badRequest(res, "WINDOW_NOT_SUPPORTED",
+                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
+                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
+                            + "；其它窗口没有数据源验证，不猜）");
+        }
+        String ip = id == null ? "" : id.trim();
+        if (ip.isEmpty()) {
+            return badRequest(res, "MISSING_ID",
+                    "缺少 id 参数：要画时间线的 IP，例如 /api/public/story?id=45.155.205.233");
+        }
+        // 与老 /story 同一个公网字面量口径：形状不对直接 400，不拿它去查任何东西
+        if (!AttackStoryService.isPublicIp(ip)) {
+            return badRequest(res, "INVALID_IP",
+                    "id 必须是公网 IP 字面量（IPv4/IPv6）；内网/保留地址、域名、带端口与网段写法一律不接受");
+        }
+        return ok(buildStoryTimeline(ip, hours), res);
+    }
+
+    /** 把 {@link AttackStoryService#story(String, int)} 的载荷投影成时间线形状；null/不可用一律如实降级。 */
+    private Map<String, Object> buildStoryTimeline(String ip, int hours) {
+        LocalDateTime now = LocalDateTime.now();
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("id", policy().display(ip));
+        Map<String, Object> story = attackStoryService == null ? null : attackStoryService.story(ip, hours);
+        if (story == null || !Boolean.TRUE.equals(story.get("available"))) {
+            return timelineUnavailable(data, hours, now);
+        }
+
+        List<?> rawEvents = story.get("events") instanceof List<?> l ? l : List.of();
+        List<Map<String, Object>> events = new ArrayList<>();
+        Map<String, Integer> severity = emptySeverity();
+        for (Object raw : rawEvents) {
+            if (!(raw instanceof Map<?, ?> m)) {
+                continue;
+            }
+            String sev = timelineText(m.get("severity"));
+            if (sev != null && severity.containsKey(sev)) {
+                severity.merge(sev, 1, Integer::sum);
+            }
+            if (events.size() >= TIMELINE_MAX_EVENTS) {
+                continue;
+            }
+            Map<String, Object> event = new LinkedHashMap<>();
+            event.put("time", timelineText(m.get("ts")));
+            // stage 是机器可读的四段标识（alerts/decoyPorts/honeypotLogins/auditActions）
+            event.put("kind", timelineText(m.get("stage")));
+            // kind 是 ATT&CK 式的事件类型（暴力破解/诱饵端口/登录尝试/处置动作）
+            event.put("rule", timelineText(m.get("kind")));
+            event.put("src", policy().display(ip));
+            event.put("sev", sev);
+            event.put("count", 1);
+            event.put("detail", timelineText(m.get("summary")));
+            events.add(event);
+        }
+        // 服务端已按 ts 升序排过；这里再排一次，保证"本端点按时间正序"不依赖上游实现细节
+        events.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("time"),
+                Comparator.nullsLast(Comparator.naturalOrder())));
+
+        Map<String, Object> window = timelineWindow(hours, now);
+        data.put("available", true);
+        data.put("reason", null);
+        data.put("total", rawEvents.size());
+        data.put("window", window);
+        data.put("firstSeen", timelineText(story.get("firstSeen")));
+        data.put("lastSeen", timelineText(story.get("lastSeen")));
+        data.put("severity", severity);
+        data.put("events", events);
+        return data;
+    }
+
+    /** 数据不足/数据源不可用：仍然是完整形状，但一个事件都不编。 */
+    private Map<String, Object> timelineUnavailable(Map<String, Object> data, int hours, LocalDateTime now) {
+        data.put("available", false);
+        data.put("reason", TIMELINE_REASON_UNAVAILABLE);
+        data.put("total", 0);
+        data.put("window", timelineWindow(hours, now));
+        data.put("firstSeen", null);
+        data.put("lastSeen", null);
+        data.put("severity", emptySeverity());
+        data.put("events", List.of());
+        return data;
+    }
+
+    /** 四档严重度计数固定按 CRITICAL/HIGH/MEDIUM/LOW 顺序输出；INFO 不属于这四档，不混进来。 */
+    private static Map<String, Integer> emptySeverity() {
+        Map<String, Integer> severity = new LinkedHashMap<>();
+        severity.put(AlertSeverity.CRITICAL.name(), 0);
+        severity.put(AlertSeverity.HIGH.name(), 0);
+        severity.put(AlertSeverity.MEDIUM.name(), 0);
+        severity.put(AlertSeverity.LOW.name(), 0);
+        return severity;
+    }
+
+    private static Map<String, Object> timelineWindow(int hours, LocalDateTime now) {
+        Map<String, Object> window = new LinkedHashMap<>();
+        window.put("hours", hours);
+        window.put("start", now.minusHours(hours).format(FMT));
+        window.put("end", now.format(FMT));
+        return window;
+    }
+
+    private static String timelineText(Object raw) {
+        if (raw == null) {
+            return null;
+        }
+        String s = String.valueOf(raw).trim();
+        return s.isEmpty() ? null : s;
     }
 
     /**

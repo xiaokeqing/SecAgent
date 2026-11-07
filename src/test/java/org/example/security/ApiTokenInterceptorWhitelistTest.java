@@ -123,6 +123,7 @@ class ApiTokenInterceptorWhitelistTest {
 
         assertTrue(preHandle("GET", "/api/public/overview"), "/api/public/** 应放行其子路径");
         assertTrue(preHandle("GET", "/api/public/alerts/agg-abc123"), "多层子路径同样应放行");
+        assertTrue(preHandle("GET", "/api/public/story"), "新增的公开时间线端点必须被 /api/public/** 覆盖");
         assertTrue(preHandle("GET", "/api/public"), "前缀本身（不带斜杠）应放行");
 
         assertFalse(preHandle("GET", "/api/public-admin/x"),
