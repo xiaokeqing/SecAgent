@@ -76,6 +76,9 @@ class ApiTokenInterceptorWhitelistTest {
         assertFalse(preHandle("POST", "/api/response/block"), "/api/response/block 需要鉴权");
         assertFalse(preHandle("GET", "/api/kb/pending"), "/api/kb/pending 需要鉴权");
         assertFalse(preHandle("GET", "/api/response/audit"), "/api/response/audit 需要鉴权");
+        // 时效指标会暴露"我们多久才发现/处置一次攻击"，与 /api/sec/conn 同权限：登录才能看
+        assertFalse(preHandle("GET", "/api/sec/metrics/summary"),
+                "/api/sec/metrics/summary 必须登录，不能进白名单");
         // 通知中枢的入口绝不能在白名单里：否则任何人只要能连到 9900，
         // 就能伪造"系统降级/看门狗已回滚"这类高危通知（通知通道本身就变成了攻击面）
         assertFalse(preHandle("POST", "/api/notify/watchdog-rollback"),
