@@ -36,6 +36,9 @@ public class PublicMetricsController {
 
     private static final List<Integer> ALLOWED_HOURS = List.of(1, 6, 24, 72);
 
+    /** 单次 summary() 要现查 Wazuh 24h 窗口（实测 ~10 s），但结果 60 秒内几乎不变 ⇒ 进程内缓存。 */
+    private static final long CACHE_TTL_MS = 60_000L;
+
     private final PublicApiSupport support;
     private final MetricsSummaryService metricsSummaryService;
 
@@ -68,7 +71,7 @@ public class PublicMetricsController {
 
         Map<String, Object> full;
         try {
-            full = metricsSummaryService.summary(hours);
+            full = summaryCached(hours);
         } catch (RuntimeException e) {
             return support.ok(publicData(hours, unavailable("数据源不可用"), unavailable("数据源不可用"),
                     new LinkedHashMap<>()), res);
@@ -92,8 +95,34 @@ public class PublicMetricsController {
         return support.ok(data, res);
     }
 
-    /** 只留中位数 / 样本数 / 单位；worst、dropped 一律不出门。 */
-    @SuppressWarnings("unchecked")
+    /**
+     * 60 秒进程内缓存（只缓存"最近一次成功"的结果，异常不缓存，避免把故障写死一分钟）。
+     * 单实例、只读、可重复计算 ⇒ 用最简单的 volatile + 时间戳，不引缓存框架。
+     */
+    private Map<String, Object> summaryCached(int hours) {
+        long now = System.currentTimeMillis();
+        Map<String, Object> hit = cache;
+        if (hit != null && cacheHours == hours && now - cacheAtMs < CACHE_TTL_MS) {
+            return hit;
+        }
+        synchronized (this) {
+            now = System.currentTimeMillis();
+            if (cache != null && cacheHours == hours && now - cacheAtMs < CACHE_TTL_MS) {
+                return cache;
+            }
+            Map<String, Object> fresh = metricsSummaryService.summary(hours);
+            cache = fresh;
+            cacheHours = hours;
+            cacheAtMs = System.currentTimeMillis();
+            return fresh;
+        }
+    }
+
+    private volatile Map<String, Object> cache;
+    private volatile int cacheHours = -1;
+    private volatile long cacheAtMs;
+
+    /** 只留中位数 / 样本数 / 单位；worst、dropped 一律不出门。 */    @SuppressWarnings("unchecked")
     private static Map<String, Object> sanitizeMetric(Object raw) {
         if (!(raw instanceof Map<?, ?> m)) {
             return unavailable("数据源不可用");
