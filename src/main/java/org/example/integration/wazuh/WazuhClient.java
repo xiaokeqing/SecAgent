@@ -670,6 +670,41 @@ public class WazuhClient {
         }
     }
 
+    /**
+     * 读取 indexer 的索引统计（{@code _cat/indices}，只读）。
+     *
+     * <p>为什么走 {@code _cat/indices} 而不是 {@code _search}：公开索引面板要的是
+     * "每个日索引多少条、占多少磁盘"，这是集群元数据，不是告警内容 ——
+     * 用 {@code size=0&track_total_hits} 逐索引查一遍既慢又会把节点压出热点。
+     *
+     * <p>{@code bytes=b} 让 {@code store.size} 直接是字节数（默认会给人读的 "12.3gb"，
+     * 在 Java 里再解析一遍单位只会引入四舍五入误差）。{@code h=} 只取需要的三列，
+     * 避免把索引设置（settings/mappings 可能很大）搬进应用进程。
+     *
+     * @param indexPattern 索引模式，如 {@code wazuh-alerts-*}
+     * @return 形如 {@code [{"index":"wazuh-alerts-4.x-2026.11.01","docs.count":"123","store.size":"456"}]}
+     */
+    public JsonNode catIndices(String indexPattern) throws IOException {
+        if (indexerUrl == null || indexerHttp == null) {
+            throw new IOException("未配置 Wazuh indexer 地址");
+        }
+        String pattern = (indexPattern == null || indexPattern.isBlank())
+                ? "wazuh-alerts-*" : indexPattern.trim();
+        Request req = new Request.Builder()
+                .url(indexerUrl + "/_cat/indices/" + pattern
+                        + "?format=json&bytes=b&h=index,docs.count,store.size")
+                .header("Authorization", indexerAuthHeader != null ? indexerAuthHeader : authHeader)
+                .get()
+                .build();
+        try (Response resp = bounded(DEP_INDEXER, () -> indexerHttp.newCall(req).execute())) {
+            String respBody = readBody(resp);
+            if (!resp.isSuccessful()) {
+                throw new IOException("indexer 查询索引统计失败 HTTP " + resp.code() + ": " + snippet(respBody));
+            }
+            return mapper.readTree(respBody);
+        }
+    }
+
     /** 拉取 manager 日志（取证用）。 */
     public JsonNode fetchManagerLogs(String query, int limit) throws IOException {
         StringBuilder path = new StringBuilder("/manager/logs?limit=" + Math.max(1, limit));

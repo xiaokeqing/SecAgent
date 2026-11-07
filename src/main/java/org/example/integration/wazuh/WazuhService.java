@@ -16,6 +16,7 @@ import org.springframework.stereotype.Service;
 import jakarta.annotation.PostConstruct;
 import org.springframework.scheduling.annotation.Scheduled;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -1106,6 +1107,96 @@ public class WazuhService implements WazuhGateway {
             logger.warn("来源 IP 分布查询失败（公开地理端点将如实降级）：{}", e.getMessage());
             return org.example.geoip.GeoWindow.unavailable("QUERY_FAILED",
                     "来源分布聚合查询失败（" + e.getMessage() + "）；这不是'没有攻击'，前端应显示降级");
+        }
+    }
+
+    /**
+     * 最近 N 天 Wazuh <b>日索引</b>的条目数与磁盘占用（公开"索引占用"面板的取数口径）。
+     *
+     * <p>为什么按索引名里的日期过滤：{@code _cat/indices/wazuh-alerts-*} 会把模板索引、
+     * 别名、以及其它管道写进来的索引一并返回；把它们算进"最近 7 天占用"，
+     * 面板上的数字就对不上 retention 配置。只有 {@code ...-2026.11.07} 这种日索引才计入。
+     *
+     * <p><b>绝不编数</b>：客户端未就绪 / 查询失败 / 响应不是数组一律 {@code available=false}；
+     * 某个日索引缺 {@code store.size} 时按 0 计并在 note 里点名，而不是拿 docs × 经验体积去估。
+     */
+    @Override
+    public Map<String, Object> alertIndices(int days) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("available", false);
+        if (client == null) {
+            out.put("reason", "CLIENT_NOT_READY");
+            out.put("note", "Wazuh 客户端未初始化（未启用或初始化失败），无法读取索引统计");
+            return out;
+        }
+        int window = days <= 0 ? 7 : Math.min(days, 30);
+        LocalDate today = LocalDate.now();
+        LocalDate from = today.minusDays(window - 1L);
+        try {
+            JsonNode root = client.catIndices("wazuh-alerts-*");
+            if (root == null || !root.isArray()) {
+                out.put("reason", "UNEXPECTED_RESPONSE");
+                out.put("note", "indexer 返回的不是 _cat/indices 数组，无法确认索引占用");
+                return out;
+            }
+            List<Map<String, Object>> indices = new ArrayList<>();
+            long total = 0;
+            int missingSize = 0;
+            for (JsonNode row : root) {
+                String name = row.path("index").asText("");
+                LocalDate date = indexDate(name);
+                if (date == null || date.isBefore(from) || date.isAfter(today)) {
+                    continue;
+                }
+                long docs = row.path("docs.count").asLong(0);
+                long bytes = row.path("store.size").asLong(0);
+                if (!row.hasNonNull("store.size")) {
+                    missingSize++;
+                }
+                Map<String, Object> item = new LinkedHashMap<>();
+                item.put("name", name);
+                item.put("docs", docs);
+                item.put("bytesEstimate", bytes);
+                item.put("date", date.toString());
+                indices.add(item);
+                total += docs;
+            }
+            indices.sort((a, b) -> String.valueOf(a.get("date")).compareTo(String.valueOf(b.get("date"))));
+            out.put("available", true);
+            out.put("total", total);
+            out.put("indices", indices);
+            if (indices.isEmpty()) {
+                out.put("note", "查询成功：最近 " + window + " 天没有 wazuh-alerts-* 日索引（真实结果）");
+            } else if (missingSize > 0) {
+                out.put("note", "已读取 " + indices.size() + " 个日索引；其中 " + missingSize
+                        + " 个缺少 store.size（按 0 计，未估算）");
+            } else {
+                out.put("note", "已读取 " + indices.size() + " 个日索引的 _cat/indices 统计（bytes=b）");
+            }
+            return out;
+        } catch (Exception e) {
+            logger.warn("索引占用查询失败（公开索引面板将如实降级）：{}", e.getMessage());
+            out.put("reason", "QUERY_FAILED");
+            out.put("note", "索引统计查询失败（" + e.getMessage() + "）；不是'没有索引'，请按降级展示");
+            return out;
+        }
+    }
+
+    /**
+     * 从索引名里取日索引的日期（同时支持 {@code yyyy.MM.dd} 与 {@code yyyy-MM-dd}）。
+     *
+     * <p>纯函数，便于单测直接喂索引名；不是日索引（含非法日期）返回 {@code null}。
+     */
+    static LocalDate indexDate(String name) {
+        if (name == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(\\d{4})[.-](\\d{2})[.-](\\d{2})$").matcher(name.trim());
+        if (!m.find()) return null;
+        try {
+            return LocalDate.of(Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2)),
+                    Integer.parseInt(m.group(3)));
+        } catch (RuntimeException e) {
+            return null;
         }
     }
 

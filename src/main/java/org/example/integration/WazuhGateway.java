@@ -143,6 +143,22 @@ public interface WazuhGateway {
     }
 
     /**
+     * <b>索引占用</b>：最近 {@code days} 天 Wazuh 日索引的条目数与磁盘占用（只读元数据）。
+     *
+     * <p>返回形状（<b>未脱敏</b>，公开侧只做字段白名单）：
+     * <pre>
+     * {available, reason, note, total,
+     *  indices:[{name, docs, bytesEstimate, date}]}   // date=yyyy-MM-dd，按日期升序
+     * </pre>
+     * 数据源不可用时 {@code available=false}，<b>不得</b>编造条目数/占用：
+     * 默认实现返回"不可用"，接口新增方法不会让既有替身静默变成"空面板"。
+     */
+    default Map<String, Object> alertIndices(int days) {
+        return Map.of("available", false, "reason", "DATA_SOURCE_UNAVAILABLE",
+                "note", "网关未实现 alertIndices");
+    }
+
+    /**
      * 日志取证检索（对应 GET 告警关联的归档日志/manager logs）。
      *
      * @param query 检索关键字（可空）
