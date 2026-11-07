@@ -11,6 +11,7 @@ import org.example.core.model.SecurityAlert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
@@ -25,11 +26,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-
 import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
-
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
@@ -66,399 +65,43 @@ import java.util.function.Supplier;
  * 蜜罐战报 / 红队评测 / 处置审计各自还需要独立的数据通路与脱敏口径，
  * 按"每期只做已验证的部分"推进 —— 那些端点跟着 P2 的页面一起加，
  * 避免先造出一批没人调用的公开端点（公开端点是攻击面，不是越多越好）。
+ *
+ * <h3>拆分说明（2026-11：god controller → 按域 controller + 委托门面）</h3>
+ * 端点实现已按域搬到 {@code PublicAlertController}/{@code PublicHomeController}/{@code PublicKbController}/
+ * {@code PublicGeoController}/{@code PublicMiscController}，共享状态与通用工具下沉到
+ * {@link PublicApiSupport}。
+ *
+ * <p><b>本类现在只是一层"为测试保留的委托门面"，默认不注册为 Spring Bean</b>：
+ * {@code @ConditionalOnProperty(app.public-api.legacy-facade-bean=true)} 默认不满足，组件扫描会跳过它，
+ * 生产环境里真正对外提供这 20 条路径的是那五个按域 controller（各自 {@code @RestController}），
+ * 因此不会出现同一路径被注册两次的 {@code Ambiguous mapping}。
+ *
+ * <p>那为什么还要留着它、并且仍然标 {@code @RestController}？因为历史单测都是
+ * {@code MockMvcBuilders.standaloneSetup(new PublicApiController())} + {@code ReflectionTestUtils.setField(...)}，
+ * 而 standaloneSetup 只认带 {@code @Controller}/{@code @RestController} 的类作为 handler。保留原注解、
+ * 原方法签名与原字段（字段经 {@link PublicApiSupport} 继承），每个方法一行转发到按域 controller，
+ * 就能让这批单测零改动地继续覆盖真实实现；条件注解只在 Spring 容器里生效，不影响手工 new 出来的实例。
  */
 @RestController
 @RequestMapping("/api/public")
-public class PublicApiController {
+@ConditionalOnProperty(prefix = "app.public-api", name = "legacy-facade-bean", havingValue = "true")
+public class PublicApiController extends PublicApiSupport {
 
-    private static final Logger logger = LoggerFactory.getLogger(PublicApiController.class);
-    private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final DateTimeFormatter HOUR_FMT = DateTimeFormatter.ofPattern("HH:mm");
+    private final PublicAlertController alertController;
+    private final PublicHomeController homeController;
+    private final PublicKbController kbController;
+    private final PublicGeoController geoController;
+    private final PublicMiscController miscController;
+    private final PublicSnapshotWarmer snapshotWarmer;
 
-    /** 时间线端点最多返回的事件条数（前端时间线一屏上限；total 仍给窗口内真实条数）。 */
-    private static final int TIMELINE_MAX_EVENTS = 200;
-
-    /** 时间线端点数据源不可用时的统一 reason（与既有公开端点的"不编数据"口径一致）。 */
-    private static final String TIMELINE_REASON_UNAVAILABLE = "数据源不可用";
-
-    /** 语音成功响应的媒体类型：{@code audio/mpeg}（实测线上带全站追加的 charset，见 {@link #tts}） */
-    private static final MediaType TTS_AUDIO = MediaType.parseMediaType("audio/mpeg");
-    /** CosyVoice 返回 wav（24 kHz / mono / 16-bit）：媒体类型不能报 mpeg */
-    private static final MediaType TTS_AUDIO_WAV = MediaType.parseMediaType("audio/wav");
-
-    @Autowired
-    private PublicAlertSource source;
-
-    @Autowired
-    private PublicRateLimiter rateLimiter;
-
-    // ==================== 密码自查（/api/public/password）====================
-    //
-    // 【数据从哪来】不是运行时读蜜罐日志：离线脚本 scripts/password-dict-build.py 在日志所在的机器上
-    // 把 password 字段就地 SHA-256、按前 5 位分桶，只把「hash + 计数」写进索引文件；
-    // 本服务只加载那个索引（格式与取舍见 PasswordDictionaryService 类注释）。
-    // 【读不到时】文件缺失/格式错 ⇒ available:false + reason，服务照常启动、端点不 500 ——
-    // 这条是硬要求：字典是"可选的富化数据"，它坏了不该让整页 500。
-
-    /** 口令字典索引（可为空：裁剪过的部署 / 单测直接 new 控制器时就没有） */
-    @Autowired(required = false)
-    private PasswordDictionaryService passwordDict;
-
-    /**
-     * 密码自查的独立限流器：默认 30 次/分钟（见 {@link PublicRateLimitersConfig}）。
-     *
-     * <p>为什么不复用 {@code rateLimiter}（20 次/分钟）：这个端点一次响应最多带 200 条 suffix，
-     * 带宽比其它只读端点大一截；同时它又是"手动试一次"的低频动作 —— 30 次/分钟够用，
-     * 但绝不跟着 README 里"把 20 调到 60"的调试习惯一起放宽。
-     */
-    @Autowired(required = false)
-    @Qualifier("publicPasswordRateLimiter")
-    private PublicAskRateLimiter passwordRateLimiter;
-
-    /** 兜底上限：没有 Spring 注入时（单测/裁剪部署）使用，仍然限流，不变成"不限" */
-    @Value("${app.public-api.password.requests-per-minute:30}")
-    private int passwordRequestsPerMinute = 30;
-
-    /** 密码自查的 Cache-Control max-age：字典按天重建，5 分钟缓存足够且能挡掉重复查询（默认 300） */
-    @Value("${app.public-api.password.cache-seconds:300}")
-    private int passwordCacheSeconds = 300;
-
-    /** 单桶最多下发多少条 suffix（超过就 truncated:true；默认 200） */
-    @Value("${app.public-api.password.max-hashes:200}")
-    private int passwordMaxHashes = 200;
-
-    private volatile PublicAskRateLimiter fallbackPasswordRateLimiter;
-
-    /** 应用内快照有效期；同时作为 Cache-Control 的 max-age 下发给浏览器/边缘（默认 45s，见 application.yml 注释） */
-    @Value("${app.public-api.cache-seconds:45}")
-    private int cacheSeconds;
-
-    /**
-     * 定时预聚合的"年龄阈值比例"（对应下面 {@code warmPublicSnapshots}）。
-     *
-     * <p>快照年龄超过 {@code TTL × 本比例} 就主动刷新，默认 0.5（TTL 45s ⇒ 22.5s）。
-     * 为什么不是"过期才刷"：过期才刷等于把现算留给下一个访客；提前刷 ⇒ 访客侧永远拿到热快照。
-     * 为什么不是更小（例如 0.2）：那会把上游查询频率抬得比"有访客才算"更高，白白增加索引器压力。
-     * 后台检查间隔由 {@code @Scheduled} 的 {@code warm-interval-ms}（默认 30s）决定。
-     */
-    @Value("${app.public-api.warm-threshold-ratio:0.5}")
-    private double warmThresholdRatio;
-
-    /**
-     * 别名路径的 {@code stale-while-revalidate}：边缘先发旧值、后台再验证 ⇒ 用户侧不被回源卡住。
-     *
-     * <p>取两倍 TTL。max-age 本身**不再单独硬编码** —— 它必须与 {@code app.public-api.cache-seconds}
-     * （快照 TTL）一致，否则会出现"快照已经 45 秒旧、却告诉缓存 15 秒"这种自相矛盾。
-     */
-    private static final int CACHE_ALIAS_SWR_SECONDS = 300;
-
-    /**
-     * 别名 ETag 的序列化器：把 Map 键排序 ⇒ ETag 只取决于内容、与插入顺序无关。
-     *
-     * <p>为什么不能直接用"完整响应体哈希"（{@link PublicEtagFilter} 的默认口径）：
-     * 别名体里的 {@code cacheAgeSeconds} 每秒都在变，ETag 会跟着每秒变 ⇒ 再验证永远拿不到 304。
-     */
-    private static final ObjectMapper ETAG_MAPPER = new ObjectMapper()
-            .configure(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS, true);
-
-    /** 是否在公网端点暴露构建版本号。health 早已公开它，且它是开源仓库的提交号，不敏感 */
-    @Value("${app.public-api.expose-build-sha:true}")
-    private boolean exposeBuildSha;
-
-    @Value("${app.build.sha:unknown}")
-    private String buildSha;
-
-    /** 构建时的源提交 / 产物指纹 / 构建时间：与 {@code /api/health} 同源（容器自述，非独立证据） */
-    @Value("${app.build.source-sha:unknown}")
-    private String buildSourceSha;
-
-    @Value("${app.build.artifact-md5:unknown}")
-    private String buildArtifactMd5;
-
-    @Value("${app.build.time:unknown}")
-    private String buildTime;
-
-    /**
-     * 发布信息文件（可选）：发布号 / 提交 / 切换时刻 / 文件数由**运维链**落地成本文件，本端点只读透传。
-     * 为什么不由本服务自己算：发布切换发生在 srv2 上，本进程（srv1）读不到那个目录 ——
-     * 读不到就写 {@code available=false}，绝不用进程启动时刻冒充"发布时间"。
-     */
-    @Value("${app.public-api.deploy-file:}")
-    private String deployFile;
-
-    /**
-     * 评测报告文件（可选）：{@code scripts/eval/} 跑出来的真值报告，落在本文件里供端点透传。
-     * 为什么本服务不自己算这些指标：它们要跑题库与评分器（离线、耗时长、依赖题库与知识库），
-     * 放在请求路径上既不可能也不该做。
-     */
-    @Value("${app.public-api.eval-report-file:}")
-    private String evalReportFile;
-
-    /** 进程启动时刻（部署可追溯端点展示 uptime 用；类加载≈启动，误差在秒级） */
-    private static final long STARTED_AT_MS = System.currentTimeMillis();
-
-    /** 公开端点读 JSON 文件的大小上限：超过就按"读不到"处理，**不截断**（截断会发出半个真相） */
-    private static final long JSON_FILE_MAX_BYTES = 256 * 1024L;
-
-    /** 发布信息文件允许透传的键（白名单：不把运维文件的任意内容端到公网） */
-    private static final List<String> DEPLOY_FILE_KEYS = List.of(
-            "release", "releaseDir", "commit", "fileCount", "totalBytes", "switchedAt", "publishedAt", "host",
-            // 2026-10-18：/status/ 的部署面板要的三样一直显示「未取到」，因为白名单里没有它们。
-            "builtAt", "files", "history");
-
-    /** 评测报告允许透传的键（白名单：正好是 C2 面板要的那几个真值 + 自证新鲜度用的 generatedAt） */
-    private static final List<String> EVAL_REPORT_KEYS = List.of(
-            "generatedAt", "sampleSize", "dataset", "model", "metrics", "keyPointHitRate",
-            "refusalRate", "strictRate", "citationRate", "personaCatchphraseRate", "tabooRate");
-
-    private final Snapshot overviewCache = new Snapshot();
-    private final Snapshot alertsCache = new Snapshot();
-    private final Snapshot honeypotCache = new Snapshot();
-    private final Snapshot auditCache = new Snapshot();
-    private final Snapshot latestCache = new Snapshot();
-
-    /** ① 聚合端点（alerts+geo+honeypot 三合一）的快照：TTL 与其它端点同源（{@code cacheSeconds}） */
-    private final Snapshot homeCache = new Snapshot();
-
-    /** ①b 部署可追溯 / ② AI 质量真值：两者都是"读一个小 JSON + 白名单透传"，同样按快照 TTL 缓存 */
-    private final Snapshot deployCache = new Snapshot();
-    private final Snapshot evalCache = new Snapshot();
-
-    // ==================== 公开面口径：IP 开关 + 内部资产名词表 ====================
-    //
-    // 【为什么集中在这里读】站主 2026-10-14 拍板：公开面显示观测到的真实来源 IP。
-    // 但"要不要掩码"一旦在多个端点里各写一遍，就必然出现第三种口径（一个页面真实、
-    // 一个页面掩码），而且【不会报错】。所以两个口径对象都只在本类注入一次，
-    // 由 ship(...) 统一作用到所有公开响应上 —— 将来新增端点（例如 /api/public/geo）
-    // 只要走 ok(...)，就自动获得同一套口径。
-
-    /** IP 显示口径（配置 app.public.mask-ips；缺注入时按掩码兜底） */
-    @Autowired(required = false)
-    private PublicIpPolicy ipPolicy;
-
-    /** 内部资产名停用词过滤（配置 app.public.asset-blocklist） */
-    @Autowired(required = false)
-    private PublicAssetFilter assetFilter;
-
-    /** 没有 Spring 注入时的保守兜底（掩码态）：单测直接 new 控制器时走这条 */
-    private static final PublicIpPolicy FAIL_CLOSED_POLICY = PublicIpPolicy.masking();
-
-    /** 没有 Spring 注入时的默认资产词表（不能因为"没注入"就不过滤） */
-    private static final PublicAssetFilter DEFAULT_ASSET_FILTER = PublicAssetFilter.defaults();
-
-    private PublicIpPolicy policy() {
-        PublicIpPolicy p = ipPolicy;
-        return p != null ? p : FAIL_CLOSED_POLICY;
+    public PublicApiController() {
+        this.alertController = new PublicAlertController(this);
+        this.geoController = new PublicGeoController(this);
+        this.homeController = new PublicHomeController(this, alertController, geoController);
+        this.kbController = new PublicKbController(this);
+        this.miscController = new PublicMiscController(this);
+        this.snapshotWarmer = new PublicSnapshotWarmer(this, alertController, homeController, geoController, miscController);
     }
-
-    private PublicAssetFilter assets() {
-        PublicAssetFilter f = assetFilter;
-        return f != null ? f : DEFAULT_ASSET_FILTER;
-    }
-
-    /**
-     * <b>公开响应出海的唯一闸门</b>：整棵 data 树过一遍内部资产名词表，
-     * 并补上统一口径字段 {@code ipDisclosure}。
-     *
-     * <h3>为什么做成"过整棵树"而不是逐字段手工过滤</h3>
-     * 逐字段过滤的失败模式是"新加了一个字段、忘了加过滤" —— 而它不会报错，
-     * 只会静静地把资产名发出去。整棵树扫一遍则相反：默认就被过滤，漏不掉。
-     * 代价是每次请求多一层拷贝（十几条记录的规模，可忽略）。
-     *
-     * <p>只过滤<b>值</b>，不动<b>键名</b>：键名是公开契约的字段名（改键名等于改接口），
-     * 而资产名只可能出现在值里。
-     */
-    private Map<String, Object> ship(Map<String, Object> data) {
-        Map<String, Object> out = new LinkedHashMap<>();
-        if (data != null) {
-            data.forEach((k, v) -> out.put(k, scrubDeep(v)));
-        }
-        if (!out.containsKey(PublicIpPolicy.DISCLOSURE_FIELD)) {
-            out.put(PublicIpPolicy.DISCLOSURE_FIELD, policy().disclosure());
-        }
-        return out;
-    }
-
-    private Object scrubDeep(Object v) {
-        if (v instanceof String s) {
-            return scrubText(s);
-        }
-        if (v instanceof Map<?, ?> m) {
-            Map<String, Object> out = new LinkedHashMap<>();
-            m.forEach((k, val) -> out.put(String.valueOf(k), scrubDeep(val)));
-            return out;
-        }
-        if (v instanceof List<?> l) {
-            List<Object> out = new ArrayList<>(l.size());
-            for (Object o : l) {
-                out.add(scrubDeep(o));
-            }
-            return out;
-        }
-        return v;
-    }
-
-    /**
-     * 单个字符串的出关口径：<b>先资产名 scrub、再凭据脱敏</b>。
-     *
-     * <p>顺序不能反：出口是"先去掉内部资产名，再把口令字段隐去"。
-     *
-     * <p><b>为什么必须在这里补一道（2026-10-14 红线违反的修复）</b>：本方法原先只有
-     * {@code assets().scrub(s)}，<b>从不做凭据脱敏</b>。{@code /honeypot} 是显式调
-     * {@link CredentialStructure#hidePasswords(String)} 才干净的，而告警链路
-     * （{@code buildAlerts()} → {@code publicAggregate()} / {@code publicAlert()}）
-     * 一处都没调 —— 于是蜜罐规则原文里的 {@code 口令=<明文>} 随 {@code title} /
-     * {@code ruleName} 直出公网（{@code /api/public/alerts} 与
-     * {@code /api/public/alerts/{aggId}}）。泄漏的是攻击者猜的口令，但违反本站红线
-     * "蜜罐完整口令永不上公网"。
-     *
-     * <p><b>为什么修在 {@code scrubDeep()} 而不是补在 {@code buildAlerts()} 里</b>：
-     * {@code scrubDeep()} 是公开面<b>唯一的出海闸门</b>（见 {@link #ship}）。补在闸门上，
-     * 今天所有端点一并覆盖，<b>以后新加的公开端点默认就是安全的</b>；补在某一个
-     * {@code buildXxx()} 里则只修了那一条路径 —— 那正是这次出事的失败模式
-     * （{@code /honeypot} 记得调、{@code /alerts} 忘了调）。这与 {@link #ship} 那
-     * "过整棵树而不是逐字段手工过滤"的理由是同一条。
-     *
-     * <p>对 {@code /honeypot} 是双重保险：它本来就已把口令换成
-     * {@link CredentialStructure#PASSWORD_HIDDEN}，而 {@code hidePasswords} 幂等
-     * （占位符里没有 {@code 口令=…} 形状），所以<b>输出不变</b>。
-     * {@code PublicHoneypotScrubPipelineTest} 钉住这一点。
-     *
-     * <p><b>为什么这里还要补一道 IP 口径（2026-10-16 收口）</b>：{@link PublicIpPolicy}
-     * 的 {@link PublicIpPolicy#displayText(String)} 原先只在<b>少数几个</b>自由文本字段上
-     * 被显式调用（{@code /honeypot} 的 detail、攻击故事、知识库片段、问答输出护栏……），
-     * 而告警链路的 {@code title} / {@code ruleName} 一处都没调 —— 于是
-     * {@code GET /api/public/alerts} 在真实态下把蜜罐规则原文里的<b>内网来源地址</b>
-     * （线上实测 {@code 蜜罐(Dionaea): SMB 连接/认证尝试 来源=172.19.0.1:57386}）
-     * 原样发到公网，而同一条记录的 {@code srcIp} 字段已经是「内网/未知」。
-     * 违反的是 {@code PublicIpPolicy} 里"内网/保留/链路地址在任何口径下都不上公开面"
-     * 这条<b>与开关无关</b>的硬约束（RUNBOOK §27.1："真实态下这类值一律写成「内网/未知」"）。
-     *
-     * <p>修法与口令那次<b>同源</b>：补在唯一的出海闸门上，而不是补在
-     * {@code publicAggregate()} / {@code publicAlert()} 里。补在闸门上，今天所有端点一并覆盖，
-     * 以后新加的公开端点默认就带 IP 口径；补在某一个 {@code buildXxx()} 里则只修了那一条路径
-     * —— 那正是口令那次与这次共同的失败模式。
-     *
-     * <p><b>幂等 / 不改变既有输出</b>：
-     * <ul>
-     *   <li>真实态：结构化字段已经过 {@code display()}，公网地址原样、内网地址已是「内网/未知」，
-     *       再过一遍 {@code maskInternalOnly} 逐字节不变；自由文本里的公网攻击源地址
-     *       <b>照旧保留</b>（本站口径就是显示观测到的真实来源地址），只把内网/保留地址换掉。</li>
-     *   <li>掩码态：{@code display()} 的产物形如 {@code 45.83.***.***}，
-     *       不含"四段数字"，{@code maskAll} 不会再改它；原先自由文本里漏出来的完整 IP
-     *       则被补上掩码 —— 这正是掩码态本来就该有的口径。</li>
-     * </ul>
-     * 回归：{@code PublicFreeTextIpGateTest}（两种口径 + 列表与下钻两条路径）。
-     */
-    private String scrubText(String s) {
-        if (s == null || s.isEmpty()) {
-            return s;
-        }
-        return policy().displayText(CredentialStructure.hidePasswords(assets().scrub(s)));
-    }
-
-    /**
-     * 这次公开问答是不是站主本人发的（决定要不要走「每 IP 每分钟 N 次」那道闸）。
-     *
-     * <p>判据只有一条：请求头 {@code X-User-Token} 通过自用面令牌校验。
-     * 其余一切情况（没带、带错、服务未配置、校验抛异常）都判成<b>不是</b> ——
-     * 宁可把站主当访客限一次流，也不能因为校验出问题把匿名限流整条打开。
-     */
-    private boolean isOwnerAsk(HttpServletRequest req, String ip) {
-        if (req == null) {
-            return false;
-        }
-        String token = req.getHeader("X-User-Token");
-        if (token == null || token.isBlank()) {
-            return false;
-        }
-        if (ownerTokenService == null || !ownerTokenService.configured()) {
-            return false;
-        }
-        try {
-            org.example.selfapi.UserTokenService.Result r = ownerTokenService.check(ip, token);
-            return r != null && r.ok();
-        } catch (RuntimeException e) {
-            logger.debug("站主令牌校验失败，按匿名处理：{}", e.toString());
-            return false;
-        }
-    }
-
-    /** 处置审计只读读取器（读留痕文件，不注入任何处置 Bean —— 隔离测试会强校验） */
-    @Autowired
-    private PublicAuditReader auditReader;
-
-    // ==================== P4：公开 AI 问答 + 知识库公开只读检索 ====================
-
-    /** 公开问答业务实现（四道护栏 + state 归一化 + 输出脱敏） */
-    @Autowired
-    private PublicAskService publicAskService;
-
-    /** 公开知识库检索（复用向量检索，但只出白名单字段） */
-    @Autowired
-    private PublicKbService publicKbService;
-
-    /** 公开问答的独立限流器（默认 6 次/分钟，与只读端点的 20 次/分钟分开） */
-    @Autowired
-    @Qualifier("publicAskRateLimiter")
-    private PublicAskRateLimiter publicAskRateLimiter;
-
-    /**
-     * 站主令牌校验器（用于「登录后问答不限次」）。
-     *
-     * <p>为什么公开面要认识自用面的令牌：站主登录后问的是<b>同一个公开问答端点</b>
-     * （响应结构与访客完全一致，展示层不用分叉），只要求"别把站主当匿名访客限流"。
-     * 换一条自用端点会让前端多一套响应契约，而这条需求只值一个头部判断。
-     *
-     * <p>失败一律回落匿名路径（{@code false}），<b>不在这里拒绝请求</b> —— 令牌坏了就是访客，
-     * 该走限额就走限额；这条路径上任何异常都不得让问答本身不可用。
-     */
-    @Autowired(required = false)
-    private org.example.selfapi.UserTokenService ownerTokenService;
-
-    /**
-     * 公开知识库检索的限流器。
-     *
-     * <p>与问答共用 {@link PublicAskRateLimiter} 这个实现，但注入的是<b>另一个实例</b> ——
-     * 于是两者各自一份计数与各自一份上限（检索 20 次/分钟、问答 6 次/分钟）。
-     * 为什么不用同一个实例：共用一个桶意味着"多刷几次检索"会顺手把问答的额度也占掉，
-     * 而访客完全看不出这两件事为什么互相影响。
-     */
-    @Autowired
-    @Qualifier("publicKbRateLimiter")
-    private PublicAskRateLimiter publicKbRateLimiter;
-
-    /** 每 IP 并发 1 守卫（匿名重操作不能靠限流兜住） */
-    @Autowired
-    private PublicConcurrencyGuard publicConcurrencyGuard;
-
-    /**
-     * 语音合成（{@code POST /api/public/tts}）。
-     *
-     * <p>{@code required = false}：装配不成立时端点必须<b>如实</b>返回
-     * {@code 503 TTS_DISABLED}，而不是让整个公网控制器起不来（公开面是匿名可达的，
-     * "语音坏了"不该把公开页面一起带走）。见 {@link #tts}。
-     */
-    @Autowired(required = false)
-    private TtsService ttsService;
-
-    /**
-     * 自由文本语音（{@code POST /api/public/tts/say}）的两道日额度。
-     *
-     * <p>为什么比短语表那条（默认 20 / 500）更紧、更松各一半：访客每问一句都要念一次，
-     * 每 IP 放 30 次才够正常读几轮答案；而全局 300 是<b>成本闸</b> ——
-     * 一次自由文本合成和一次短语合成花的是同一笔上游的钱，但自由文本没有短语表那种
-     * "文本已定"的可预测性，所以全局只给 300。这两个数与短语表共用同一本落盘额度账。
-     */
-    @Value("${app.tts.say.per-ip-daily:30}")
-    private int ttsSayPerIpDaily;
-
-    @Value("${app.tts.say.global-daily:300}")
-    private int ttsSayGlobalDaily;
-
-    /** 单次公开问答的请求体长度上限（比服务内的字符上限略宽，挡住超大 body） */
-    @Value("${app.public-api.ask.max-body-chars:4000}")
-    private int maxBodyChars;
 
     /**
      * 公开 AI 问答：<b>匿名可访问</b>，但必须过四道护栏。
@@ -479,73 +122,7 @@ public class PublicApiController {
     public ResponseEntity<Map<String, Object>> ask(@RequestBody(required = false) Map<String, Object> body,
                                                    HttpServletRequest req,
                                                    HttpServletResponse res) {
-        String ip = clientIp(req);
-
-        // ① 限流（每 IP 每分钟 N 次）—— 先于一切上游动作，包括并发登记
-        //    站主带有效 X-User-Token ⇒ 跳过这一道（他不限次），其余访客照旧。
-        boolean owner = isOwnerAsk(req, ip);
-        if (!owner && !publicAskRateLimiter.allow(ip)) {
-            return tooMany(res, publicAskRateLimiter, "公开问答请求过于频繁（每 IP 每分钟 "
-                    + publicAskRateLimiter.limitPerMinute() + " 次），请稍后再试");
-        }
-
-        // ② 并发 1（每 IP 同时只允许一个在飞）
-        if (!publicConcurrencyGuard.tryAcquire(ip)) {
-            res.setHeader(HttpHeaders.RETRY_AFTER, "5");
-            res.setHeader("X-Public-Concurrency", "1");
-            Map<String, Object> b = new LinkedHashMap<>();
-            b.put("code", 429);
-            b.put("message", "同一来源同时只允许 1 个公开问答请求在飞，请等上一条返回后再试");
-            b.put("reason", "per-ip-concurrency-limit");
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(b);
-        }
-
-        try {
-            String question = extractQuestion(body);
-            // 要不要顺带一句日语语音（speakJa）：只有调用方显式要才做 ——
-            // 那是一次额外的模型调用，关着声音的访客不该替别人付这笔钱。
-            Map<String, Object> data = publicAskService.ask(question, ip, wantSpeakJa(body));
-
-            // 记一条"刚生成过的回答"，并把它的 textHash 一并发给前端 ——
-            // 这是 /api/public/tts 的 textHash 闸【唯一】的文本来源：只有服务端
-            // 自己产出过的回答才能被合成，前端永远不传文本。
-            if (ttsService != null) {
-                Object answer = data.get("answer");
-                String textHash = answer == null ? null : ttsService.recordAnswer(String.valueOf(answer));
-                if (textHash != null) {
-                    data.put("ttsTextHash", textHash);
-                }
-            }
-
-            // 一次性返回：公开问答的响应永不被边缘缓存（它是"这一次提问"的结果）
-            res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-            res.setHeader("X-Data-Source", "PUBLIC_ASK");
-            if (owner) {
-                // 说清楚：这次没记限额。数字别写成假的"6"，否则日志里会以为被限过。
-                res.setHeader("X-RateLimit-Limit", "owner-unlimited");
-                res.setHeader("X-RateLimit-Remaining", "owner-unlimited");
-                res.setHeader("X-Owner-Ask", "1");
-            } else {
-                res.setHeader("X-RateLimit-Limit", String.valueOf(publicAskRateLimiter.limitPerMinute()));
-                res.setHeader("X-RateLimit-Remaining",
-                        String.valueOf(Math.max(0, publicAskRateLimiter.remaining(ip))));
-            }
-
-            Map<String, Object> out = new LinkedHashMap<>();
-            out.put("code", 200);
-            out.put("message", "success");
-            // POST 不走 ok(...)，但口径必须一样：同一个 ship(...)（资产名过滤 + ipDisclosure）
-            out.put("data", ship(data));
-            return ResponseEntity.ok(out);
-        } catch (Exception e) {
-            logger.warn("公开问答失败（已按 fail-closed 处理）：{}", e.getMessage());
-            Map<String, Object> b = new LinkedHashMap<>();
-            b.put("code", 500);
-            b.put("message", "公开问答暂时不可用，请稍后再试");
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(b);
-        } finally {
-            publicConcurrencyGuard.release(ip);
-        }
+        return kbController.ask(body, req, res);
     }
 
     /**
@@ -559,54 +136,7 @@ public class PublicApiController {
     public ResponseEntity<Map<String, Object>> kb(@RequestParam(value = "q", required = false) String q,
                                                   HttpServletRequest req,
                                                   HttpServletResponse res) {
-        String ip = clientIp(req);
-        if (!publicKbRateLimiter.allow(ip)) {
-            return tooMany(res, publicKbRateLimiter, "知识库检索请求过于频繁（每 IP 每分钟 "
-                    + publicKbRateLimiter.limitPerMinute() + " 次），请稍后再试");
-        }
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("query", q == null ? "" : q.trim());
-        data.put("rule", publicKbService.ruleSummary());
-
-        String query = q == null ? "" : q.trim();
-        if (query.isEmpty()) {
-            data.put("results", List.of());
-            data.put("hitCount", 0);
-            data.put("available", true);
-            data.put("note", "未提供查询词（q）。");
-            return ok(data, res);
-        }
-        if (query.length() > 200) {
-            data.put("results", List.of());
-            data.put("hitCount", 0);
-            data.put("available", true);
-            data.put("note", "查询词过长（上限 200 字符）。");
-            return ok(data, res);
-        }
-
-        try {
-            List<Map<String, Object>> results = publicKbService.search(query);
-            data.put("results", results);
-            data.put("hitCount", results.size());
-            data.put("available", true);
-            // 口径描述随开关而变：掩码态<b>逐字节保留改造前的说法</b>（掩码回归要求），
-            // 真实态如实说明"显示的是观测到的真实来源地址"，不能嘴上还说"已掩码"。
-            data.put("note", results.isEmpty()
-                    ? "公开知识库未检索到相关片段（未命中就是未命中，不用别的数据顶替）。"
-                    : (policy().masked()
-                            ? "片段已截断并脱敏；IP 已掩码，内部路径与凭据不出现在响应里。"
-                            : "片段已截断并脱敏；IP 显示观测到的真实来源地址（内网/保留地址一律写作「内网/未知」），"
-                                    + "内部路径、凭据与内部资产名不出现在响应里。"));
-        } catch (PublicKbService.PublicKbUnavailableException e) {
-            // fail-closed：检索不可用就如实说不可用，不回空列表冒充"没有相关内容"
-            data.put("results", List.of());
-            data.put("hitCount", 0);
-            data.put("available", false);
-            data.put("note", "知识库检索不可用（向量检索异常）：未返回任何内容，也不以内置样本顶替。");
-        }
-        return ok(data, res);
+        return kbController.kb(q, req, res);
     }
 
     /**
@@ -646,38 +176,7 @@ public class PublicApiController {
     public ResponseEntity<?> tts(@RequestBody(required = false) Map<String, Object> body,
                                  HttpServletRequest req,
                                  HttpServletResponse res) {
-        String ip = clientIp(req);
-
-        // ① 频率闸：与其它公开端点共用同一个限流器（同一本账，不另开一个桶）
-        if (!rateLimiter.allow(ip)) {
-            res.setHeader(HttpHeaders.RETRY_AFTER, "60");
-            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-            res.setHeader("X-RateLimit-Remaining", "0");
-            return ttsError(res, 429, "RATE_LIMITED",
-                    "语音请求过于频繁（每 IP 每分钟 " + rateLimiter.limitPerMinute() + " 次），请稍后再试");
-        }
-
-        if (ttsService == null) {
-            return ttsError(res, 503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
-        }
-
-        try {
-            TtsService.Result result = ttsService.synthesize(
-                    bodyString(body, "phraseId"), bodyString(body, "textHash"), ip);
-            // 与 ok(...) 同一口径：快照 TTL 就是下发出去的 max-age。
-            // 音频内容是内容寻址的（同一个 voiceId+text 永远是同一份字节），
-            // 但仍按公网统一 TTL 走，避免出现"这个端点的缓存语义和别的不一样"。
-            res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
-            res.setHeader("X-Tts-Cache", result.cacheHit() ? "HIT" : "MISS");
-            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-            MediaType media = (ttsService != null && ttsService.config().isCosyVoice()) ? TTS_AUDIO_WAV : TTS_AUDIO;
-            return ResponseEntity.ok().contentType(media).body(result.audio());
-        } catch (TtsService.TtsException e) {
-            // 归一化的 reason 码：前端按它决定"隐藏 🔊 / 提示额度用完 / 提示稍后再试"。
-            // message 是人话，绝不含 Key、上游原文或 URL 细节。
-            logger.warn("公开 TTS 未完成：reason={} status={}", e.reason(), e.httpStatus());
-            return ttsError(res, e.httpStatus(), e.reason(), e.userMessage());
-        }
+        return kbController.tts(body, req, res);
     }
 
     /**
@@ -707,95 +206,7 @@ public class PublicApiController {
     public ResponseEntity<?> ttsSay(@RequestBody(required = false) Map<String, Object> body,
                                     HttpServletRequest req,
                                     HttpServletResponse res) {
-        String ip = clientIp(req);
-
-        // ① 频率闸：与其它公开端点共用同一个限流器（同一本账，不另开一个桶）
-        if (!rateLimiter.allow(ip)) {
-            res.setHeader(HttpHeaders.RETRY_AFTER, "60");
-            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-            res.setHeader("X-RateLimit-Remaining", "0");
-            return ttsError(res, 429, "RATE_LIMITED",
-                    "语音请求过于频繁（每 IP 每分钟 " + rateLimiter.limitPerMinute() + " 次），请稍后再试");
-        }
-
-        if (ttsService == null) {
-            return ttsError(res, 503, "TTS_DISABLED", "语音合成未启用（app.tts.enabled=false）");
-        }
-
-        try {
-            TtsService.Result result = ttsService.say(
-                    bodyString(body, "text"), ip, ttsSayPerIpDaily, ttsSayGlobalDaily);
-            res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
-            res.setHeader("X-Tts-Cache", result.cacheHit() ? "HIT" : "MISS");
-            res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-            MediaType media = ttsService.config().isCosyVoice() ? TTS_AUDIO_WAV : TTS_AUDIO;
-            return ResponseEntity.ok().contentType(media).body(result.audio());
-        } catch (TtsService.TtsException e) {
-            // 归一化的 reason 码（TEXT_TOO_LONG / TEXT_CHARSET_NOT_ALLOWED / PER_IP_DAILY_LIMIT …）
-            // message 是人话，绝不含 Key、上游原文或 URL 细节。
-            logger.warn("公开 TTS(say) 未完成：reason={} status={}", e.reason(), e.httpStatus());
-            return ttsError(res, e.httpStatus(), e.reason(), e.userMessage());
-        }
-    }
-
-    /**
-     * 语音端点的失败响应：既有 JSON 信封 + {@code reason} 码（零 IP、零上游细节）。
-     *
-     * <p>{@code Cache-Control: no-store}：错误不该被边缘或浏览器缓存住 ——
-     * 否则"额度明天恢复"这件事在访客那里可能要等缓存过期才生效。
-     */
-    private ResponseEntity<Map<String, Object>> ttsError(HttpServletResponse res, int status,
-                                                         String reason, String message) {
-        res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", status);
-        body.put("message", message);
-        body.put("reason", reason);
-        return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).body(body);
-    }
-
-    /** 请求体取字符串字段（非字符串值按其字面量处理；null 表示没给） */
-    private static String bodyString(Map<String, Object> body, String key) {
-        if (body == null) {
-            return null;
-        }
-        Object value = body.get(key);
-        return value == null ? null : String.valueOf(value);
-    }
-
-    /**
-     * 请求体里的「要日语语音」开关：只认 {@code speakJa} 一个键。
-     *
-     * <p>为什么做成<b>显式 opt-in</b> 而不是无条件生成：{@code speakJa} 是一次真实的模型调用
-     * （走公开池额度）。绝大多数访客是静音浏览的，替他们每次问答多花一份钱、多等最多 3 秒，
-     * 换来的东西他们根本不会打开。所以"要不要"由调用方说 —— 前端只在
-     * {@code __xkSound.on} 为真时才带这个字段。
-     *
-     * <p>接受的形态：布尔 {@code true}、数字 {@code 1}、字符串 {@code "true"/"1"/"yes"}（大小写不敏感）。
-     * 其余一律当作"不要"——宁可少说一句，也不要解析出一个意外的 {@code true}。
-     */
-    private static boolean wantSpeakJa(Map<String, Object> body) {
-        if (body == null) {
-            return false;
-        }
-        Object v = body.get("speakJa");
-        if (v instanceof Boolean b) {
-            return b;
-        }
-        String s = v == null ? "" : String.valueOf(v).trim();
-        return s.equalsIgnoreCase("true") || s.equals("1") || s.equalsIgnoreCase("yes");
-    }
-
-    /** 请求体取问题：只认 {@code question} / {@code q} 两个键，其余一律忽略 */
-    private static String extractQuestion(Map<String, Object> body) {
-        if (body == null) {
-            return "";
-        }
-        Object v = body.get("question");
-        if (v == null) {
-            v = body.get("q");
-        }
-        return v == null ? "" : String.valueOf(v);
+        return kbController.ttsSay(body, req, res);
     }
 
     // ==================== 端点 ====================
@@ -803,21 +214,13 @@ public class PublicApiController {
     /** 首页状态条用：两台服务器在线状态 + 告警概览。载荷刻意做小。 */
     @GetMapping({"/overview", "/overview.js"})
     public ResponseEntity<Map<String, Object>> overview(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        Map<String, Object> data = overviewCache.get(cacheSeconds, this::buildOverview);
-        return ok(data, res);
+        return alertController.overview(req, res);
     }
 
     /** 告警看板用：聚合后的实时告警流 + 分布 + 24 小时趋势，一次请求拿全。 */
     @GetMapping({"/alerts", "/alerts.js"})
     public ResponseEntity<Map<String, Object>> alerts(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        Map<String, Object> data = alertsCache.get(cacheSeconds, this::buildAlerts);
-        return ok(data, res);
+        return alertController.alerts(req, res);
     }
 
     /**
@@ -829,44 +232,7 @@ public class PublicApiController {
     public ResponseEntity<Map<String, Object>> drillDown(@PathVariable("aggId") String aggId,
                                                          HttpServletRequest req,
                                                          HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-
-        List<Map<String, Object>> aggs = source.aggregated();
-        Map<String, Object> hit = null;
-        for (Map<String, Object> g : aggs) {
-            if (aggId.equals(String.valueOf(g.get("aggId")))) {
-                hit = g;
-                break;
-            }
-        }
-        if (hit == null) {
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("code", 404);
-            body.put("message", "未找到聚合告警（可能已超出当前取数窗口）");
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
-        }
-
-        List<String> memberIds = asStringList(hit.get("memberIds"));
-        Map<String, SecurityAlert> byId = new LinkedHashMap<>();
-        for (SecurityAlert a : source.readAlerts()) {
-            byId.put(a.getId(), a);
-        }
-        List<Map<String, Object>> members = new ArrayList<>();
-        for (String mid : memberIds) {
-            SecurityAlert a = byId.get(mid);
-            if (a != null) {
-                members.add(publicAlert(a));
-            }
-        }
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("summary", publicAggregate(hit));
-        data.put("members", members);
-        data.put("memberCount", members.size());
-        return ok(data, res);
+        return alertController.drillDown(aggId, req, res);
     }
 
     /**
@@ -877,10 +243,7 @@ public class PublicApiController {
      */
     @GetMapping({"/honeypot", "/honeypot.js"})
     public ResponseEntity<Map<String, Object>> honeypot(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(honeypotCache.get(cacheSeconds, this::buildHoneypot), res);
+        return alertController.honeypot(req, res);
     }
 
     // ==================== ① 聚合端点：一次请求拿三块（弱网收益最大的一处） ====================
@@ -918,60 +281,7 @@ public class PublicApiController {
      */
     @GetMapping({"/home", "/home.js"})
     public ResponseEntity<Map<String, Object>> home(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(homeCache.get(cacheSeconds, this::buildHome), res);
-    }
-
-    /**
-     * 组装聚合块：三个子块各走自己的快照缓存（各自 TTL / 各自后台预聚合 / 各自失败兜底），
-     * 并各自 {@link #ship(Map)} 一次 —— 这一步是"逐字段一致"的关键：
-     * 单端点的 {@code ok(...)} 会给 data 补 {@code ipDisclosure}，所以子块也必须补，
-     * 否则聚合里的子块会少一个字段（而少字段不会报错，只会让前端的一个字段永远读不到）。
-     */
-    private Map<String, Object> buildHome() {
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("alerts", ship(alertsCache.get(cacheSeconds, this::buildAlerts)));
-        out.put("geo", ship(geoCache.get(cacheSeconds, this::buildGeo)));
-        out.put("honeypot", ship(honeypotCache.get(cacheSeconds, this::buildHoneypot)));
-        /* audit 是**可选块**：它的上游是处置审计日志，坏了也只该少这一块。
-           理由（2026-10-18 实测）：聚合端点的全部价值是"一次请求把首屏填满"，
-           所以任何单个子块失败都**不许**把整次请求变成 500——否则一个封禁库读不到，
-           连告警列表和地图一起黑屏，比没有聚合更糟。取不到就不放这个键，
-           前端发现 `home.data.audit` 缺失会自己补拉一次 /api/public/audit（它有自己的错误态文案）。 */
-        try {
-            out.put("audit", ship(auditCache.get(cacheSeconds, this::buildAudit)));
-        } catch (RuntimeException e) {
-            logger.warn("聚合里的 audit 块取不到（首屏降级为四块，前端会补拉 /audit）：{}", e.getMessage());
-        }
-        out.put("health", buildHealthBlock());
-        return out;
-    }
-
-    /**
-     * 聚合里的 {@code health} 块：只放**本控制器能自证**的事实，不跨控制器调 {@code /api/health}。
-     *
-     * <p>口径与 {@code /api/health}、{@code /api/public/deploy} 一致：{@code build.*} 是
-     * <b>容器自述</b>（{@code selfReported=true}），不是独立证据；{@code runtime.*} 来自进程内
-     * {@code STARTED_AT_MS}，是真实的进程启动时刻。这样首屏/状态页不必再为一个版本号多打一次请求。
-     */
-    private Map<String, Object> buildHealthBlock() {
-        Map<String, Object> h = new LinkedHashMap<>();
-        h.put("status", source.available() ? "ok" : "degraded");
-        h.put("buildSha", buildSha);
-        h.put("sourceSha", buildSourceSha);
-        h.put("artifactMd5", buildArtifactMd5);
-        h.put("buildTime", buildTime);
-        h.put("selfReported", true);
-        Map<String, Object> rt = new LinkedHashMap<>();
-        rt.put("startedAt", Instant.ofEpochMilli(STARTED_AT_MS)
-                .atZone(ZoneId.systemDefault()).truncatedTo(ChronoUnit.SECONDS)
-                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
-        rt.put("uptimeSeconds", Math.max(0, (System.currentTimeMillis() - STARTED_AT_MS) / 1000));
-        h.put("runtime", rt);
-        h.put("dataSource", source.available() ? "WAZUH_REAL" : "UNAVAILABLE");
-        return h;
+        return homeController.home(req, res);
     }
 
     // ==================== ①b 给 C2 面板线的两个只读端点 ====================
@@ -988,68 +298,7 @@ public class PublicApiController {
      */
     @GetMapping({"/deploy", "/deploy.js"})
     public ResponseEntity<Map<String, Object>> deploy(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(deployCache.get(cacheSeconds, this::buildDeploy), res);
-    }
-
-    private Map<String, Object> buildDeploy() {
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("generatedAt", generatedAt());
-
-        Map<String, Object> build = new LinkedHashMap<>();
-        build.put("sha", buildSha);
-        build.put("sourceSha", buildSourceSha);
-        build.put("artifactMd5", buildArtifactMd5);
-        build.put("buildTime", buildTime);
-        build.put("selfReported", true);   // 明确标注：这几个值是"容器自述"，不是独立证据
-        out.put("build", build);
-
-        Map<String, Object> runtime = new LinkedHashMap<>();
-        runtime.put("startedAt", Instant.ofEpochMilli(STARTED_AT_MS)
-                .atZone(ZoneId.systemDefault()).truncatedTo(ChronoUnit.SECONDS)
-                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
-        runtime.put("uptimeSeconds", Math.max(0, (System.currentTimeMillis() - STARTED_AT_MS) / 1000));
-        out.put("runtime", runtime);
-
-        out.put("release", readDeployFile());
-        out.put("available", true);   // 构建信息恒可得；release 的可得性由 release.available 单列
-        out.put("note", "build.* 是容器自述（与 /api/health 同源）；release.* 来自 app.public-api.deploy-file，"
-                + "取不到就写 available=false —— 不用 0 或猜测值冒充发布信息。");
-        return out;
-    }
-
-    /** 发布信息文件（可选）：只透传白名单键，未配置/缺失/坏 JSON 一律如实说不可得 */
-    private Map<String, Object> readDeployFile() {
-        Map<String, Object> rel = new LinkedHashMap<>();
-        if (deployFile == null || deployFile.isBlank()) {
-            rel.put("available", false);
-            rel.put("reason", "RELEASE_INFO_NOT_CONFIGURED");
-            rel.put("note", "未配置 app.public-api.deploy-file（发布号在 srv2 的 releases 目录，本进程读不到）");
-            return rel;
-        }
-        Object parsed = readJsonOrNull(deployFile);
-        if (parsed == null) {
-            rel.put("available", false);
-            rel.put("reason", "RELEASE_INFO_UNREADABLE");
-            rel.put("note", "发布信息文件不存在或不是合法 JSON：" + deployFile + "（不用旧值冒充新发布）");
-            return rel;
-        }
-        if (!(parsed instanceof Map<?, ?> m)) {
-            rel.put("available", false);
-            rel.put("reason", "RELEASE_INFO_SHAPE");
-            rel.put("note", "发布信息文件顶层必须是 JSON 对象");
-            return rel;
-        }
-        rel.put("available", true);
-        for (String k : DEPLOY_FILE_KEYS) {
-            if (m.containsKey(k)) {
-                rel.put(k, m.get(k));
-            }
-        }
-        rel.put("source", "app.public-api.deploy-file");
-        return rel;
+        return homeController.deploy(req, res);
     }
 
     /**
@@ -1062,76 +311,13 @@ public class PublicApiController {
      */
     @GetMapping({"/eval", "/eval.js"})
     public ResponseEntity<Map<String, Object>> evalReport(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(evalCache.get(cacheSeconds, this::buildEval), res);
-    }
-
-    private Map<String, Object> buildEval() {
-        Map<String, Object> out = new LinkedHashMap<>();
-        if (evalReportFile == null || evalReportFile.isBlank()) {
-            out.put("available", false);
-            out.put("reason", "EVAL_REPORT_NOT_CONFIGURED");
-            out.put("note", "未配置 app.public-api.eval-report-file：本服务不自己算评测数字，"
-                    + "也不以内置样本或 0 值顶替（0 会被误读成'测过但全错'）。");
-            return out;
-        }
-        Object parsed = readJsonOrNull(evalReportFile);
-        if (parsed == null) {
-            out.put("available", false);
-            out.put("reason", "EVAL_REPORT_UNREADABLE");
-            out.put("note", "评测报告文件不存在或不是合法 JSON：" + evalReportFile);
-            return out;
-        }
-        if (!(parsed instanceof Map<?, ?> m)) {
-            out.put("available", false);
-            out.put("reason", "EVAL_REPORT_SHAPE");
-            out.put("note", "评测报告顶层必须是 JSON 对象");
-            return out;
-        }
-        out.put("available", true);
-        for (String k : EVAL_REPORT_KEYS) {
-            if (m.containsKey(k)) {
-                out.put(k, m.get(k));
-            }
-        }
-        out.put("source", evalReportFile);
-        out.put("note", "数字来自离线评测报告原文（未重算、未四舍五入、未合并）；"
-                + "唯一改动是把白名单字段挑出来。报告自身的 generatedAt 决定它有多新。");
-        return out;
-    }
-
-    /**
-     * 读一个小 JSON 文件（只读、限长、任何异常一律返回 null）。
-     *
-     * <p>为什么限长：这是公开端点的数据源，若被误指向一个巨大文件，会把一次 HTTP 请求
-     * 变成一次全文件读取。超过上限就当"读不到"（而不是截断后当合法 JSON —— 那会发出半个真相）。
-     */
-    private Object readJsonOrNull(String path) {
-        try {
-            java.io.File f = new java.io.File(path);
-            if (!f.isFile() || !f.canRead()) {
-                return null;
-            }
-            if (f.length() > JSON_FILE_MAX_BYTES) {
-                logger.warn("公开端点 JSON 文件超过上限（{} > {}）：按读不到处理", f.length(), JSON_FILE_MAX_BYTES);
-                return null;
-            }
-            return new ObjectMapper().readValue(f, Map.class);
-        } catch (Exception e) {
-            logger.warn("公开端点读取 JSON 失败（{}）：{}", path, e.getMessage());
-            return null;
-        }
+        return miscController.evalReport(req, res);
     }
 
     /** 处置审计（只读）：封禁记录 + 审计流水，IP 按开关口径显示，不含原始 detail。 */
     @GetMapping({"/audit", "/audit.js"})
     public ResponseEntity<Map<String, Object>> audit(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(auditCache.get(cacheSeconds, this::buildAudit), res);
+        return alertController.audit(req, res);
     }
 
     /**
@@ -1160,54 +346,8 @@ public class PublicApiController {
      */
     @GetMapping({"/latest", "/latest.js"})
     public ResponseEntity<Map<String, Object>> latest(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(latestCache.get(cacheSeconds, this::buildLatest), res);
+        return alertController.latest(req, res);
     }
-
-    // ==================== 地理分布（离线库；设计见 docs/design-geo-endpoint.md，运维见 RUNBOOK §26） ====================
-
-    /** 地理分布端点自己的快照（与 /alerts 分开：它的取数是一次独立的 indexer 聚合查询） */
-    private final Snapshot geoCache = new Snapshot();
-
-    /**
-     * 离线地理库（<b>可为空</b>：裁剪过的部署 / 单测直接 new 控制器时就是 null）。
-     * 空 → 端点按 {@code GEO_DB_MISSING} 如实降级，绝不假装"没有攻击"。
-     */
-    @Autowired(required = false)
-    private org.example.geoip.GeoIpService geoIpService;
-
-    /** 入榜门槛：少于这么多次的攻击不入榜（防"1 次探测就上公网地图"） */
-    @Value("${app.public-api.geo.min-count:3}")
-    private int geoMinCount;
-
-    /** 占比门槛（%）：与条数门槛<b>同时</b>满足才入榜（防大窗口里的长尾噪声占满榜单） */
-    @Value("${app.public-api.geo.min-share-percent:1.0}")
-    private double geoMinSharePercent;
-
-    /** 每个来源字段取多少个 IP 做聚合（terms size）；超出的长尾由 coverage 如实披露 */
-    @Value("${app.public-api.geo.top-ips:1000}")
-    private int geoTopIps;
-
-    @Value("${app.public-api.geo.top-countries:20}")
-    private int geoTopCountries;
-
-    @Value("${app.public-api.geo.top-provinces:10}")
-    private int geoTopProvinces;
-
-    @Value("${app.public-api.geo.top-asns:10}")
-    private int geoTopAsns;
-
-    /**
-     * 我方自己的公网出口 IP（逗号分隔）。
-     *
-     * <p>为什么必须有：实测 24 小时 {@code data.srcip} 里排第二的是 srv2 自己的公网 IP（180 条）、
-     * 第三名是 srv1（15 条）—— 不排掉，"攻击来源 TOP"里会出现我们自己的服务器。
-     * 默认空：<b>服务器真实 IP 不进仓库</b>，由部署时的 {@code APP_GEOIP_SELF_IPS} 注入。
-     */
-    @Value("${app.geoip.self-ips:}")
-    private String geoSelfIps;
 
     /**
      * 攻击来源地理分布（<b>只聚合</b>）：国家 + 省份 + ASN + 时间桶，供博客大屏画"攻击来源分布"。
@@ -1238,137 +378,8 @@ public class PublicApiController {
      */
     @GetMapping({"/geo", "/geo.js"})
     public ResponseEntity<Map<String, Object>> geo(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(geoCache.get(cacheSeconds, this::buildGeo), res);
+        return geoController.geo(req, res);
     }
-
-    private Map<String, Object> buildGeo() {
-        org.example.geoip.GeoIpService svc = geoIpService;
-        if (svc == null) {
-            // 没有地理库 Bean（例如裁剪过的部署）：与"库缺失"同一口径，不假装有数据
-            return buildGeoUnavailable("GEO_DB_MISSING",
-                    "地理富化未装配（没有 GeoIpService）：本端点不返回任何分布，也不以 0 冒充'没有攻击'。",
-                    cacheSeconds, generatedAt());
-        }
-        if (!svc.ready()) {
-            return buildGeoUnavailable(svc.reason(), geoUnavailableNote(svc), cacheSeconds, generatedAt());
-        }
-        return buildGeo(svc, source.geoWindow24h(geoTopIps), geoThresholds(), cacheSeconds,
-                generatedAt(), geoSelfIps);
-    }
-
-    private static String geoUnavailableNote(org.example.geoip.GeoIpService svc) {
-        return switch (svc.state()) {
-            case DISABLED -> "地理富化已在配置中关闭（app.geoip.enabled=false）：不返回分布，也不以内置样本顶替。";
-            case MISSING -> "离线地理库不存在（app.geoip.city-db 指向的文件/目录里没有 dbip-city-lite-*.csv.gz）："
-                    + "请先跑 scripts/srv1-geoip-update.sh 落地 DB-IP Lite 库；本端点不返回任何数字。";
-            case LOADING -> "离线地理库正在后台装载：稍后重试即可（这不是'没有攻击'）。";
-            default -> "离线地理库读取失败（不是 gzip / 被截断 / 坏行超阈值 / 区间乱序）："
-                    + "请按 RUNBOOK §26 回滚到上一份库文件；本次不返回任何分布。";
-        };
-    }
-
-    private org.example.geoip.GeoAggregator.Thresholds geoThresholds() {
-        return new org.example.geoip.GeoAggregator.Thresholds(
-                Math.max(1, geoMinCount), Math.max(0d, geoMinSharePercent),
-                Math.max(1, geoTopCountries), Math.max(1, geoTopProvinces), Math.max(1, geoTopAsns));
-    }
-
-    /** 不可用载荷（纯函数：字段名与可用载荷对齐，前端只判 {@code available} 一个开关） */
-    static Map<String, Object> buildGeoUnavailable(String reason, String note, int cacheSeconds, String now) {
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", now);
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("available", false);
-        data.put("reason", reason);
-        data.put("geoSource", null);
-        data.put("geoAttribution", org.example.geoip.GeoIpService.ATTRIBUTION);
-        data.put("window", "24h");
-        data.put("coverage", org.example.geoip.GeoAggregator.emptyCoverage());
-        data.put("byCountry", List.of());
-        data.put("byProvinceCN", List.of());
-        data.put("byAsnTop", List.of());
-        data.put("trend", List.of());
-        // 小时 × 国家 这一块即便端点整体不可用也保持同形（前端只判 available 一个开关）
-        Map<String, Object> byCountryHour = new LinkedHashMap<>();
-        byCountryHour.put("available", false);
-        byCountryHour.put("reason", "HOUR_CROSS_MISSING");
-        byCountryHour.put("hours", List.of());
-        byCountryHour.put("series", List.of());
-        data.put("byCountryHour", byCountryHour);
-        data.put("note", note + " " + org.example.geoip.GeoIpService.ATTRIBUTION);
-        return data;
-    }
-
-    /**
-     * 可用性判定 + 聚合（<b>纯函数</b>：除入参外不读任何状态）。
-     *
-     * <p>抽成 static 是为了能被单测直接喂各种组合（库不可用 / 数据源不可用 / 窗口为空 / 正常聚合），
-     * 而不用起 Spring 上下文 —— 这些分支在真环境里几乎不可能同时复现。
-     */
-    static Map<String, Object> buildGeo(org.example.geoip.GeoIpService geo,
-                                        org.example.geoip.GeoWindow window,
-                                        org.example.geoip.GeoAggregator.Thresholds thresholds,
-                                        int cacheSeconds, String now, String selfIps) {
-        if (window == null || !window.available()) {
-            String reason = window == null ? "DATA_SOURCE_UNAVAILABLE" : window.reason();
-            String note = "DATA_SOURCE_UNAVAILABLE".equals(reason)
-                    ? "告警数据源不可达（或未拿到真实数据）：本次不展示任何地理分布，也不以内置样本顶替。"
-                    : reason + "；" + (window == null || window.note() == null ? "" : window.note());
-            return buildGeoUnavailable(reason, note, cacheSeconds, now);
-        }
-        Map<String, Object> data = org.example.geoip.GeoAggregator.aggregate(
-                new org.example.geoip.GeoAggregator.Inputs(
-                        window.ipCounts(), window.alertsTotal24h(), window.alertsWithSourceIp24h(),
-                        window.bucketsTruncated(), window.trend(), parseSelfIps(selfIps)),
-                geo, thresholds, now);
-        data.put("cacheSeconds", cacheSeconds);
-        if (window.ipCounts().isEmpty()) {
-            // 数据源可用但窗口内没有任何带来源 IP 的告警：仍然 available=true（不是故障），
-            // 但必须把这句话写进 note —— 否则读者会把"地图上什么都没有"读成"全量分布为空"
-            data.put("reason", "NO_DATA_IN_WINDOW");
-            data.put("note", "数据源可用，但最近 24 小时没有任何带来源 IP 的告警（不是故障）。"
-                    + org.example.geoip.GeoIpService.ATTRIBUTION);
-        }
-        return data;
-    }
-
-    /** 我方公网 IP 配置 → 集合（去空白、丢空项） */
-    static java.util.Set<String> parseSelfIps(String csv) {
-        java.util.Set<String> out = new java.util.LinkedHashSet<>();
-        if (csv == null) {
-            return out;
-        }
-        for (String s : csv.split(",")) {
-            String v = s.trim();
-            if (!v.isEmpty()) {
-                out.add(v);
-            }
-        }
-        return out;
-    }
-
-    // ==================== 攻击故事线（/stories + /story；设计见 docs/design-attack-story-endpoint.md，运维见 RUNBOOK §32） ====================
-
-    /**
-     * 攻击故事线服务（<b>可为空</b>：单测直接 new 控制器、或裁剪过的部署里就是 null）。
-     *
-     * <p>空 → 两个端点如实返回 {@code available=false + STORY_DISABLED}，
-     * 绝不用"空事件流"冒充"这个来源什么都没做"。
-     */
-    @Autowired(required = false)
-    private AttackStoryService attackStoryService;
-
-    /**
-     * 「这个 IP 干过什么」的组装层（<b>可为空</b>：单测直接 new 控制器、裁剪过的部署里就是 null）。
-     *
-     * <p>空 → 端点如实返回 {@code available=false + IP_PROFILE_DISABLED} 且所有计数项为 null，
-     * 绝不用"0 条"冒充"这个 IP 什么都没干"。
-     */
-    @Autowired(required = false)
-    private PublicIpProfileService ipProfileService;
 
     /**
      * <b>值得看的来源</b>：把同一个来源的「告警 → 诱饵端口 → 蜜罐登录 → 处置审计」四段
@@ -1398,22 +409,7 @@ public class PublicApiController {
             @RequestParam(value = "window", required = false) String window,
             @RequestParam(value = "limit", required = false) String limit,
             HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        Integer hours = AttackStoryService.parseWindowHours(window);
-        if (hours == null) {
-            return badRequest(res, "WINDOW_NOT_SUPPORTED",
-                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
-                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
-                            + "；其它窗口没有数据源验证，不猜）");
-        }
-        if (attackStoryService == null) {
-            return ok(storyDisabled(hours, null), res);
-        }
-        // 缓存与 limit 归一都在 AttackStoryService 里（它按 window / src 分开存，
-        // 单个 Snapshot 只存一份值，用在这里会把不同窗口的结果互相顶掉）
-        return ok(attackStoryService.stories(hours, attackStoryService.parseLimit(limit)), res);
+        return miscController.stories(window, limit, req, res);
     }
 
     /**
@@ -1436,38 +432,7 @@ public class PublicApiController {
             @RequestParam(value = "src", required = false) String src,
             @RequestParam(value = "window", required = false) String window,
             HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        Integer hours = AttackStoryService.parseWindowHours(window);
-        if (hours == null) {
-            return badRequest(res, "WINDOW_NOT_SUPPORTED",
-                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
-                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
-                            + "）");
-        }
-        String ip = src == null ? "" : src.trim();
-        if (ip.isEmpty()) {
-            return badRequest(res, "MISSING_SRC", "缺少 src 参数（要查哪一个来源）");
-        }
-        if (attackStoryService == null) {
-            return ok(storyDisabled(hours, ip), res);
-        }
-        // 只接受"公网字面量"这一种形状：形状不对直接 400，不拿它去查任何东西
-        if (!AttackStoryService.isPublicIp(ip)) {
-            return badRequest(res, "INVALID_SRC",
-                    "src 必须是观测到的公网来源地址（IPv4/IPv6 字面量）；内网/保留地址不进入故事线");
-        }
-        Map<String, Object> data = attackStoryService.story(ip, hours);
-        if (data == null) {
-            Map<String, Object> body = new LinkedHashMap<>();
-            body.put("code", 404);
-            body.put("message", "该来源不在当前窗口的候选池里（可能是窗口外、我方 IP、内网地址，"
-                    + "或这一段没有它的记录）；请先看 /api/public/stories");
-            body.put("reason", "SOURCE_NOT_IN_WINDOW");
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(body);
-        }
-        return ok(data, res);
+        return miscController.story(src, window, req, res);
     }
 
     /**
@@ -1492,152 +457,18 @@ public class PublicApiController {
      *
      * <p>用 {@code params="id"} 与既有的 {@code /story?src=} 区分：不带 {@code id} 的请求仍走老 handler，
      * 因此两个契约可以共存于同一路径；显式同时带 {@code id} 与 {@code src} 时本变体优先。
+     *
+     * <p>窗口参数同时接受 {@code window} 与 {@code hours}（前端时间线卡按字段名写成
+     * {@code ?id=…&hours=24}）；两者都缺省 24h，同时出现时以 {@code window} 为准。
+     * 取值仍只允许 {@link AttackStoryService#SUPPORTED_WINDOWS}，不认识的窗口直接 400。
      */
     @GetMapping(value = {"/story", "/story.js"}, params = "id")
     public ResponseEntity<Map<String, Object>> storyTimeline(
             @RequestParam(value = "id", required = false) String id,
             @RequestParam(value = "window", required = false) String window,
+            @RequestParam(value = "hours", required = false) String hoursParam,
             HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        Integer hours = AttackStoryService.parseWindowHours(window);
-        if (hours == null) {
-            return badRequest(res, "WINDOW_NOT_SUPPORTED",
-                    "不支持的 window（只实现了 " + AttackStoryService.SUPPORTED_WINDOWS.stream()
-                            .map(AttackStoryService::windowLabel).reduce((a, b) -> a + "/" + b).orElse("")
-                            + "；其它窗口没有数据源验证，不猜）");
-        }
-        String ip = id == null ? "" : id.trim();
-        if (ip.isEmpty()) {
-            return badRequest(res, "MISSING_ID",
-                    "缺少 id 参数：要画时间线的 IP，例如 /api/public/story?id=45.155.205.233");
-        }
-        // 与老 /story 同一个公网字面量口径：形状不对直接 400，不拿它去查任何东西
-        if (!AttackStoryService.isPublicIp(ip)) {
-            return badRequest(res, "INVALID_IP",
-                    "id 必须是公网 IP 字面量（IPv4/IPv6）；内网/保留地址、域名、带端口与网段写法一律不接受");
-        }
-        return ok(buildStoryTimeline(ip, hours), res);
-    }
-
-    /** 把 {@link AttackStoryService#story(String, int)} 的载荷投影成时间线形状；null/不可用一律如实降级。 */
-    private Map<String, Object> buildStoryTimeline(String ip, int hours) {
-        LocalDateTime now = LocalDateTime.now();
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("id", policy().display(ip));
-        Map<String, Object> story = attackStoryService == null ? null : attackStoryService.story(ip, hours);
-        if (story == null || !Boolean.TRUE.equals(story.get("available"))) {
-            return timelineUnavailable(data, hours, now);
-        }
-
-        List<?> rawEvents = story.get("events") instanceof List<?> l ? l : List.of();
-        List<Map<String, Object>> events = new ArrayList<>();
-        Map<String, Integer> severity = emptySeverity();
-        for (Object raw : rawEvents) {
-            if (!(raw instanceof Map<?, ?> m)) {
-                continue;
-            }
-            String sev = timelineText(m.get("severity"));
-            if (sev != null && severity.containsKey(sev)) {
-                severity.merge(sev, 1, Integer::sum);
-            }
-            if (events.size() >= TIMELINE_MAX_EVENTS) {
-                continue;
-            }
-            Map<String, Object> event = new LinkedHashMap<>();
-            event.put("time", timelineText(m.get("ts")));
-            // stage 是机器可读的四段标识（alerts/decoyPorts/honeypotLogins/auditActions）
-            event.put("kind", timelineText(m.get("stage")));
-            // kind 是 ATT&CK 式的事件类型（暴力破解/诱饵端口/登录尝试/处置动作）
-            event.put("rule", timelineText(m.get("kind")));
-            event.put("src", policy().display(ip));
-            event.put("sev", sev);
-            event.put("count", 1);
-            event.put("detail", timelineText(m.get("summary")));
-            events.add(event);
-        }
-        // 服务端已按 ts 升序排过；这里再排一次，保证"本端点按时间正序"不依赖上游实现细节
-        events.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("time"),
-                Comparator.nullsLast(Comparator.naturalOrder())));
-
-        Map<String, Object> window = timelineWindow(hours, now);
-        data.put("available", true);
-        data.put("reason", null);
-        data.put("total", rawEvents.size());
-        data.put("window", window);
-        data.put("firstSeen", timelineText(story.get("firstSeen")));
-        data.put("lastSeen", timelineText(story.get("lastSeen")));
-        data.put("severity", severity);
-        data.put("events", events);
-        return data;
-    }
-
-    /** 数据不足/数据源不可用：仍然是完整形状，但一个事件都不编。 */
-    private Map<String, Object> timelineUnavailable(Map<String, Object> data, int hours, LocalDateTime now) {
-        data.put("available", false);
-        data.put("reason", TIMELINE_REASON_UNAVAILABLE);
-        data.put("total", 0);
-        data.put("window", timelineWindow(hours, now));
-        data.put("firstSeen", null);
-        data.put("lastSeen", null);
-        data.put("severity", emptySeverity());
-        data.put("events", List.of());
-        return data;
-    }
-
-    /** 四档严重度计数固定按 CRITICAL/HIGH/MEDIUM/LOW 顺序输出；INFO 不属于这四档，不混进来。 */
-    private static Map<String, Integer> emptySeverity() {
-        Map<String, Integer> severity = new LinkedHashMap<>();
-        severity.put(AlertSeverity.CRITICAL.name(), 0);
-        severity.put(AlertSeverity.HIGH.name(), 0);
-        severity.put(AlertSeverity.MEDIUM.name(), 0);
-        severity.put(AlertSeverity.LOW.name(), 0);
-        return severity;
-    }
-
-    private static Map<String, Object> timelineWindow(int hours, LocalDateTime now) {
-        Map<String, Object> window = new LinkedHashMap<>();
-        window.put("hours", hours);
-        window.put("start", now.minusHours(hours).format(FMT));
-        window.put("end", now.format(FMT));
-        return window;
-    }
-
-    private static String timelineText(Object raw) {
-        if (raw == null) {
-            return null;
-        }
-        String s = String.valueOf(raw).trim();
-        return s.isEmpty() ? null : s;
-    }
-
-    /**
-     * 故事线服务未装配时的降级载荷（与可用载荷同名同形，前端只判 available）。
-     *
-     * <p>两个端点的形状不同，所以按调用方补对应的空集合键：
-     * {@code srcIp == null}（来自 {@code /stories}）补 {@code sources: []}，
-     * 否则（来自 {@code /story}）补 {@code events: []}。混着返回会让页面
-     * 把"候选列表"当"事件流"渲染。
-     */
-    private Map<String, Object> storyDisabled(int windowHours, String srcIp) {
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("cacheSeconds", Math.max(0, cacheSeconds));
-        data.put("window", AttackStoryService.windowLabel(windowHours));
-        data.put("windowHours", windowHours);
-        data.put("available", false);
-        data.put("reason", "STORY_DISABLED");
-        data.put("note", "攻击故事线未装配（裁剪过的部署，或单测直接 new 控制器）："
-                + "不返回任何来源/事件，也不用内部样本顶替");
-        if (srcIp == null) {
-            data.put("sources", List.of());
-        } else {
-            data.put("srcIp", policy().display(srcIp));
-            data.put("events", List.of());
-            data.put("eventCount", 0);
-        }
-        return data;
+        return miscController.storyTimeline(id, window, hoursParam, req, res);
     }
 
     /**
@@ -1668,28 +499,7 @@ public class PublicApiController {
     public ResponseEntity<Map<String, Object>> ipProfile(
             @RequestParam(value = "q", required = false) String q,
             HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        String ip = q == null ? "" : q.trim();
-        if (ip.isEmpty()) {
-            return badRequest(res, "MISSING_Q",
-                    "缺少 q 参数：要查的 IPv4 地址，例如 /api/public/ip?q=45.155.205.233");
-        }
-        if (!PublicIpProfileService.isIpv4Literal(ip)) {
-            return badRequest(res, "INVALID_IP",
-                    "q 必须是 IPv4 字面量（四段十进制、每段 0-255）；IPv6 / 域名 / 带端口 / 网段写法"
-                            + "一律不接受，也不做任何猜测性解析");
-        }
-        if (!PublicIpProfileService.isQueryable(ip)) {
-            return badRequest(res, "NOT_PUBLIC_IP",
-                    "内网/保留/链路地址不在公开查询口径内：它们在公开面上统一写作「内网/未知」，"
-                            + "而多个不同的内网地址会共用同一个输入，按 IP 查只会给出误导性的答案");
-        }
-        if (ipProfileService == null) {
-            return ok(PublicIpProfileService.disabled(policy().display(ip), cacheSeconds), res);
-        }
-        return ok(ipProfileService.profile(ip), res);
+        return geoController.ipProfile(q, req, res);
     }
 
     // ==================== 密码自查（/api/public/password；别名 /password.js）====================
@@ -1721,157 +531,8 @@ public class PublicApiController {
     public ResponseEntity<Map<String, Object>> password(
             @RequestParam(value = "p", required = false) String p,
             HttpServletRequest req, HttpServletResponse res) {
-        PublicAskRateLimiter limiter = passwordLimiter();
-        String ip = clientIp(req);
-        if (!limiter.allow(ip)) {
-            return tooMany(res, limiter, "密码自查请求过于频繁（每 IP 每分钟 "
-                    + limiter.limitPerMinute() + " 次），请稍后再试；这是防刷，不是限制你检查自己的口令");
-        }
-        if (!PasswordDictionaryService.isLowerHex(p, PasswordDictionaryService.PREFIX_HEX_CHARS)) {
-            return badRequest(res, "INVALID_PREFIX",
-                    "p 必须是口令 SHA-256 的前 " + PasswordDictionaryService.PREFIX_HEX_CHARS
-                            + " 位小写十六进制（例如 /api/public/password?p=a1b2c）；本端点只收前缀，"
-                            + "不收口令原文、不收大写 hex、也不收前 6 位以上的部分 hash");
-        }
-
-        PasswordDictionaryService.Snapshot snap = passwordDict == null
-                ? PasswordDictionaryService.unavailable("DICT_NOT_WIRED")
-                : passwordDict.snapshot();
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("prefix", p);
-        data.put("match", null);
-        data.put("available", snap.available());
-        data.put("limits", passwordLimits());
-
-        if (!snap.available()) {
-            // 读不到：只写原因，不写"0 次"（0 会被读成"没被尝试过"，正是最危险的假阴性）
-            data.put("bucketCount", null);
-            data.put("bucketLastSeen", null);
-            data.put("hashes", List.of());
-            data.put("listed", List.of());
-            data.put("truncated", false);
-            data.put("notes", "读不到攻击者口令字典（" + snap.reason() + "）—— 不补数：这里没有记录，"
-                    + "不代表这个口令不在攻击者字典里；请不要把这句读成\"安全\"");
-        } else {
-            PasswordDictionaryService.Bucket bucket = snap.bucket(p);
-            int cap = Math.max(1, Math.min(passwordMaxHashes, PasswordDictionaryService.MAX_SUFFIXES_PER_BUCKET));
-            if (bucket == null) {
-                data.put("bucketCount", 0L);
-                data.put("bucketLastSeen", null);
-                data.put("hashes", List.of());
-                data.put("listed", List.of());
-                data.put("truncated", false);
-                data.put("notes", "这个前缀下没有任何记录（字典生成于 " + nz(snap.generatedAt())
-                        + "）—— 不代表绝对安全：攻击者字典不是全集，我们只统计自己蜜罐与公开弱口令榜里出现过的口令");
-            } else {
-                List<String> suffixes = bucket.suffixes();
-                List<String> listed = bucket.listed();
-                boolean truncated = suffixes.size() > cap || listed.size() > cap;
-                data.put("bucketCount", bucket.count());
-                data.put("bucketLastSeen", bucket.lastSeen());
-                data.put("hashes", suffixes.size() > cap ? suffixes.subList(0, cap) : suffixes);
-                data.put("listed", listed.size() > cap ? listed.subList(0, cap) : listed);
-                data.put("truncated", truncated);
-                data.put("notes", "bucketCount 是这 5 位前缀下**所有**口令的尝试次数合计（不是你这一个的次数）："
-                        + "命中与否由页面用完整 hash 的后 " + PasswordDictionaryService.SUFFIX_HEX_CHARS
-                        + " 位自行比对。hashes = 蜜罐里真实出现过的口令；listed = 只在公开弱口令榜里、"
-                        + "蜜罐还没抓到过的口令 —— 两者文案必须分开，别把\"榜上有名\"写成\"被攻击者试过 N 次\"。"
-                        + (truncated
-                        ? "该桶有 " + suffixes.size() + " 条（榜单 " + listed.size() + " 条），只下发前 " + cap
-                                + " 条（truncated:true）—— 你的口令不在这 " + cap
-                                + " 条里时页面会显示\"未命中\"，那可能只是被截断了，不代表不在字典里。"
-                        : ""));
-            }
-            data.put("generatedAt", snap.generatedAt());
-            data.put("totalAttempts", snap.totalAttempts());
-            data.put("unique", snap.unique());
-        }
-
-        return respondPassword(data, snap.available(), limiter, ip, res);
+        return miscController.password(p, req, res);
     }
-
-    /** 密码自查的出口：自带 Cache-Control（public, max-age=5 分钟）与数据源标记，不复用 {@code ok(...)} */
-    private ResponseEntity<Map<String, Object>> respondPassword(
-            Map<String, Object> data, boolean available, PublicAskRateLimiter limiter,
-            String clientIp, HttpServletResponse res) {
-        res.setHeader("Cache-Control", "public, max-age=" + Math.max(0, passwordCacheSeconds));
-        res.setHeader("X-Data-Source", available ? "PASSWORD_DICT" : "PASSWORD_DICT_UNAVAILABLE");
-        res.setHeader("X-RateLimit-Limit", String.valueOf(limiter.limitPerMinute()));
-        res.setHeader("X-RateLimit-Remaining", String.valueOf(limiter.remaining(clientIp)));
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 200);
-        body.put("message", "success");
-        body.put("data", data);
-        return ResponseEntity.ok(body);
-    }
-
-    /** 公开的限额口径：让页面能把"为什么只有 200 条"与"多久能再查一次"如实写出来 */
-    private Map<String, Object> passwordLimits() {
-        Map<String, Object> limits = new LinkedHashMap<>();
-        limits.put("perMinute", passwordLimiter().limitPerMinute());
-        limits.put("maxHashesPerBucket", Math.max(1,
-                Math.min(passwordMaxHashes, PasswordDictionaryService.MAX_SUFFIXES_PER_BUCKET)));
-        limits.put("cacheSeconds", Math.max(0, passwordCacheSeconds));
-        limits.put("prefixHexChars", PasswordDictionaryService.PREFIX_HEX_CHARS);
-        limits.put("suffixHexChars", PasswordDictionaryService.SUFFIX_HEX_CHARS);
-        return limits;
-    }
-
-    private static String nz(String s) {
-        return s == null || s.isBlank() ? "未知时间" : s;
-    }
-
-    /** 注入的限流器优先；没有 Spring 注入时用同口径的本地实例（仍然限流，不退化为不限） */
-    private PublicAskRateLimiter passwordLimiter() {
-        PublicAskRateLimiter l = passwordRateLimiter;
-        if (l != null) {
-            return l;
-        }
-        PublicAskRateLimiter f = fallbackPasswordRateLimiter;
-        if (f == null) {
-            synchronized (this) {
-                f = fallbackPasswordRateLimiter;
-                if (f == null) {
-                    f = new PublicAskRateLimiter(Math.max(1, passwordRequestsPerMinute));
-                    fallbackPasswordRateLimiter = f;
-                }
-            }
-        }
-        return f;
-    }
-
-    /** 400：参数不合法（只回机读 reason + 人话，不回任何内部细节） */
-    private ResponseEntity<Map<String, Object>> badRequest(HttpServletResponse res, String reason, String message) {
-        res.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 400);
-        body.put("message", message);
-        body.put("reason", reason);
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
-    }
-
-    // ==================== 访问日志聚合（/api/public/webstats；设计见 docs/design-webstats-public-endpoint.md） ====================
-
-    /** 聚合端点自己的快照（与 /geo 分开：它读的是内存聚合器，不碰 indexer） */
-    private final Snapshot webStatsCache = new Snapshot();
-
-    /**
-     * 访问日志聚合数据面（<b>可为空</b>：单测直接 new 控制器、或裁剪过的部署里就是 null）。
-     * 空 → 端点按 {@code WEBSTATS_DISABLED} 如实降级，绝不假装"最近没人扫"。
-     */
-    @Autowired(required = false)
-    private org.example.accesslog.WebStatsService webStatsService;
-
-    /** 入榜门槛（站主口径⑤：类别计数 ≥5 才进 topCategories，低于门槛的只进总量） */
-    @Value("${app.webstats.min-count:5}")
-    private int webStatsMinCount = 5;
-
-    @Value("${app.webstats.top-categories:10}")
-    private int webStatsTopCategories = 10;
-
-    @Value("${app.webstats.top-uas:5}")
-    private int webStatsTopUas = 5;
 
     /**
      * 访问日志聚合（<b>只聚合</b>）：HTTP 状态码分布 + 7 天按天 + 7×24 热力图 + 固定类别 TOP + UA TOP，
@@ -1903,296 +564,30 @@ public class PublicApiController {
      */
     @GetMapping({"/webstats", "/webstats.js"})
     public ResponseEntity<Map<String, Object>> webstats(HttpServletRequest req, HttpServletResponse res) {
-        if (!rateLimiter.allow(clientIp(req))) {
-            return tooMany(res);
-        }
-        return ok(webStatsCache.get(cacheSeconds, this::buildWebStats), res);
+        return miscController.webstats(req, res);
     }
 
-    private Map<String, Object> buildWebStats() {
-        String now = generatedAt();
-        org.example.accesslog.WebStatsService svc = webStatsService;
-        if (svc == null || !svc.enabled()) {
-            return buildWebStatsUnavailable("WEBSTATS_DISABLED",
-                    "访问日志聚合已在配置中关闭（app.webstats.enabled=false）：本端点不返回任何分布，"
-                            + "也不以 0 冒充'最近没有扫描'。", cacheSeconds, now);
-        }
-        org.example.accesslog.WebStatsService.Status st = svc.status();
-        if (!st.accessLogEnabled()) {
-            return buildWebStatsUnavailable("LOG_DISABLED",
-                    "应用侧访问日志已关闭（app.accesslog.enabled=false）：没有数据源，"
-                            + "本端点不返回任何分布（URL 级扫描在应用侧不可见）。", cacheSeconds, now);
-        }
-        if (!st.fileExists()) {
-            return buildWebStatsUnavailable("LOG_FILE_MISSING",
-                    "访问日志文件当前不存在（可能被删、正在轮转，或从未写入）：不返回分布。"
-                            + "内存聚合器仍在计数，文件恢复后会自动恢复（探测间隔见配置）。", cacheSeconds, now);
-        }
-        if (!st.fileReadable()) {
-            return buildWebStatsUnavailable("LOG_UNREADABLE",
-                    "访问日志文件存在但读不出来（权限/被占用/不是普通文件）：不返回分布，"
-                            + "也不以 0 冒充'这段时间太平'。", cacheSeconds, now);
-        }
-        org.example.accesslog.WebStatsAggregator.Thresholds th = webStatsThresholds();
-        org.example.accesslog.WebStatsAggregator.Snapshot snap =
-                svc.snapshot(java.time.OffsetDateTime.now(), th);
-        if (snap.requests() <= 0) {
-            // 窗口空 = 数据源可用但确实没有请求（不是故障）。回填还没读完时单独一个 reason：
-            // 否则"刚重启还没读到日志"会被画成"24 小时零请求"。
-            if (st.backfillRunning() || !st.backfillDone()) {
-                return buildWebStatsUnavailable("BACKFILL_RUNNING",
-                        "启动回填仍在后台进行（不阻塞启动）：暂不展示分布，"
-                                + "以免把'还没读到'画成'没有请求'；稍后重试即可。", cacheSeconds, now);
-            }
-            return buildWebStatsUnavailable("WINDOW_EMPTY",
-                    "访问日志可读，但最近 24 小时窗口内没有任何请求记录（不是故障，也不是被隐藏）。",
-                    cacheSeconds, now);
-        }
-        return buildWebStatsAvailable(snap, st, cacheSeconds, now, th);
-    }
-
-    private org.example.accesslog.WebStatsAggregator.Thresholds webStatsThresholds() {
-        return new org.example.accesslog.WebStatsAggregator.Thresholds(
-                Math.max(1, webStatsMinCount), Math.max(1, webStatsTopCategories), Math.max(0, webStatsTopUas));
-    }
-
-    /** 不可用载荷（字段名与可用载荷完全一致：前端只判 {@code available} 一个开关） */
-    static Map<String, Object> buildWebStatsUnavailable(String reason, String note, int cacheSeconds, String now) {
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", now);
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("window", "24h");
-        data.put("available", false);
-        data.put("reason", reason);
-        data.put("totals", webStatsTotals(0L, org.example.accesslog.WebStatsAggregator.StatusClass.EMPTY));
-        data.put("topCategories", List.of());
-        data.put("topUas", List.of());
-        data.put("byDay", List.of());
-        data.put("heatmap", List.of());
-        data.put("thresholds", webStatsThresholds(DEFAULT_WEBSTATS_THRESHOLDS));
-        data.put("coverage", webStatsCoverage(null, null, null));
-        data.put("note", note + " " + WEBSTATS_NOTE_SUFFIX);
-        return data;
-    }
-
-    /** 缺口门槛兜底（没有注入配置时的默认值：≥5 次入榜） */
-    private static final org.example.accesslog.WebStatsAggregator.Thresholds DEFAULT_WEBSTATS_THRESHOLDS =
-            org.example.accesslog.WebStatsAggregator.Thresholds.defaults();
-
-    /**
-     * 可用载荷（<b>纯函数</b>：除入参外不读任何状态，方便单测直接喂各种组合）。
-     *
-     * <p>出参字段就是公开契约：{@code generatedAt / cacheSeconds / window / available / reason /
-     * totals / topCategories / topUas / byDay / heatmap / thresholds / coverage / note}
-     * （+ 出口统一加的 {@code ipDisclosure}）。<b>只许新增，不许改名/删除</b>。
-     */
-    static Map<String, Object> buildWebStatsAvailable(org.example.accesslog.WebStatsAggregator.Snapshot snap,
-                                                      org.example.accesslog.WebStatsService.Status st,
-                                                      int cacheSeconds, String now,
-                                                      org.example.accesslog.WebStatsAggregator.Thresholds th) {
-        org.example.accesslog.WebStatsAggregator.Thresholds t =
-                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
-        long requests = Math.max(0L, snap.requests());
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", now);
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("window", "24h");
-        data.put("available", true);
-        data.put("reason", "OK");
-        data.put("totals", webStatsTotals(requests, snap.statusClass()));
-
-        List<Map<String, Object>> categories = new ArrayList<>();
-        for (org.example.accesslog.WebStatsAggregator.CategoryCount c : snap.topCategories()) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("category", c.category());
-            m.put("count", c.count());
-            m.put("sharePercent", webStatsSharePercent(c.count(), requests));
-            categories.add(m);
-        }
-        data.put("topCategories", categories);
-
-        List<Map<String, Object>> uas = new ArrayList<>();
-        for (org.example.accesslog.WebStatsAggregator.UaCount u : snap.topUas()) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("ua", u.ua());
-            m.put("count", u.count());
-            uas.add(m);
-        }
-        data.put("topUas", uas);
-
-        List<Map<String, Object>> byDay = new ArrayList<>();
-        for (org.example.accesslog.WebStatsAggregator.DayStat d : snap.byDay()) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("date", d.date());
-            m.put("requests", d.requests());
-            m.put("statusClass", webStatsStatusClassMap(d.statusClass()));
-            byDay.add(m);
-        }
-        data.put("byDay", byDay);
-
-        List<Map<String, Object>> heatmap = new ArrayList<>();
-        for (org.example.accesslog.WebStatsAggregator.HourStat h : snap.heatmap()) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("date", h.date());
-            m.put("hour", h.hour());
-            m.put("count", h.requests());
-            heatmap.add(m);
-        }
-        data.put("heatmap", heatmap);
-
-        data.put("thresholds", webStatsThresholds(t));
-        data.put("coverage", webStatsCoverage(st, snap, t));
-        data.put("note", webStatsNote(t) + " " + WEBSTATS_NOTE_SUFFIX);
-        return data;
-    }
-
-    static Map<String, Object> webStatsTotals(long requests,
-                                              org.example.accesslog.WebStatsAggregator.StatusClass sc) {
-        Map<String, Object> totals = new LinkedHashMap<>();
-        totals.put("requests", requests);
-        totals.put("statusClass", webStatsStatusClassMap(sc));
-        return totals;
-    }
-
-    /** 状态码只到类别（口径⑥）：key 固定为 2xx/3xx/4xx/5xx/other，永远是这五个 */
-    static Map<String, Object> webStatsStatusClassMap(org.example.accesslog.WebStatsAggregator.StatusClass sc) {
-        org.example.accesslog.WebStatsAggregator.StatusClass v =
-                sc == null ? org.example.accesslog.WebStatsAggregator.StatusClass.EMPTY : sc;
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("2xx", v.c2xx());
-        m.put("3xx", v.c3xx());
-        m.put("4xx", v.c4xx());
-        m.put("5xx", v.c5xx());
-        m.put("other", v.other());
-        return m;
-    }
-
-    static Map<String, Object> webStatsThresholds(org.example.accesslog.WebStatsAggregator.Thresholds th) {
-        org.example.accesslog.WebStatsAggregator.Thresholds t =
-                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("minCount", t.minCount());
-        m.put("topCategories", t.topCategories());
-        m.put("topUas", t.topUas());
-        return m;
+    /** 不可用载荷（纯函数：字段名与可用载荷对齐，前端只判 {@code available} 一个开关） */
+    static Map<String, Object> buildGeoUnavailable(String reason, String note, int cacheSeconds, String now) {
+        return PublicGeoController.buildGeoUnavailable(reason, note, cacheSeconds, now);
     }
 
     /**
-     * 覆盖度自证：<b>内存上限</b>（桶数/热力格数/UA 槽数）、回填与解析的实数、窗口外的丢弃数。
+     * 可用性判定 + 聚合（<b>纯函数</b>：除入参外不读任何状态）。
      *
-     * <p>刻意<b>不</b>输出 {@code lastError} 原文：那是内部绝对路径/异常文本，
-     * 属于"内部资产名"那一类，只给一个布尔。
+     * <p>抽成 static 是为了能被单测直接喂各种组合（库不可用 / 数据源不可用 / 窗口为空 / 正常聚合），
+     * 而不用起 Spring 上下文 —— 这些分支在真环境里几乎不可能同时复现。
      */
-    static Map<String, Object> webStatsCoverage(org.example.accesslog.WebStatsService.Status st,
-                                                org.example.accesslog.WebStatsAggregator.Snapshot snap,
-                                                org.example.accesslog.WebStatsAggregator.Thresholds th) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("logReadable", st != null && st.fileReadable());
-        m.put("backfillDone", st != null && st.backfillDone());
-        m.put("backfillRunning", st != null && st.backfillRunning());
-        m.put("backfilledRecords", st == null ? 0L : st.backfilledRecords());
-        m.put("parsedRecords", st == null ? 0L : st.parsedRecords());
-        m.put("skippedLines", st == null ? 0L : st.skippedLines());
-        m.put("sourceError", st != null && st.lastError() != null && !st.lastError().isEmpty());
-        m.put("bucketCount", st == null ? org.example.accesslog.WebStatsAggregator.BUCKET_COUNT : st.bucketCount());
-        m.put("bucketSeconds", st == null ? org.example.accesslog.WebStatsAggregator.BUCKET_SECONDS : st.bucketSeconds());
-        m.put("hourCells", st == null ? org.example.accesslog.WebStatsAggregator.HOUR_CELLS : st.hourCells());
-        m.put("uaSlotsPerBucket", st == null ? org.example.accesslog.WebStatsAggregator.UA_SLOTS_PER_BUCKET : st.uaSlotsPerBucket());
-        m.put("globalUaSlots", st == null ? org.example.accesslog.WebStatsAggregator.GLOBAL_UA_SLOTS : st.globalUaSlots());
-        m.put("uaOverflowRows", snap == null ? 0L : snap.uaOverflowRows());
-        m.put("uaKeysDropped", snap == null ? 0L : snap.uaKeysDropped());
-        m.put("recordsOutsideWindow", snap == null ? 0L : snap.droppedOutOfWindow());
-        m.put("bucketStaleSkips", snap == null ? 0L : snap.staleSlotSkips());
-        return m;
+    static Map<String, Object> buildGeo(org.example.geoip.GeoIpService geo,
+                                        org.example.geoip.GeoWindow window,
+                                        org.example.geoip.GeoAggregator.Thresholds thresholds,
+                                        int cacheSeconds, String now, String selfIps) {
+        return PublicGeoController.buildGeo(geo, window, thresholds, cacheSeconds, now, selfIps);
     }
 
-    /** 占比（百分数，保留两位）——只用于展示与门槛，不参与任何账目 */
-    static double webStatsSharePercent(long count, long total) {
-        if (total <= 0) {
-            return 0d;
-        }
-        return Math.round(count * 10000.0d / total) / 100.0d;
-    }
-
-    static String webStatsNote(org.example.accesslog.WebStatsAggregator.Thresholds th) {
-        org.example.accesslog.WebStatsAggregator.Thresholds t =
-                (th == null ? DEFAULT_WEBSTATS_THRESHOLDS : th).normalized();
-        return "只给聚合：不含任何 IP（连掩码 IP 都没有）、不含原始路径与查询串、不含来源数、不含疑似扫描占比。"
-                + "路径只以固定类别出现（" + org.example.accesslog.WebStatsCategory.ALL.stream()
-                .map(org.example.accesslog.WebStatsCategory::wireName).reduce((a, b) -> a + "/" + b).orElse("")
-                + "），低于门槛（计数>=" + t.minCount() + "）的类别/UA 只计入总量。"
-                + "statusClass 只到类别（2xx/3xx/4xx/5xx/other），不给具体状态码。";
-    }
-
-    /** 所有 webstats 响应共用的口径尾巴（含"缺格/缺天"的读法，防止读者自己脑补） */
-    static final String WEBSTATS_NOTE_SUFFIX =
-            "heatmap 是最近 7 天按日志行本地时间的整点桶（7×24=168 格，只列有请求的格，缺格=0）；"
-                    + "byDay 只含日志里真实有请求的天（缺天=那天的日志已被轮转删除，或确实没有请求）；"
-                    + "24h 窗口 = 最近 288 个 5 分钟桶（最老的 <=5 分钟落在窗口外）；时间取自日志行自带的时区偏移。";
-
-    // ==================== 载荷组装 ====================
-
-    private Map<String, Object> buildHoneypot() {
-        Map<String, Object> raw = source.honeypotSummary(800);
-        boolean available = Boolean.TRUE.equals(raw.get("available"));
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("available", available);
-        data.put("commandsAvailable", Boolean.TRUE.equals(raw.get("commandsAvailable")));
-        data.put("note", available
-                ? (policy().masked()
-                        ? "IP 已掩码到网段；命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）"
-                        : "IP 显示观测到的真实来源地址（内网/保留地址一律写作「内网/未知」）；"
-                                + "口令只给结构，命令时间线的数据源尚未接入（Wazuh 侧没有命令执行规则，不编造）")
-                : "蜜罐数据源不可达，本页不展示任何蜜罐数据");
-
-        if (available) {
-            data.put("total", raw.get("total"));
-            data.put("connections", raw.get("connections"));
-            data.put("logins", raw.get("logins"));
-            data.put("loginFails", raw.get("loginFails"));
-            data.put("sampled", raw.get("sampled"));
-            // 【2026-10-14 修】账号口令 Top 不再原样透出。
-            // 改造前的注释写着"那是攻击者试的弱口令，是战报的核心信息"——来源里确实是这么想的，
-            // 但原样输出的是【完整口令】（键的形状是 "root / 123456"），而站主的硬约束是
-            // 蜜罐抓到的完整口令/凭据永不上公网（与投诉无关，是硬伤害）。
-            // 现在只出结构：用户名 + 长度 + 字符类 + 弱口令标记；key 仍是同一个键，
-            // 值改成结构摘要（"root / 6 位·小写字母+数字·弱口令"），页面无需为"口令列"改结构。
-            data.put("topCredentials", credentialShapes(raw.get("topCredentials")));
-            data.put("topSources", topSourcesForPublic(raw.get("topSources"), policy()));
-            data.put("topClients", raw.get("topClients"));
-            data.put("timeline", timelineForPublic(raw.get("timeline"), policy()));
-        }
-        return data;
-    }
-
-    private Map<String, Object> buildAudit() {
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("readOnly", true);
-        data.put("summary", auditReader.summary());
-        data.put("blocks", auditReader.blocks(20));
-        data.put("actions", actionTextForPublic(auditReader.actions(30), policy()));
-        return data;
-    }
-
-    /** {@code /latest} 的取数入口（控制器方法，便于测试时只换数据源） */
-    private Map<String, Object> buildLatest() {
-        List<SecurityAlert> alerts = source.readAlerts();
-        String mode = source.mode();
-        boolean available = source.realData() && !alerts.isEmpty();
-
-        List<Map<String, Object>> blocks = auditReader == null ? List.of() : auditReader.blocks(1);
-        return buildLatest(alerts, available, mode, source.windowSize(), cacheSeconds, generatedAt(),
-                blocks, policy());
-    }
-
-    private String generatedAt() {
-        return LocalDateTime.now().format(FMT);
+    /** 我方公网 IP 配置 → 集合（去空白、丢空项） */
+    static java.util.Set<String> parseSelfIps(String csv) {
+        return PublicGeoController.parseSelfIps(csv);
     }
 
     /**
@@ -2220,11 +615,7 @@ public class PublicApiController {
     static Map<String, Object> buildLatest(List<SecurityAlert> alerts, boolean available, String mode,
                                            int windowSize, int cacheSeconds, String generatedAt,
                                            List<Map<String, Object>> latestBlocks) {
-        // 【保留这个 7 参重载】它等价于"掩码态"，也就是改造前的口径：
-        // 既有的载荷口径测试（PublicApiLatestTest）用的就是它，因此它们
-        // 一字不改仍然是"掩码回归"的证据。生产链路走下面带 policy 的重载。
-        return buildLatest(alerts, available, mode, windowSize, cacheSeconds, generatedAt,
-                latestBlocks, PublicIpPolicy.masking());
+        return PublicAlertController.buildLatest(alerts, available, mode, windowSize, cacheSeconds, generatedAt, latestBlocks);
     }
 
     /**
@@ -2235,107 +626,35 @@ public class PublicApiController {
     static Map<String, Object> buildLatest(List<SecurityAlert> alerts, boolean available, String mode,
                                            int windowSize, int cacheSeconds, String generatedAt,
                                            List<Map<String, Object>> latestBlocks, PublicIpPolicy policy) {
-        PublicIpPolicy p = policy == null ? PublicIpPolicy.masking() : policy;
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", generatedAt);
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("available", available);
-        data.put("wazuhMode", mode);
-        data.put("windowSize", windowSize);
-        data.put("windowAlertCount", alerts == null ? 0 : alerts.size());
-
-        if (!available) {
-            // 如实说原因。两种"没有数据"必须区分开：数据源不可用 vs 确实这段时间没有告警 ——
-            // 前者是故障，后者是常态，混在一起会让前端把"链路断了"渲染成"一切太平"。
-            String reason = "REAL".equalsIgnoreCase(mode == null ? "" : mode.trim())
-                    ? "NO_DATA_IN_WINDOW" : "DATA_SOURCE_UNAVAILABLE";
-            data.put("reason", reason);
-            data.put("note", "DATA_SOURCE_UNAVAILABLE".equals(reason)
-                    ? "告警数据源不可达（或未拿到真实数据），本次不展示任何告警数字，也不以内置样本顶替"
-                    : "数据源可用，但当前取数窗口内没有任何真实告警（不是故障）");
-            data.put("latestEvent", null);
-            data.put("latestBlock", latestBlocks == null || latestBlocks.isEmpty() ? null : latestBlocks.get(0));
-            return data;
-        }
-
-        data.put("reason", "OK");
-        data.put("note", p.masked()
-                ? "字段全部来自公开白名单：来源 IP 已掩码到网段，不含标题/内网目的地址/聚合 id"
-                : "字段全部来自公开白名单：来源 IP 显示观测到的真实地址（内网/保留地址写作「内网/未知」），"
-                        + "不含标题/内网目的地址/聚合 id");
-
-        data.put("severityCounts", severityCounts(alerts));
-        data.put("sourceCounts", sourceCounts(alerts));
-
-        SecurityAlert newest = newest(alerts);
-        Map<String, Object> ev = new LinkedHashMap<>();
-        ev.put("occurredAt", newest == null ? null : newest.getOccurredAt());
-        putEnum(ev, "severity", newest == null ? null : newest.getSeverity());
-        putEnum(ev, "type", newest == null ? null : newest.getType());
-        putEnum(ev, "source", newest == null ? null : newest.getSource());
-        ev.put("srcIp", p.display(newest == null ? null : newest.getSrcIp()));
-        data.put("latestEvent", ev);
-        data.put("latestBlock", latestBlocks == null || latestBlocks.isEmpty() ? null : latestBlocks.get(0));
-        return data;
+        return PublicAlertController.buildLatest(alerts, available, mode, windowSize, cacheSeconds, generatedAt, latestBlocks, policy);
     }
 
-    /** 等级分布（固定枚举顺序，前端不必自己兜底缺失档位） */
-    private static List<Map<String, Object>> severityCounts(List<SecurityAlert> alerts) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (AlertSeverity s : AlertSeverity.values()) {
-            out.add(bucketOf(s.name(), s.getLabel(),
-                    alerts.stream().filter(a -> a.getSeverity() == s).count()));
-        }
-        return out;
+    /**
+     * 可用载荷（<b>纯函数</b>：除入参外不读任何状态，方便单测直接喂各种组合）。
+     *
+     * <p>出参字段就是公开契约：{@code generatedAt / cacheSeconds / window / available / reason /
+     * totals / topCategories / topUas / byDay / heatmap / thresholds / coverage / note}
+     * （+ 出口统一加的 {@code ipDisclosure}）。<b>只许新增，不许改名/删除</b>。
+     */
+    static Map<String, Object> buildWebStatsAvailable(org.example.accesslog.WebStatsAggregator.Snapshot snap,
+                                                      org.example.accesslog.WebStatsService.Status st,
+                                                      int cacheSeconds, String now,
+                                                      org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        return PublicMiscController.buildWebStatsAvailable(snap, st, cacheSeconds, now, th);
     }
 
-    /** 来源分布（固定枚举顺序） */
-    private static List<Map<String, Object>> sourceCounts(List<SecurityAlert> alerts) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (AlertSource s : AlertSource.values()) {
-            out.add(bucketOf(s.name(), s.getLabel(),
-                    alerts.stream().filter(a -> a.getSource() == s).count()));
-        }
-        return out;
+    /** 不可用载荷（字段名与可用载荷完全一致：前端只判 {@code available} 一个开关） */
+    static Map<String, Object> buildWebStatsUnavailable(String reason, String note, int cacheSeconds, String now) {
+        return PublicMiscController.buildWebStatsUnavailable(reason, note, cacheSeconds, now);
     }
 
-    /** 窗口内最近一条（按 occurredAt 倒序；时间解析不了的一律排到最后，不拿它冒充"最近"） */
-    private static SecurityAlert newest(List<SecurityAlert> alerts) {
-        SecurityAlert best = null;
-        LocalDateTime bestTime = null;
-        for (SecurityAlert a : alerts) {
-            LocalDateTime t = parseTime(a == null ? null : a.getOccurredAt());
-            if (t == null) {
-                continue;
-            }
-            if (bestTime == null || t.isAfter(bestTime)) {
-                bestTime = t;
-                best = a;
-            }
-        }
-        return best;
+    /** 占比（百分数，保留两位）——只用于展示与门槛，不参与任何账目 */
+    static double webStatsSharePercent(long count, long total) {
+        return PublicMiscController.webStatsSharePercent(count, total);
     }
 
-    /** {@link #bucket} 的 static 版本（{@link #buildLatest} 是静态方法，不能调实例方法） */
-    private static Map<String, Object> bucketOf(String key, String label, long count) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("key", key);
-        m.put("label", label);
-        m.put("count", count);
-        return m;
-    }
-
-    /** 审计流水的文本字段（reason）也过一遍 IP 口径与口令隐藏 —— 文本里可能内嵌 IP / 口令 */
-    private static List<Map<String, Object>> actionTextForPublic(List<Map<String, Object>> in,
-                                                                 PublicIpPolicy policy) {
-        for (Map<String, Object> m : in) {
-            Object reason = m.get("reason");
-            if (reason != null) {
-                // 先隐口令（与 IP 口径无关的硬约束），再按开关处理 IP
-                m.put("reason", policy.displayText(CredentialStructure.hidePasswords(String.valueOf(reason))));
-            }
-        }
-        return in;
+    static String webStatsNote(org.example.accesslog.WebStatsAggregator.Thresholds th) {
+        return PublicMiscController.webStatsNote(th);
     }
 
     /**
@@ -2348,709 +667,29 @@ public class PublicApiController {
      * 新增的四个字段让页面能自己组装结构说明。口令原文字符<b>一个都不出现</b>。
      */
     static List<Map<String, Object>> credentialShapes(Object v) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        if (v instanceof List<?> l) {
-            for (Object o : l) {
-                if (o instanceof Map<?, ?> m) {
-                    Map<String, Object> x = CredentialStructure.describe(
-                            m.get("key") == null ? null : String.valueOf(m.get("key")));
-                    Map<String, Object> entry = new LinkedHashMap<>();
-                    entry.put("key", x.get("key"));
-                    entry.put("count", m.get("count"));
-                    entry.put("username", x.get("username"));
-                    entry.put("passwordLength", x.get("passwordLength"));
-                    entry.put("passwordCharClasses", x.get("passwordCharClasses"));
-                    entry.put("weakPassword", x.get("weakPassword"));
-                    out.add(entry);
-                }
-            }
-        }
-        return out;
-    }
-
-    /** 把 [{key,count}] 里的 key 当来源 IP 处理（口径由 {@link PublicIpPolicy} 决定） */
-    private static List<Map<String, Object>> topSourcesForPublic(Object v, PublicIpPolicy policy) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        if (v instanceof List<?> l) {
-            for (Object o : l) {
-                if (o instanceof Map<?, ?> m) {
-                    Map<String, Object> x = new LinkedHashMap<>();
-                    x.put("key", policy.display(m.get("key") == null ? null : String.valueOf(m.get("key"))));
-                    x.put("count", m.get("count"));
-                    out.add(x);
-                }
-            }
-        }
-        return out;
+        return PublicAlertController.credentialShapes(v);
     }
 
     /**
-     * 时间线 → 来源 IP + detail 文本（口径由 {@link PublicIpPolicy} 决定）。
-     *
-     * <p><b>2026-10-14 修</b>：{@code detail} 是蜜罐规则的<b>描述原文</b>，形状是
-     * {@code 蜜罐: 攻击者"登录成功" 用户=root 口令=123456 来源=106.37.205.248}。
-     * 改造前这里只对 IP 做掩码，<b>完整口令就这样随 timeline 出过公网</b>。
-     * 现在先整段隐口令（与开关无关），再按口径处理 IP。
+     * 出关脱敏的兼容壳：历史测试用 {@code getDeclaredMethod("ship", Map.class)} 直接打在旧类上，
+     * 方法必须仍<b>声明在本类</b>（{@code getDeclaredMethod} 不看父类），实现转发到 {@link PublicApiSupport#ship}。
      */
-    private static List<Map<String, Object>> timelineForPublic(Object v, PublicIpPolicy policy) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        if (v instanceof List<?> l) {
-            for (Object o : l) {
-                if (o instanceof Map<?, ?> m) {
-                    Map<String, Object> x = new LinkedHashMap<>();
-                    x.put("time", m.get("time"));
-                    x.put("kind", m.get("kind"));
-                    x.put("srcIp", policy.display(m.get("srcIp") == null ? null : String.valueOf(m.get("srcIp"))));
-                    // detail 是规则描述原文，里面内嵌了完整 IP 与完整口令 —— 两者都必须处理，
-                    // 否则前面结构化字段处理得再干净，这里照样漏（实测漏过一次）
-                    x.put("detail", policy.displayText(CredentialStructure.hidePasswords(
-                            m.get("detail") == null ? null : String.valueOf(m.get("detail")))));
-                    out.add(x);
-                }
-            }
-        }
-        return out;
+    Map<String, Object> ship(Map<String, Object> data) {
+        return super.ship(data);
     }
 
-    private Map<String, Object> buildOverview() {
-        // 先取数、再判定可用性：若上游"连得上但查询失败"退回内置样本，
-        // readAlerts() 会把样本剔除并把 mockFallback 置位，realData() 随后如实返回 false，
-        // 于是响应里的 degraded=true（而不是拿样本当真实告警、还写 degraded=false）。
-        List<SecurityAlert> raw = source.readAlerts();
-        boolean real = source.realData();
-
-        Map<String, Object> alerts = new LinkedHashMap<>();
-        alerts.put("windowSize", source.windowSize());
-        alerts.put("windowCount", raw.size());
-        alerts.put("windowFull", raw.size() >= source.windowSize());
-        alerts.put("windowDescription", "最近 " + source.windowSize() + " 条告警窗口"
-                + (raw.size() >= source.windowSize() ? "（已取满，实际数量更多）" : ""));
-        alerts.put("todayInWindow", countToday(raw));
-        alerts.put("critical", countSeverity(raw, AlertSeverity.CRITICAL));
-        alerts.put("high", countSeverity(raw, AlertSeverity.HIGH));
-        alerts.put("bySeverity", severityStats(raw));
-        alerts.put("bySource", sourceStats(raw));
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("nodes", nodes(real));
-        data.put("alerts", alerts);
-        data.put("dataSource", dataSource(real));
-        return data;
+    /** 兼容壳：{@code PublicMaskedRegressionTest} 用 {@code getDeclaredMethod("buildHoneypot")} 打在旧类上 */
+    Map<String, Object> buildHoneypot() {
+        return alertController.buildHoneypot();
     }
 
-    private Map<String, Object> buildAlerts() {
-        // 先取数、再判定可用性：若上游"连得上但查询失败"退回内置样本，
-        // readAlerts() 会把样本剔除并把 mockFallback 置位，realData() 随后如实返回 false，
-        // 于是响应里的 degraded=true（而不是拿样本当真实告警、还写 degraded=false）。
-        List<SecurityAlert> raw = source.readAlerts();
-        boolean real = source.realData();
-        List<Map<String, Object>> aggs = source.aggregated();
-        List<Map<String, Object>> publicList = new ArrayList<>();
-        for (Map<String, Object> g : aggs) {
-            publicList.add(publicAggregate(g));
-        }
-
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("generatedAt", LocalDateTime.now().format(FMT));
-        data.put("cacheSeconds", cacheSeconds);
-        data.put("dataSource", dataSource(real));
-        data.put("windowSize", source.windowSize());
-        data.put("rawTotal", raw.size());
-        data.put("total", publicList.size());
-        data.put("aggregated", source.aggregationEnabled());
-        data.put("windowMinutes", source.aggregationWindowMinutes());
-        data.put("list", publicList);
-        data.put("stats", Map.of(
-                "bySeverity", severityStats(raw),
-                "bySource", sourceStats(raw),
-                "byType", typeStats(raw),
-                "trend", trend(raw)
-        ));
-        // 近 24 小时口径：KPI 的"严重/高危"与趋势图都取这一份 ——
-        // 取数窗口会被低危网络告警刷屏，按时间范围聚合才是"这段时间到底怎么样"
-        Map<String, Object> stats24h = source.summary24h();
-        data.put("stats24h", stats24h);
-        // 把 24h 聚合的机读状态也放进 dataSource：前端 Hero 的第一个数字取的是 stats24h，
-        // 而"链路没起来(warming)"与"后端真的坏了(degraded)"要显示成不同的话。
-        // 这里是【新增字段】，既有 available/degraded 口径不变。
-        if (stats24h.get("state") != null) {
-            data.put("stats24hState", stats24h.get("state"));
-            data.put("stats24hReason", stats24h.get("reason"));
-        }
-        return data;
+    /** 兼容壳：{@code PublicMaskedRegressionTest} 用 {@code getDeclaredMethod("buildAudit")} 打在旧类上 */
+    Map<String, Object> buildAudit() {
+        return alertController.buildAudit();
     }
 
-    /** 两台服务器的在线状态。判据写清楚：不写"我觉得在线"。 */
-    private List<Map<String, Object>> nodes(boolean dataLinkUp) {
-        List<Map<String, Object>> nodes = new ArrayList<>();
-
-        Map<String, Object> srv1 = new LinkedHashMap<>();
-        srv1.put("id", "srv1");
-        srv1.put("label", "服务机 · SecAgent");
-        srv1.put("online", true);
-        srv1.put("probe", "本进程正在响应");
-        srv1.put("detail", exposeBuildSha ? ("build " + buildSha) : "");
-        nodes.add(srv1);
-
-        Map<String, Object> srv2 = new LinkedHashMap<>();
-        srv2.put("id", "srv2");
-        srv2.put("label", "数据机 · Wazuh / Suricata / Cowrie");
-        srv2.put("online", dataLinkUp);
-        srv2.put("probe", "indexer(9200) 经 SSH 隧道可达");
-        srv2.put("detail", dataLinkUp ? "数据链路正常" : "数据链路不可达，告警不展示");
-        nodes.add(srv2);
-
-        return nodes;
-    }
-
-    private Map<String, Object> dataSource(boolean real) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("wazuhMode", source.mode());
-        m.put("degraded", !real);
-        m.put("note", real
-                ? "网络告警（Suricata）经 Wazuh agent 采集后随 indexer 一起返回，来源已按规则分组判定"
-                : "告警数据源不可达，本页不展示任何告警（不以内置样本代替）");
-        return m;
-    }
-
-    /**
-     * 聚合告警 → 公网字段白名单。
-     *
-     * <p>被<b>刻意丢掉</b>的字段：{@code dstIp} / {@code dstAsset} / {@code assets}
-     * （内网拓扑）、{@code memberIds}（内部 id 集合）、{@code rawLog} / 完整 payload。
-     */
-    private Map<String, Object> publicAggregate(Map<String, Object> src) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("aggId", src.get("aggId"));
-        m.put("count", src.get("count"));
-        m.put("startTime", src.get("startTime"));
-        m.put("endTime", src.get("endTime"));
-        m.put("title", src.get("title"));
-        m.put("ruleName", src.get("ruleName"));
-        // ATT&CK 技术编号（只新增字段，既有键一个不动）：由规则名查 AttackTechniqueMapper 的
-        // 有序映射表。映射不到时明确给 null —— 前端据此显示"未归类"，而不是拿 type/source
-        // 再猜一次（AlertType 本身就是关键词粗分类，二次猜测只会把没把握包装成有把握）。
-        m.put("attck", AttackTechniqueMapper.toMap(asString(src.get("ruleName"))));
-        m.put("srcIp", policy().display(asString(src.get("srcIp"))));
-        // 公开面【刻意】恒为 null：srcGeo 的内部形状是「国家|省|城市|ASN|机构」（GeoIpInfo.describe()），
-        // 逐条输出它等于把"某个攻击者属于哪个机构"搬上公网页面；公开面的地理口径只有聚合
-        // （GET /api/public/geo，见 docs/design-geo-endpoint.md）。
-        // 键名保留、值保持空 —— 这正是本轮改造前它对真实告警的取值（内置样本不进公开面），
-        // 所以不是语义变更，而是"不让新富化的数据从这条缝里漏出去"。测试：PublicApiGeoLeakTest。
-        m.put("srcGeo", null);
-        m.put("occurredAt", src.get("occurredAt"));
-        m.put("status", src.get("status"));
-        m.put("hitCount", src.get("hitCount"));
-        putEnum(m, "severity", src.get("severity"));
-        putEnum(m, "type", src.get("type"));
-        putEnum(m, "source", src.get("source"));
-        return m;
-    }
-
-    /** 原始告警 → 公网字段白名单（下钻明细用） */
-    private Map<String, Object> publicAlert(SecurityAlert a) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id", a.getId());
-        m.put("title", a.getTitle());
-        m.put("ruleName", a.getRuleName());
-        m.put("srcIp", policy().display(a.getSrcIp()));
-        // 同 publicAggregate：srcGeo 只在内网面可见，公开面恒为 null（口径见上）
-        m.put("srcGeo", null);
-        m.put("occurredAt", a.getOccurredAt());
-        m.put("status", a.getStatus());
-        m.put("hitCount", a.getCount());
-        putEnum(m, "severity", a.getSeverity());
-        putEnum(m, "type", a.getType());
-        putEnum(m, "source", a.getSource());
-        return m;
-    }
-
-    /** 枚举字段统一输出 {枚举名, 中文标签}，前端不必自己维护映射表 */
-    private static void putEnum(Map<String, Object> target, String field, Object value) {
-        if (value == null) {
-            target.put(field, null);
-            target.put(field + "Label", null);
-            return;
-        }
-        if (value instanceof AlertSeverity s) {
-            target.put(field, s.name());
-            target.put(field + "Label", s.getLabel());
-        } else if (value instanceof AlertSource s) {
-            target.put(field, s.name());
-            target.put(field + "Label", s.getLabel());
-        } else if (value instanceof AlertType t) {
-            target.put(field, t.name());
-            target.put(field + "Label", t.getLabel());
-        } else {
-            target.put(field, String.valueOf(value));
-            target.put(field + "Label", String.valueOf(value));
-        }
-    }
-
-    // ==================== 统计 ====================
-
-    private List<Map<String, Object>> severityStats(List<SecurityAlert> raw) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (AlertSeverity s : AlertSeverity.values()) {
-            out.add(bucket(s.name(), s.getLabel(), countSeverity(raw, s)));
-        }
-        return out;
-    }
-
-    private List<Map<String, Object>> sourceStats(List<SecurityAlert> raw) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (AlertSource s : AlertSource.values()) {
-            long c = raw.stream().filter(a -> a.getSource() == s).count();
-            out.add(bucket(s.name(), s.getLabel(), c));
-        }
-        return out;
-    }
-
-    private List<Map<String, Object>> typeStats(List<SecurityAlert> raw) {
-        List<Map<String, Object>> out = new ArrayList<>();
-        for (AlertType t : AlertType.values()) {
-            long c = raw.stream().filter(a -> a.getType() == t).count();
-            if (c > 0) {
-                out.add(bucket(t.name(), t.getLabel(), c));
-            }
-        }
-        return out;
-    }
-
-    private Map<String, Object> bucket(String key, String label, long count) {
-        Map<String, Object> m = new LinkedHashMap<>();
-        m.put("key", key);
-        m.put("label", label);
-        m.put("count", count);
-        return m;
-    }
-
-    /** 最近 24 小时按小时分桶 */
-    private List<Map<String, Object>> trend(List<SecurityAlert> raw) {
-        LocalDateTime now = LocalDateTime.now().withMinute(0).withSecond(0).withNano(0);
-        Map<String, Long> buckets = new LinkedHashMap<>();
-        for (int i = 23; i >= 0; i--) {
-            buckets.put(now.minusHours(i).format(HOUR_FMT), 0L);
-        }
-        for (SecurityAlert a : raw) {
-            LocalDateTime t = parseTime(a.getOccurredAt());
-            if (t == null || t.isBefore(now.minusHours(24)) || t.isAfter(now.plusHours(1))) {
-                continue;
-            }
-            buckets.merge(t.withMinute(0).format(HOUR_FMT), 1L, Long::sum);
-        }
-        List<Map<String, Object>> out = new ArrayList<>();
-        buckets.forEach((k, v) -> {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("time", k);
-            m.put("count", v);
-            out.add(m);
-        });
-        return out;
-    }
-
-    private long countToday(List<SecurityAlert> raw) {
-        String today = LocalDate.now().toString();
-        return raw.stream()
-                .filter(a -> a.getOccurredAt() != null && a.getOccurredAt().startsWith(today))
-                .count();
-    }
-
-    private long countSeverity(List<SecurityAlert> raw, AlertSeverity s) {
-        return raw.stream().filter(a -> a.getSeverity() == s).count();
-    }
-
-    private static LocalDateTime parseTime(String s) {
-        if (s == null || s.isBlank()) {
-            return null;
-        }
-        try {
-            return LocalDateTime.parse(s.trim(), FMT);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    // ==================== 限流 / 缓存 / 响应 ====================
-
-    /**
-     * 取调用方 IP。
-     *
-     * <p>线上流量经 Cloudflare 隧道进来，{@code remoteAddr} 是隧道侧地址、
-     * 所有访客会落进同一个桶 —— 所以优先取 {@code CF-Connecting-IP}。
-     * 边界说明：这两个头在<b>直连</b>场景下可伪造，因此它只用于限流，
-     * 不作为任何安全判定依据（真正的边界在隧道与拦截器上）。
-     */
-    private String clientIp(HttpServletRequest req) {
-        String cf = req.getHeader("CF-Connecting-IP");
-        if (cf != null && !cf.isBlank()) {
-            return cf.trim();
-        }
-        String xff = req.getHeader("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) {
-            int comma = xff.indexOf(',');
-            return (comma > 0 ? xff.substring(0, comma) : xff).trim();
-        }
-        return req.getRemoteAddr();
-    }
-
-    private ResponseEntity<Map<String, Object>> ok(Map<String, Object> data, HttpServletResponse res) {
-        res.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + Math.max(0, cacheSeconds));
-        res.setHeader("X-Data-Source", source.available() ? "WAZUH_REAL" : "UNAVAILABLE");
-        res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 200);
-        body.put("message", "success");
-        // 所有公开 GET 端点的共同出口：资产名过滤 + 统一 ipDisclosure（口径只有一个来源）
-        Map<String, Object> shipped = ship(data);
-        body.put("data", shipped);
-        // 【缓存别名专属】旧路径（无 .js 后缀）不写下面任何一项 ⇒ 响应体与响应头逐字节不变。
-        if (isCacheAliasRequest()) {
-            res.setHeader(HttpHeaders.CACHE_CONTROL, aliasCacheControl());
-            String stableEtag = cacheAliasEtag(shipped);
-            if (stableEtag != null) {
-                res.setHeader(HttpHeaders.ETAG, stableEtag);
-            }
-            stampSnapshotFreshness(body);
-        }
-        return ResponseEntity.ok(body);
-    }
-
-    /**
-     * 别名路径的缓存头（max-age 与快照 TTL 同源：{@code app.public-api.cache-seconds}）。
-     *
-     * <h3>为什么 max-age 必须等于快照 TTL，而不是另一个数</h3>
-     * 站点 {@code /alerts/} 页**每 40 秒轮询一次**（`layouts/partials/xk-demo/api-bind.html:41`
-     * {@code REFRESH = 40000}，配 {@code :1003 setInterval(load, REFRESH)}）。边缘 TTL 若短于轮询间隔，
-     * 每次轮询都落在"已过期"上 ⇒ 每 40 秒给源站 9 个请求（≈13.5/分，逼近公开面每 IP 20/分 的上限，
-     * 而每次回源都消耗访客自己的额度）。现在快照 TTL 与边缘 TTL 都是 45s（> 40s 轮询间隔）⇒
-     * 常规轮询落在有效期内的**快照**上 ⇒ 命中边缘、且源站那一腿是热的（3~5ms）。
-     * 数据最旧 45 秒，由 {@code snapshotAt} + {@code Age} 如实呈现（红线 D4：被缓存不许假装更新）。
-     *
-     * <p>为什么不能各写一个数：只要两者不一致，就会出现"快照已经 45 秒旧、却告诉缓存 15 秒"或反之的
-     * 自相矛盾 —— 而这类矛盾不会报错，只会在线上表现为"偶尔很慢"。
-     *
-     * <h3>为什么要 stale-while-revalidate</h3>
-     * 即使再验证发生，边缘也**先把手上那份发出去**、在后台去源站确认 ⇒ 用户侧不会因为
-     * "回源 + TLS + 边缘选择（实测曾命中 LHR 伦敦）"而卡住。这正是"加载很慢"的直接解药。
-     *
-     * <h3>⚠️ 浏览器侧 TTL 由 Cloudflare 决定，不由这里决定</h3>
-     * 实测（2026-10-16 20:08，srv1）：本机直连 origin 得到 {@code public, max-age=45}；
-     * 经 CF 得到的却是 {@code public, max-age=14400}（4 小时，SWR 被保留）—— 这是 zone 的
-     * **Browser Cache TTL** 在覆写（CF 会把较短的 max-age 抬到该设置值）。
-     * ⇒ 浏览器可能把这份数据缓存 4 小时。**前端因此必须用条件请求/`no-store` 语义取数**
-     * （站点线 B2 那批），或由站主在 CF 控制台把 Browser Cache TTL 改为 "Respect Existing Headers"。
-     * 这一条已写进契约文档，别让它留在线上而不写文档。
-     */
-    private String aliasCacheControl() {
-        return "public, max-age=" + Math.max(0, cacheSeconds)
-                + ", stale-while-revalidate=" + CACHE_ALIAS_SWR_SECONDS;
-    }
-
-    /**
-     * 别名路径的**稳定 ETag**：只对"数据内容"算，不含 {@code snapshotAt} / {@code cacheAgeSeconds}
-     * 这类每请求都在变的元数据。
-     *
-     * <h3>为什么必须这样算（实测的坑）</h3>
-     * {@link PublicEtagFilter} 默认按**完整响应体**算 ETag。而别名响应体里的
-     * {@code cacheAgeSeconds} 每秒都在变（实测：两次调用 {@code data} 完全相同，
-     * 唯一差异是 {@code cacheAgeSeconds: 9 → 12}）⇒ ETag 每次都不同
-     * ⇒ Cloudflare 的再验证**永远拿不到 304**，每次过期都变成一次完整的 200 回源。
-     * 按"数据内容"算之后，同一快照窗口内 ETag 稳定 ⇒ 再验证可 304 ⇒ 回源从
-     * "每 15 秒每端点 1 次"降到"数据真的变了才回源"。
-     *
-     * <p>序列化器把 Map 键排序 ⇒ ETag 与插入顺序无关，只取决于内容。
-     * 计算失败返回 {@code null}：调用方不下发 ETag，退回过滤器按完整体算（如实降级，不假装稳定）。
-     */
-    private static String cacheAliasEtag(Map<String, Object> shipped) {
-        try {
-            return PublicEtagFilter.etagOf(ETAG_MAPPER.writeValueAsBytes(shipped));
-        } catch (Exception e) {
-            logger.warn("别名 ETag 计算失败，退回按完整响应体计算：{}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * 定时预聚合：把"读 indexer + 聚合"的现算成本**从访客请求路径搬到后台**。
-     *
-     * <h3>它解决什么</h3>
-     * 站主实测："页面打开很快，但取数慢（约 10s 才出数据）"。根因之一就是
-     * <b>冷快照要现算</b>：{@code alerts} 冷 3.7s / {@code webstats} 冷 4.1s / {@code honeypot} 冷 3.8s
-     * （暖态 3~5ms）。快照一旦过期，第一个到达的访客就要替所有人付这笔钱。
-     * 后台每 {@code warm-interval-ms}（默认 30s）检查一遍：只要某个快照的年龄超过
-     * {@code TTL × warm-threshold-ratio}（默认 45s × 0.5 = 22.5s）就主动刷新 ⇒
-     * 访客侧几乎永远命中热快照（目标：源站响应 ≤50ms，无论冷暖）。
-     *
-     * <h3>三个刻意的设计</h3>
-     * <ol>
-     *   <li><b>不比原来更频繁地查上游</b>：阈值取 TTL 的一半，而不是"每 30 秒无条件重算" ——
-     *       后者会把上游查询量抬到"有访客才算"的几十倍；</li>
-     *   <li><b>绝不阻塞、绝不抛</b>：任何端点刷新失败只记一条 WARN，保留旧快照
-     *       （{@link Snapshot#refreshIfOlderThan} 内部已兜底）；整个方法再包一层 try/catch，
-     *       保证"预聚合坏掉"不会影响任何请求、也不会让定时线程崩掉；</li>
-     *   <li><b>与请求侧共用同一个 Snapshot 与同一把"刷新权"</b>：后台正在刷时，请求侧立刻拿旧值，
-     *       两边不会同时打上游（也天然防击穿）。</li>
-     * </ol>
-     *
-     * <p>为什么放在控制器里而不是单独一个 {@code @Component}：这些快照实例与各端点的 builder
-     * 都是本类的私有成员，放在这里才能复用同一份实例 —— 换个类就得把这些状态暴出去，
-     * 反而更容易出"两份缓存"的错。
-     */
-    @Scheduled(fixedDelayString = "${app.public-api.warm-interval-ms:30000}",
-            initialDelayString = "${app.public-api.warm-initial-delay-ms:10000}")
+    /** 兼容壳：{@code PublicSnapshotWarmerTest} 直接 new 旧类后调它；定时任务本体在 {@link PublicSnapshotWarmer} */
     public void warmPublicSnapshots() {
-        long maxAge = Math.max(1000L, (long) (Math.max(1, cacheSeconds) * 1000L * Math.max(0.1d, warmThresholdRatio)));
-        int refreshed = 0;
-        refreshed += warmOne(overviewCache, "overview", maxAge, this::buildOverview);
-        refreshed += warmOne(alertsCache, "alerts", maxAge, this::buildAlerts);
-        refreshed += warmOne(honeypotCache, "honeypot", maxAge, this::buildHoneypot);
-        refreshed += warmOne(auditCache, "audit", maxAge, this::buildAudit);
-        refreshed += warmOne(latestCache, "latest", maxAge, this::buildLatest);
-        refreshed += warmOne(geoCache, "geo", maxAge, this::buildGeo);
-        refreshed += warmOne(webStatsCache, "webstats", maxAge, this::buildWebStats);
-        /* ★2026-10-16 补：**聚合端点也必须进预聚合**。
-           漏了它的后果是线上实测出来的：`/api/public/home.js` 的 P50 = **29.9 秒**（min 868ms）——
-           45 秒 TTL 一过，第一个访客就要替所有人现算三块（alerts+geo+honeypot），
-           而单端点那些早就被后台刷热了 ⇒ 聚合反而比单端点慢 20 倍，与本端点"省一次路程"的初衷相反。
-           **顺序有讲究**：放在三个子快照之后 —— 这样 buildHome() 只是"组合三份已热快照"（毫秒级），
-           若放前面，它会触发三个子快照的冷现算，把后台这一轮拖成十几秒。 */
-        refreshed += warmOne(homeCache, "home", maxAge, this::buildHome);
-        if (refreshed > 0) {
-            logger.debug("公网快照预聚合：本轮刷新 {} 个端点（年龄阈值 {}ms）", refreshed, maxAge);
-        }
-    }
-
-    /** 单个端点的预聚合：任何异常都吞掉并记 WARN —— 预聚合坏掉不许影响请求或定时线程 */
-    private int warmOne(Snapshot snapshot, String name, long maxAgeMillis, Supplier<Map<String, Object>> loader) {
-        try {
-            return snapshot.refreshIfOlderThan(maxAgeMillis, cacheSeconds, loader) ? 1 : 0;
-        } catch (Exception e) {
-            logger.warn("公网快照预聚合失败（{}，保留旧快照）：{}", name, e.getMessage());
-            return 0;
-        }
-    }
-
-    /**
-     * 缓存别名请求的判定：URI 以 {@link PublicCorsInterceptor#CACHE_ALIAS_SUFFIX} 结尾。
-     *
-     * <p>为什么用 URI 而不是参数/Header：别名是<b>纯 URL 形状</b>的约定（Cloudflare 按扩展名
-     * 决定是否缓存），任何请求头/查询参数都不能改变它 —— 也让"客户端加了 {@code ?cb=} 反而
-     * 命中不到边缘缓存"这件事变得可解释（契约里明文禁止 cache-buster）。
-     */
-    private static boolean isCacheAliasRequest() {
-        RequestAttributes attrs = RequestContextHolder.getRequestAttributes();
-        if (!(attrs instanceof ServletRequestAttributes sra)) {
-            return false;
-        }
-        String uri = sra.getRequest().getRequestURI();
-        return uri != null && uri.endsWith(PublicCorsInterceptor.CACHE_ALIAS_SUFFIX);
-    }
-
-    /**
-     * 给别名响应体盖上"数据真实生成时刻"的戳（站主红线 D4：被缓存不等于可以假装更新）。
-     *
-     * <ul>
-     *   <li>{@code snapshotAt} —— 本响应体内数据的真实生成时刻（ISO-8601 带时区）。页面显示
-     *       "刚刚同步"必须用它，<b>不许</b>用接收响应的时刻；</li>
-     *   <li>{@code cacheAgeSeconds} —— 生成本响应体时，这份数据已经有多旧（走快照的端点在快照
-     *       命中时大于 0）；</li>
-     *   <li>{@code snapshotTtlSeconds} —— 应用内快照 TTL，同时也是 {@code Cache-Control: max-age}
-     *       的值（两者同一个来源 {@code app.public-api.cache-seconds}）。</li>
-     * </ul>
-     *
-     * <p><b>真实年龄 = {@code cacheAgeSeconds} + 响应头 {@code Age}</b>：前者是"源站生成时它多旧"，
-     * 后者是"边缘/中间缓存又放了多久"。{@code Age} 不是 CORS 安全响应头，所以别名路径在
-     * {@code Access-Control-Expose-Headers} 里显式放行了它（见 {@link PublicCorsInterceptor}）。
-     *
-     * <p>{@code freshnessNote} 是给前端与未来的接手者读的<b>口径说明</b>（一句话，不参与判断）。
-     */
-    private void stampSnapshotFreshness(Map<String, Object> body) {
-        Long marked = PublicSnapshotClock.peek();
-        PublicSnapshotClock.clear();
-        long now = System.currentTimeMillis();
-        long generatedAt = marked == null ? now : marked;
-        body.put("snapshotAt", Instant.ofEpochMilli(generatedAt)
-                .atZone(ZoneId.systemDefault())
-                .truncatedTo(ChronoUnit.SECONDS)
-                .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
-        body.put("cacheAgeSeconds", Math.max(0, (now - generatedAt) / 1000));
-        body.put("snapshotTtlSeconds", Math.max(0, cacheSeconds));
-        body.put("freshnessNote",
-                "snapshotAt=本响应体内数据的真实生成时刻（页面按它显示同步时间）；"
-                        + "cacheAgeSeconds=生成时它已有多旧；真实年龄=cacheAgeSeconds+响应头Age；"
-                        + "禁止给本地址加 ?cb= 之类 cache-buster（会绕过边缘缓存）");
-    }
-
-    private ResponseEntity<Map<String, Object>> tooMany(HttpServletResponse res) {
-        res.setHeader(HttpHeaders.RETRY_AFTER, "60");
-        res.setHeader("X-RateLimit-Limit", String.valueOf(rateLimiter.limitPerMinute()));
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 429);
-        body.put("message", "请求过于频繁，请稍后再试");
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
-    }
-
-    /**
-     * 429：带上"哪个限流器挡的、上限多少、还剩多少、多久能再试"。
-     *
-     * <p>为什么要多这几个字段：公开页面必须能显示人话（"请稍后再试"），
-     * 而排障时最需要知道的恰恰是"被哪一条规则挡的" —— 只回一个裸 429，
-     * 前端只能笼统提示，站主也只能靠猜。
-     */
-    private ResponseEntity<Map<String, Object>> tooMany(HttpServletResponse res,
-                                                        PublicAskRateLimiter limiter,
-                                                        String message) {
-        res.setHeader(HttpHeaders.RETRY_AFTER, "60");
-        res.setHeader("X-RateLimit-Limit", String.valueOf(limiter.limitPerMinute()));
-        res.setHeader("X-RateLimit-Remaining", "0");
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("code", 429);
-        body.put("message", message);
-        body.put("limitPerMinute", limiter.limitPerMinute());
-        body.put("retryAfterSeconds", 60);
-        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(body);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static List<String> asStringList(Object v) {
-        if (v instanceof List<?> l) {
-            List<String> out = new ArrayList<>();
-            for (Object o : l) {
-                out.add(String.valueOf(o));
-            }
-            return out;
-        }
-        return Collections.emptyList();
-    }
-
-    private static String asString(Object v) {
-        return v == null ? null : String.valueOf(v);
-    }
-
-    /**
-     * 极简快照缓存：TTL 内直接返回上一次的结果；**过期时只让一个线程去算，其余线程立刻拿旧值**。
-     *
-     * <p>为什么值得要：公网页面每次刷新都会触发一次"读 indexer + 聚合"，
-     * 而数据本身只按分钟级变化。缓存把上游查询量与访客数解耦，
-     * 同时让"数据同步时间"变成一个可以如实展示的值（generatedAt）。
-     *
-     * <h3>为什么不阻塞（2026-10-16 晚改）</h3>
-     * 旧实现是 {@code synchronized}：快照过期时，第一个请求进去现算（实测 alerts 冷 3.7s /
-     * webstats 冷 4.1s），**同时到达的其他请求会被锁住一起等** —— 这就是站主看到的"页面打开快、
-     * 取数慢（约 10s）"。现在改成：
-     * <ul>
-     *   <li>未过期 ⇒ 直接返回（3~5ms）；</li>
-     *   <li>已过期 ⇒ 抢到"刷新权"的那个线程去算，**其余线程立刻返回旧值**（旧值只差几十秒，
-     *       且由 {@code snapshotAt}/{@code cacheAgeSeconds} 如实标注年龄）；</li>
-     *   <li>只有"从来没有过值"（应用刚起来）才会短暂等待，等待超时仍按 fail-closed 抛错，
-     *       不返回空白 200。</li>
-     * </ul>
-     * 再配合 {@link #warmPublicSnapshots()} 的后台预聚合，"过期"这件事在正常情况下根本不会发生。
-     */
-    static final class Snapshot {
-
-        private volatile Map<String, Object> value;
-        private volatile long expiresAt;
-
-        /** 上一次真正去加载（或首次加载）的时刻：别名响应体的 {@code snapshotAt} 用它 */
-        private volatile long loadedAtMs;
-
-        /** 是否有线程正在刷新：用它替代"锁"，保证请求侧不等现算（也天然防击穿） */
-        private final AtomicBoolean refreshing = new AtomicBoolean(false);
-
-        /** 首次无值时的等待上限（毫秒）：冷启动并发首访才会用到 */
-        private static final long FIRST_WAIT_TIMEOUT_MS = 3000L;
-
-        Map<String, Object> get(int ttlSeconds, Supplier<Map<String, Object>> loader) {
-            Map<String, Object> cur = value;
-            if (cur != null && System.currentTimeMillis() < expiresAt) {
-                PublicSnapshotClock.mark(loadedAtMs);
-                return cur;
-            }
-            if (!refreshing.compareAndSet(false, true)) {
-                // 别的线程正在算：有旧值就**立刻**给旧值（不阻塞、不等待）
-                if (cur != null) {
-                    PublicSnapshotClock.mark(loadedAtMs);
-                    return cur;
-                }
-                return awaitFirstValue(loader, ttlSeconds);
-            }
-            try {
-                return load(ttlSeconds, loader);
-            } finally {
-                refreshing.set(false);
-            }
-        }
-
-        /**
-         * 定时预聚合用：值比 {@code maxAgeMillis} 旧（或还没有值）就刷新。
-         *
-         * <p>为什么按"年龄阈值"而不是"过期才刷"：过期才刷等于把现算留给下一个访客。
-         * 阈值取 TTL 的一半（默认）⇒ 访客侧永远拿到热快照，而上游查询频率不会比原来更高。
-         *
-         * @return 本轮是否真的执行了刷新（有人在算时直接跳过，不排队）
-         */
-        boolean refreshIfOlderThan(long maxAgeMillis, int ttlSeconds, Supplier<Map<String, Object>> loader) {
-            Map<String, Object> cur = value;
-            if (cur != null && (System.currentTimeMillis() - loadedAtMs) <= maxAgeMillis) {
-                return false;
-            }
-            if (!refreshing.compareAndSet(false, true)) {
-                return false;
-            }
-            try {
-                load(ttlSeconds, loader);
-                return true;
-            } finally {
-                refreshing.set(false);
-            }
-        }
-
-        /** 带异常兜底的真实加载：成功则发布新值；失败保留旧值，没有旧值才抛（fail-closed） */
-        private Map<String, Object> load(int ttlSeconds, Supplier<Map<String, Object>> loader) {
-            try {
-                Map<String, Object> fresh = loader.get();
-                long now = System.currentTimeMillis();
-                value = fresh;
-                loadedAtMs = now;
-                expiresAt = now + Math.max(0, ttlSeconds) * 1000L;
-                PublicSnapshotClock.mark(now);
-                return fresh;
-            } catch (Exception e) {
-                // 刷新失败：有旧快照就继续用旧的（页面标注同步时间），
-                // 没有旧快照就抛出，让调用方看到错误而不是"空白但 200"
-                logger.warn("公网快照刷新失败：{}", e.getMessage());
-                Map<String, Object> cur = value;
-                if (cur != null) {
-                    expiresAt = System.currentTimeMillis() + 5000L;
-                    PublicSnapshotClock.mark(loadedAtMs);
-                    return cur;
-                }
-                throw new IllegalStateException("公网快照刷新失败且无可用旧快照", e);
-            }
-        }
-
-        /** 冷启动并发首访：另一个线程正在算且还没有值 —— 有限等待，超时抛错（不返回空白 200） */
-        private Map<String, Object> awaitFirstValue(Supplier<Map<String, Object>> loader, int ttlSeconds) {
-            long deadline = System.currentTimeMillis() + FIRST_WAIT_TIMEOUT_MS;
-            while (System.currentTimeMillis() < deadline) {
-                Map<String, Object> v = value;
-                if (v != null) {
-                    PublicSnapshotClock.mark(loadedAtMs);
-                    return v;
-                }
-                try {
-                    Thread.sleep(50L);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
-            throw new IllegalStateException("公网快照首次加载等待超时（另一个线程仍在计算）");
-        }
+        snapshotWarmer.warmPublicSnapshots();
     }
 }

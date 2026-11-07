@@ -233,6 +233,21 @@ class PublicStoryControllerTest {
     }
 
     @Test
+    @DisplayName("【前端契约】hours= 是 window= 的别名（前端时间线卡用 ?id=&hours=24）")
+    void hoursParamIsAcceptedAsWindowAlias() throws Exception {
+        JsonNode data = performOK(controller(true, "REAL"),
+                "/api/public/story?id=" + IP + "&hours=6").get("data");
+        assertTrue(data.get("available").asBoolean());
+        assertEquals(6, data.get("window").get("hours").asInt(), "hours=6 必须真的只查 6h 窗口");
+
+        // window= 仍优先；非法别名（hours=7）与非法 window 一样 400，不静默退回 24h
+        mvc(controller(true, "REAL")).perform(get("/api/public/story?id=" + IP + "&hours=7"))
+                .andExpect(status().isBadRequest())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers
+                        .jsonPath("$.reason").value("WINDOW_NOT_SUPPORTED"));
+    }
+
+    @Test
     @DisplayName("【缓存】带 If-None-Match 的第二次请求返回 304")
     void etagSupportsConditionalGet() throws Exception {
         PublicApiController c = controller(true, "REAL");
