@@ -21,12 +21,61 @@
 #   ③ 工作区必须干净（有未提交改动 → 源码无法用 commit 唯一定位）
 #   任一不满足 → 非零退出，且【不产生镜像、不重启容器】。
 #
-# 【部署后硬校验】容器起来之后还要证明「它跑的就是本次构建的镜像」：
-#   容器 .Image == docker image inspect secagent:local 的 .Id，不等就 exit 7。
-#   原因：真实事故里 build 是成功的，但 compose 起的是 ACR 旧镜像（4ecf4741…），
-#   一切"看起来都成功"。这条校验让那种情况当场失败。
+# 【部署后硬校验】容器起来之后还要证明「它跑的就是本次构建的镜像、跑的就是本次上传的 jar」：
+#   ① 部署前记录 docker image ls 的镜像 ID；构建后取本次镜像 ID；
+#      `docker inspect -f '{{.Image}}' secagent` 必须等于它，不等就 exit 7。
+#      （防 compose 复用/回退旧 image —— 真实事故里 build 成功，但 compose 起的是 ACR 旧镜像）
+#   ② `docker exec secagent md5sum /app/app.jar` 必须等于上传 jar 的 MD5，不等就 exit 8。
+#      （防"镜像里的 app.jar 不是本次上传的产物" —— 曾经只能靠人肉 docker cp 才发现）
+#   ③ 轮询 /api/health（最多 120s、每 3s）直到 status=ok 且 embeddedGitCommit=目标 sha；
+#      超时才 exit 6，并打印最后一次 health 全量 JSON。
+#      （原先读一次就判，容器还在 starting 时会读到旧版本指纹而误判失败）
+#   ④ 若 secagent-redeploy.timer 处于 active，打印醒目警告与建议命令，但**不自动停**：
+#      它每 5 分钟按 ACR digest 巡检，会把手工部署滚回旧镜像（实测 6994a3d → 69aff26）。
 # ============================================================
 set -euo pipefail
+
+# 从 health JSON 里取字段（服务器上不保证有 jq；health 是单行紧凑 JSON）。
+# json_str 取带引号的字符串值，json_raw 取布尔/数字等裸值。
+json_str() {
+  printf '%s' "${1:-}" \
+    | grep -oE "\"${2}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*"//; s/"$//' || true
+}
+json_raw() {
+  printf '%s' "${1:-}" \
+    | grep -oE "\"${2}\"[[:space:]]*:[[:space:]]*(true|false|-?[0-9]+)" | head -1 \
+    | sed -E 's/^[^:]*:[[:space:]]*//' || true
+}
+
+# ============================================================
+# 【冲突检测】secagent-redeploy.timer 每 5 分钟按 ACR stable digest 巡检：
+#   只要发布指针与当前运行 digest 不同，它就会 pull + 重建，把容器滚回 ACR 镜像。
+#   实测后果：手工部署做到 6994a3d，几分钟后它把 embeddedGitCommit 退回 69aff26。
+#   只警告、不自动停：停 timer 是有副作用的决定（可能正等 CI 的正式版本）。
+# ============================================================
+warn_timer_conflict() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local timer svc
+  timer="$(systemctl is-active secagent-redeploy.timer 2>/dev/null || true)"
+  svc="$(systemctl is-active secagent-redeploy.service 2>/dev/null || true)"
+  if [ "$timer" != "active" ] && [ "$svc" != "active" ]; then
+    echo "  [OK] secagent-redeploy.timer/service 均未激活（不会被 ACR 巡检滚回旧镜像）"
+    return 0
+  fi
+  printf '\n\033[1;41;97m'
+  printf '  !!! 警告：ACR 巡检定时器正在运行，可能覆盖本次手工部署  !!!'
+  printf '\033[0m\n'
+  echo "       secagent-redeploy.timer   = $timer"
+  echo "       secagent-redeploy.service = $svc"
+  echo "       它每 5 分钟按 ACR stable digest 巡检；一旦触发重建，容器会被换回 ACR 里的镜像"
+  echo "       （实测 embeddedGitCommit 从 6994a3d 退回 69aff26，手工部署被覆盖）。"
+  echo "       本脚本【不会自动停】它。若要保证本次部署不被覆盖，请先执行："
+  printf '           \033[1;33msudo systemctl stop secagent-redeploy.timer\033[0m\n'
+  echo "       部署并核对完成后，按需恢复："
+  echo "           sudo systemctl start secagent-redeploy.timer"
+  printf '\n'
+}
 
 JAR="${1:-/tmp/sec-agent.jar}"
 SHA="${2:-unknown}"
@@ -37,8 +86,10 @@ if [ ! -f "$JAR" ]; then
   echo "[X] 找不到 jar: $JAR"
   exit 2
 fi
-if [ ! -f Dockerfile ]; then
-  echo "[X] 找不到 Dockerfile: $APP/Dockerfile"
+if [ ! -f Dockerfile.runtime ]; then
+  echo "[X] 找不到 Dockerfile.runtime: $APP/Dockerfile.runtime"
+  echo "    本脚本只认 Dockerfile.runtime（单阶段、直接 COPY 上传的 runtime/app.jar）；"
+  echo "    绝不能用多阶段的 Dockerfile（它会在镜像内用服务器源码重编，产物与上传 jar 不一致）。"
   exit 2
 fi
 
@@ -92,6 +143,9 @@ if [ -n "$DIRTY_LINES" ]; then
 fi
 echo "  [OK] 源码校验通过：HEAD=$HEAD_FULL == 目标 commit，工作区$([ -n "$DIRTY_LINES" ] && echo '脏（已显式放行）' || echo '干净')"
 
+# 【部署前】检测 ACR 巡检 timer 是否会覆盖本次部署（只警告，不自动停）
+warn_timer_conflict
+
 echo "==> 1/4 放置 jar（放 runtime/ —— target/ 被 .dockerignore 排除，会导致 COPY 失败）"
 mkdir -p runtime
 install -m 644 "$JAR" runtime/app.jar
@@ -110,10 +164,33 @@ echo "  上传 jar MD5 = $JAR_MD5"
 # 用本脚本建出的镜像缺 label → 推到 ACR stable 后 redeploy 直接被拒，
 # 而 secagent-redeploy.timer 每 5 分钟还会把容器换回 ACR 里那版旧镜像。
 # 所以镜像必须自证身份：revision = 完整 commit，artifact-md5 = 上传 jar 的 MD5。
+# 【部署前】记录现有镜像：部署后用容器 .Image 与「本次构建的镜像 ID」对比，
+# 才能证明 compose 没有复用旧 image / 回退到 ACR 镜像。
+PRE_IMAGE_ID="$(docker image inspect secagent:local --format '{{.Id}}' 2>/dev/null || true)"
+echo "  部署前 secagent:local 镜像 ID = ${PRE_IMAGE_ID:-<不存在>}"
+echo "  部署前 docker image ls（secagent 相关）："
+docker image ls --no-trunc --format '    {{.Repository}}:{{.Tag}}  {{.ID}}  {{.CreatedSince}}' 2>/dev/null \
+  | grep -i secagent || echo "    <无>"
 docker build --network=host -f Dockerfile.runtime \
   --label "org.opencontainers.image.revision=$TARGET_FULL" \
   --label "artifact-md5=$JAR_MD5" \
   -t secagent:local . 2>&1 | tail -6
+
+# 【构建后】取本次产出的镜像 ID —— 这是后面证明"容器跑的就是它"的唯一依据。
+BUILT_IMAGE_ID=""
+if ! BUILT_IMAGE_ID="$(docker image inspect secagent:local --format '{{.Id}}' 2>/dev/null)"; then
+  echo "  [X] 构建后取不到 secagent:local 的镜像 ID —— 构建没有产出镜像，中止"
+  exit 7
+fi
+if [ -z "$BUILT_IMAGE_ID" ]; then
+  echo "  [X] 本次构建的镜像 ID 为空 —— 检索失败，中止"
+  exit 7
+fi
+echo "  本次构建镜像 ID = $BUILT_IMAGE_ID"
+if [ -n "$PRE_IMAGE_ID" ] && [ "$PRE_IMAGE_ID" = "$BUILT_IMAGE_ID" ]; then
+  echo "  [!] 本次构建镜像 ID 与部署前相同 —— 内容未变化（Docker 层缓存命中）；"
+  echo "      若刚改过 jar，说明 build context 或 Dockerfile.runtime 没把新 jar 拷进去，请检查。"
+fi
 
 # 【硬校验】镜像内产物必须等于上传的 jar。
 # 不加这一步就会重演实测过的坑：多阶段 Dockerfile 在镜像内用【服务器旧源码】编译，
@@ -145,44 +222,74 @@ export BUILD_SHA="$SHA"
 # 产物指纹交给 /api/health 暴露（P0-4）：compose 里映射为 APP_BUILD_* 两个变量
 export ARTIFACT_MD5
 export SOURCE_SHA
-docker compose up -d --force-recreate secagent 2>&1 | tail -3
-# 这里不盲目 sleep：下面 4/4 会轮询 health，一直到容器真的报出目标 commit 为止
+# 【部署前复检】timer 若仍是 active，此刻提醒（部署后它随时可能把容器滚回 ACR 镜像）
+warn_timer_conflict
+# --no-build：禁止 compose 回退去用 build.dockerfile（多阶段旧 Dockerfile）重新构建，
+# 也避免它在 image 缺失时自行 build 产出与本次产物不同的镜像。
+docker compose up -d --force-recreate --no-build secagent 2>&1 | tail -3
+# 这里不盲目 sleep：下面 3.6/4 与 4/4 会分别校验 jar 与 health，直到新版本真的在服务
 
 # ============================================================
-# 3.5/4 【硬校验】容器实际跑的镜像 == 本次构建的 secagent:local
+# 3.5/4 【硬校验】容器实际跑的镜像 == 本次构建产出的镜像 ID
 # ------------------------------------------------------------
 # 真实事故 B（2026-10-18）：build 明明产出了 secagent:local，`docker compose up -d`
 # 起来的却是 ACR 旧镜像（digest 4ecf4741…）—— 原因是 compose 里 image: 指向别处、
 # 或已有容器没被真正重建。当时是靠人肉 `md5sum /app/app.jar` 才发现"线上是旧代码"。
 # 这里的判据不可反驳：容器 .Image（它真正使用的镜像 ID）必须等于
-# `docker image inspect secagent:local` 的 .Id。不等就当场 exit 7。
+# 本次构建后取到的 BUILT_IMAGE_ID。不等就当场 exit 7。
+# 另外显式用容器名 secagent 而不是 `docker compose ps -q`：compose 的 -q 可能给空，
+# 空字符串喂给 docker inspect 只会报错，掩盖真正原因。
 # 为什么用 if ! 形式取命令替换：set -e **不会**捕获 $(...) 内部的失败，
 # 直接 `X="$(docker ...)"` 在取不到值时只会得到空串继续往下跑 —— 于是校验变成
 # 永远通过的空比较。if ! 显式判断退出码，取不到也算失败。
 # ============================================================
-EXPECT_IMAGE_ID=""
-if ! EXPECT_IMAGE_ID="$(docker image inspect secagent:local --format '{{.Id}}' 2>/dev/null)"; then
-  echo "  [X] 取不到 secagent:local 的镜像 ID（镜像不存在或 inspect 失败）—— 中止"
-  exit 7
-fi
+echo "==> 3.5/4 校验容器实际镜像 == 本次构建镜像"
 ACTUAL_IMAGE_ID=""
-if ! ACTUAL_IMAGE_ID="$(docker inspect "$(docker compose ps -q secagent)" --format '{{.Image}}' 2>/dev/null)"; then
+if ! ACTUAL_IMAGE_ID="$(docker inspect -f '{{.Image}}' secagent 2>/dev/null)"; then
   echo "  [X] 取不到容器 secagent 的实际镜像 ID（容器没起来？）—— 中止"
   exit 7
 fi
-if [ -z "$EXPECT_IMAGE_ID" ] || [ -z "$ACTUAL_IMAGE_ID" ]; then
-  echo "  [X] 镜像 ID 为空（期望='$EXPECT_IMAGE_ID' 实际='$ACTUAL_IMAGE_ID'）—— 检索失败，中止"
+if [ -z "$ACTUAL_IMAGE_ID" ]; then
+  echo "  [X] 容器 secagent 的镜像 ID 为空 —— 检索失败，中止"
   exit 7
 fi
-echo "  期望镜像ID(secagent:local) = $EXPECT_IMAGE_ID"
-echo "  实际镜像ID(容器)           = $ACTUAL_IMAGE_ID"
-if [ "$EXPECT_IMAGE_ID" != "$ACTUAL_IMAGE_ID" ]; then
+echo "  期望镜像ID(本次构建) = $BUILT_IMAGE_ID"
+echo "  实际镜像ID(容器)     = $ACTUAL_IMAGE_ID"
+if [ "$BUILT_IMAGE_ID" != "$ACTUAL_IMAGE_ID" ]; then
   echo "  [X] 容器跑的不是本次构建的镜像 —— 起了旧镜像，中止（不再靠人肉发现）"
-  echo "      期望（secagent:local）: $EXPECT_IMAGE_ID"
-  echo "      实际（容器 .Image）   : $ACTUAL_IMAGE_ID"
+  echo "      期望（本次构建）: $BUILT_IMAGE_ID"
+  echo "      实际（容器）    : $ACTUAL_IMAGE_ID"
   exit 7
 fi
-echo "  [OK] 镜像一致：容器实际镜像 == 本次构建的 secagent:local"
+echo "  [OK] 镜像一致：容器实际镜像 == 本次构建镜像"
+
+# ============================================================
+# 3.6/4 【硬校验】容器内 /app/app.jar 必须就是本次上传的 jar
+# ------------------------------------------------------------
+# 事故形态：镜像里的 app.jar 不是本次上传产物（构建上下文不对 / compose 复用旧 image），
+# 当时只能靠人肉 `docker cp` 才发现"线上是旧代码"。这里直接进容器算 MD5 对比。
+# 先等容器进入 Running：--force-recreate 刚返回时 exec 可能撞上 "container is restarting"。
+# ============================================================
+echo "==> 3.6/4 校验容器内 jar（docker exec secagent md5sum /app/app.jar）"
+CONTAINER_RUNNING=""
+for _ in $(seq 1 30); do
+  CONTAINER_RUNNING="$(docker inspect -f '{{.State.Running}}' secagent 2>/dev/null || true)"
+  [ "$CONTAINER_RUNNING" = "true" ] && break
+  sleep 2
+done
+if [ "$CONTAINER_RUNNING" != "true" ]; then
+  echo "  [X] 容器 secagent 在 60s 内没有进入 Running（当前=${CONTAINER_RUNNING:-<空>}）—— 中止"
+  docker ps -a --filter name=secagent --format '  {{.Names}} | {{.Status}}' || true
+  exit 8
+fi
+CONTAINER_MD5="$(docker exec secagent md5sum /app/app.jar 2>/dev/null | awk '{print $1}')" || true
+echo "  上传 jar MD5   = $JAR_MD5"
+echo "  容器内 jar MD5 = ${CONTAINER_MD5:-<取不到>}"
+if [ -z "$CONTAINER_MD5" ] || [ "$CONTAINER_MD5" != "$JAR_MD5" ]; then
+  echo "  [X] 容器内 /app/app.jar 与本次上传的 jar 不一致 —— 中止（镜像里的 jar 不是本次产物）"
+  exit 8
+fi
+echo "  [OK] jar 一致：容器内 /app/app.jar == 上传 jar"
 
 echo "==> 4/4 双指纹落盘 + 健康检查"
 # SOURCE_SHA 已在步骤 2 算好并 export（必须在 compose up 之前，否则容器里是 unknown）
@@ -211,27 +318,63 @@ elif [ "$SOURCE_SHA" != "$ORIGIN_SHA" ]; then
 fi
 docker ps --format '  {{.Names}} | {{.Status}}' | head -3
 
-# 部署后独立核对（不靠"看起来成功"）：
-#   等到 health 报出【目标 commit】，再断言 fingerprintMismatch=false、status=ok。
-# 为什么不能只 curl 一下就算过：事故形态就是"接口 200、一切正常"。
+# ============================================================
+# 4/4 【fail-closed】轮询 health 直到「新版本真的在服务」
+# ------------------------------------------------------------
+# 为什么必须轮询：--force-recreate 返回时新容器才刚刚开始启动（Spring 40~90s）。
+# 立刻读 /api/health 会读到旧容器的应答（旧版本指纹）或空 ——
+# 于是把"新容器其实已经起来"误判成失败，fail-closed 中止。
+# 判据：status=ok 且 embeddedGitCommit=目标 sha；最多 120 秒、每 3 秒一次。
+# 超时才失败，并打印最后一次 health 全量 JSON（含 fingerprintIssues 等排查信息）。
+# ============================================================
 HEALTH_JSON=""
-for _ in $(seq 1 36); do
-  HEALTH_JSON="$(curl -s -m 10 http://127.0.0.1:9900/api/health || true)"
-  if echo "$HEALTH_JSON" | grep -q "\"embeddedGitCommit\":\"${SHA}\""; then
-    break
+HEALTH_STATUS=""
+HEALTH_COMMIT=""
+HEALTH_OK=0
+DEADLINE=$(( $(date +%s) + 120 ))
+ATTEMPT=0
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  ATTEMPT=$((ATTEMPT + 1))
+  HEALTH_JSON="$(curl -s -m 10 http://127.0.0.1:9900/api/health 2>/dev/null || true)"
+  if [ -n "$HEALTH_JSON" ]; then
+    HEALTH_STATUS="$(json_str "$HEALTH_JSON" status)"
+    HEALTH_COMMIT="$(json_str "$HEALTH_JSON" embeddedGitCommit)"
+    echo "  第 ${ATTEMPT} 次健康检查：status=${HEALTH_STATUS:-?} embeddedGitCommit=${HEALTH_COMMIT:-?}"
+    if [ "$HEALTH_STATUS" = "ok" ] && [ "$HEALTH_COMMIT" = "$SHA" ]; then
+      HEALTH_OK=1
+      break
+    fi
   fi
-  sleep 5
+  sleep 3
 done
+if [ "$HEALTH_OK" != "1" ]; then
+  echo "  [X] 120s 内没有等到 status=ok 且 embeddedGitCommit=$SHA"
+  if [ -n "$HEALTH_JSON" ]; then
+    echo "  最后一次 /api/health 全量 JSON："
+    echo "  $HEALTH_JSON"
+  else
+    echo "  最后一次 /api/health：无响应（120s 内 curl 没拿到任何 JSON）"
+  fi
+  exit 6
+fi
 echo "  health: $HEALTH_JSON"
 POST_FAILED=0
-echo "$HEALTH_JSON" | grep -q "\"embeddedGitCommit\":\"${SHA}\"" \
-  || { echo "  [X] embeddedGitCommit != $SHA（jar 内固化的 commit 与本次发布的目标 commit 不一致）"; POST_FAILED=1; }
-echo "$HEALTH_JSON" | grep -q '"fingerprintMismatch":false' \
-  || { echo "  [X] fingerprintMismatch != false（见 health 的 fingerprintMismatchReason）"; POST_FAILED=1; }
-echo "$HEALTH_JSON" | grep -q '"status":"ok"' \
-  || { echo "  [X] status != ok（见 health 的 fingerprintIssues）"; POST_FAILED=1; }
+HEALTH_BUILD_SHA="$(json_str "$HEALTH_JSON" buildSha)"
+[ "$HEALTH_BUILD_SHA" = "$SHA" ] \
+  || { echo "  [X] buildSha=$HEALTH_BUILD_SHA != $SHA（容器环境变量 BUILD_SHA 没注入对，compose 可能没生效）"; POST_FAILED=1; }
+HEALTH_MISMATCH="$(json_raw "$HEALTH_JSON" fingerprintMismatch)"
+[ "$HEALTH_MISMATCH" = "false" ] \
+  || { echo "  [X] fingerprintMismatch=$HEALTH_MISMATCH != false（见 health 的 fingerprintIssues / fingerprintMismatchReason）"; POST_FAILED=1; }
+HEALTH_STATUS="$(json_str "$HEALTH_JSON" status)"
+[ "$HEALTH_STATUS" = "ok" ] \
+  || { echo "  [X] status=$HEALTH_STATUS != ok（见 health 的 fingerprintIssues）"; POST_FAILED=1; }
+HEALTH_ARTIFACT_MD5="$(json_str "$HEALTH_JSON" artifactMd5)"
+if [ -n "$HEALTH_ARTIFACT_MD5" ] && [ "$HEALTH_ARTIFACT_MD5" != "$JAR_MD5" ]; then
+  echo "  [X] health.artifactMd5=$HEALTH_ARTIFACT_MD5 != 上传 jar MD5=$JAR_MD5（容器里不是本次上传产物）"
+  POST_FAILED=1
+fi
 if [ "$POST_FAILED" != "0" ]; then
   echo "  [X] 部署后核对未通过 —— 以非零退出（别把『看起来成功』当成功）"
   exit 6
 fi
-echo "  [OK] 部署后核对通过：embeddedGitCommit = $SHA，fingerprintMismatch=false，status=ok"
+echo "  [OK] 部署后核对通过：embeddedGitCommit = buildSha = $SHA，fingerprintMismatch=false，status=ok，artifactMd5=${HEALTH_ARTIFACT_MD5:-<未暴露>}"

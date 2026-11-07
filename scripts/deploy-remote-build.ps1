@@ -17,8 +17,13 @@
     ② 构建后  —— 从 jar 里把 git.properties 读出来，核对 git.commit.id.abbrev == 目标 commit、
                  git.dirty == false；对不上**连 scp 都不做**（防止 -SkipBuild 复用旧 jar）
     ③ 服务器侧 —— build-on-server.sh 再核对一次源码树（clean + HEAD == 目标）+ 镜像内 jar MD5 硬校验
-    ④ 部署后  —— 解析 /api/health，核对 embeddedGitCommit == buildSha == 目标 commit 且
-                 fingerprintMismatch=false、status=ok；不满足就非零退出
+                 + 部署前记录镜像 ID、部署后断言容器 .Image == 本次构建镜像 ID（防复用旧 image）
+                 + 对运行中的容器做 `docker exec md5sum /app/app.jar` 一致性断言（防 app.jar 不是本次产物）
+    ④ 部署后  —— **轮询** /api/health（最多 120s、每 3s）直到 status=ok 且 embeddedGitCommit == 目标
+                 commit，再核对 buildSha 一致、fingerprintMismatch=false；超时才失败并打印最后一次
+                 health 全量 JSON（避免"容器还在 starting"被误判成部署失败）
+    ⑤ 冲突检测 —— 服务器上的 secagent-redeploy.timer 会按 ACR digest 把容器滚回旧镜像；
+                 检测到 active 时打印醒目警告与建议命令，但**不自动停**（停不停由站主决定）
 
   为什么①③是"源码"校验而不是多余：真实事故是老 Dockerfile 在镜像内用**服务器上的旧 src** 编译，
   于是 BUILD_SHA（环境变量自述）显示新版本、容器里跑的是旧代码。
@@ -49,6 +54,44 @@ Set-Location $repo
 function Step($n, $msg) { Write-Host "==> $n $msg" }
 function Fail($msg) { Write-Host "[X] $msg" -ForegroundColor Red; exit 1 }
 function Warn($msg) { Write-Host "[!] $msg" -ForegroundColor Yellow }
+
+# 读取服务器上某个 systemd unit 的状态（active/inactive/failed/unknown）。
+function Get-RemoteUnitState([string]$unit) {
+  $s = (ssh -o ConnectTimeout=20 $SshHost "systemctl is-active $unit 2>/dev/null || true" 2>$null | Out-String).Trim()
+  if (-not $s) { return 'unknown' }
+  return $s
+}
+
+# ============================================================
+# 【冲突检测】secagent-redeploy.timer 每 5 分钟按 ACR stable digest 巡检：
+#   只要发布指针和当前运行 digest 对不上，它就会 pull + 重建，把容器滚回 ACR 里的镜像。
+#   实测后果：手工部署刚把 embeddedGitCommit 做到 6994a3d，几分钟后它又退回 69aff26。
+#
+# 为什么不自动 stop：停 timer 是有副作用的决定（可能正等人 push 正式版本；
+#   也可能本次只是临时验证，之后仍要靠 timer 巡检）。脚本只负责把风险说清楚。
+# ============================================================
+function Show-TimerConflictWarning {
+  $timer = Get-RemoteUnitState 'secagent-redeploy.timer'
+  $svc   = Get-RemoteUnitState 'secagent-redeploy.service'
+  if ($timer -ne 'active' -and $svc -ne 'active') {
+    Write-Host "    [OK] secagent-redeploy.timer/service 均未激活（不会被 ACR 巡检滚回旧镜像）"
+    return $false
+  }
+  Write-Host ""
+  Write-Host ("  " + ("!" * 76)) -ForegroundColor Red
+  Write-Host "  [!!] 警告：服务器上的 ACR 巡检定时器正在运行，可能覆盖本次手工部署" -ForegroundColor Red
+  Write-Host ("  " + ("!" * 76)) -ForegroundColor Red
+  Write-Host "       secagent-redeploy.timer   = $timer" -ForegroundColor Yellow
+  Write-Host "       secagent-redeploy.service = $svc" -ForegroundColor Yellow
+  Write-Host "       它每 5 分钟读一次 ACR 的 stable digest；一旦触发重建，容器会被换回 ACR 里的镜像" -ForegroundColor Yellow
+  Write-Host "       （实测：embeddedGitCommit 从 6994a3d 退回 69aff26，手工部署被覆盖）。" -ForegroundColor Yellow
+  Write-Host "       本脚本【不会自动停】它。若本次必须让手工部署保持，请先执行：" -ForegroundColor Yellow
+  Write-Host "           sudo systemctl stop secagent-redeploy.timer" -ForegroundColor White
+  Write-Host "       部署并核对完成后，按需恢复：" -ForegroundColor Yellow
+  Write-Host "           sudo systemctl start secagent-redeploy.timer" -ForegroundColor White
+  Write-Host ""
+  return $true
+}
 
 $mvn = 'F:\Maven\apache-maven-3.9.12-bin\apache-maven-3.9.12\bin\mvn.cmd'
 if (-not $mvn -or -not (Test-Path $mvn)) { $mvn = 'mvn' }
@@ -108,6 +151,9 @@ if ($dirty.Count -gt 0) {
 $worktreeState = if ($dirty.Count -gt 0) { '脏（已显式放行）' } else { '干净' }
 Step "0/4" "[OK] 源码校验通过：HEAD == 目标 commit=$sha，工作区$worktreeState"
 
+# 【部署前】先看 ACR 巡检 timer 是否会覆盖本次部署（只警告，不自动停）
+$timerActive = Show-TimerConflictWarning
+
 # 1) 本机编译（不需要 Docker）
 if (-not $SkipBuild) {
   Step "1/4" "本机编译 + 单测（mvn package）"
@@ -160,20 +206,56 @@ $out = ssh -o ConnectTimeout=20 $SshHost "tr -d '\r' < $RemoteDir/scripts/build-
 $sshCode = $LASTEXITCODE
 $out | ForEach-Object { Write-Host "    $_" }
 if ($sshCode -ne 0) {
-  Fail "服务器侧构建/校验失败（exit=$sshCode）—— 已按 fail-closed 中止，未重启容器"
+  Fail "服务器侧构建/校验失败（exit=$sshCode）—— fail-closed 中止；注意 exit 6/7/8 发生在容器已重建之后，线上状态以日志与 /api/health 为准"
 }
 
-# 5) 【fail-closed ④】部署后严格核对 health（解析 JSON，不再只做子串匹配）
-Step "5/5" "核对线上版本指纹（三方核对：embeddedGitCommit / artifactMd5 / buildSha）"
+# 5) 【fail-closed ④】部署后**轮询**核对 health
+#    为什么必须轮询：docker compose up --force-recreate 返回时新容器才刚刚开始启动，
+#    Spring 上下文初始化要 40~90 秒。若立刻读 /api/health：
+#      · 旧容器的端口可能还在应答 → 读到【旧版本指纹】；
+#      · 或者新容器还没监听 → 读到空。
+#    实测后果：脚本把"新容器其实已经起来"误判成失败（exit 6 / fail-closed 中止）。
+#    判据：status == ok 且 embeddedGitCommit == 目标 sha；最多 120 秒、每 3 秒一次。
+#    超时才失败，并把最后一次 health 的【全量 JSON】原样打出来（排查用）。
+Step "5/5" "轮询 /api/health（最多 120s / 每 3s）直到 status=ok 且 embeddedGitCommit=$sha"
+$healthDeadline = (Get-Date).AddSeconds(120)
+$healthRaw = ''
 $j = $null
-for ($i = 0; $i -lt 20; $i++) {
-  $health = ssh -o ConnectTimeout=20 $SshHost "curl -s -m 10 http://127.0.0.1:9900/api/health" 2>$null
-  if ($health) { try { $j = $health | ConvertFrom-Json } catch { $j = $null } }
-  if ($j) { break }
-  Start-Sleep -Seconds 5
+$attempt = 0
+while ((Get-Date) -lt $healthDeadline) {
+  $attempt++
+  $raw = ssh -o ConnectTimeout=20 $SshHost "curl -s -m 10 http://127.0.0.1:9900/api/health" 2>$null
+  if ($raw) {
+    $healthRaw = ($raw | Out-String).Trim()
+    $candidate = $null
+    try { $candidate = $healthRaw | ConvertFrom-Json } catch { $candidate = $null }
+    if ($candidate) {
+      $j = $candidate
+      $curStatus = "$($candidate.status)"
+      $curCommit = "$($candidate.embeddedGitCommit)"
+      Write-Host ("    第 {0,2} 次：status={1} embeddedGitCommit={2}" -f $attempt, $curStatus, $curCommit)
+      if ($curStatus -eq 'ok' -and $curCommit -eq $sha) { break }
+    } else {
+      Write-Host ("    第 {0,2} 次：响应不是 JSON，继续等" -f $attempt)
+    }
+  }
+  Start-Sleep -Seconds 3
 }
-if (-not $j) { Fail "拿不到 /api/health（或不是 JSON）—— 无法核对线上版本" }
-Write-Host "    $($health.Trim())"
+if (-not $j -or "$($j.status)" -ne 'ok' -or "$($j.embeddedGitCommit)" -ne $sha) {
+  Write-Host ""
+  Write-Host "    [X] 120 秒内没有等到 status=ok 且 embeddedGitCommit=$sha" -ForegroundColor Red
+  if ($healthRaw) {
+    Write-Host "    最后一次 /api/health 全量 JSON：" -ForegroundColor Yellow
+    Write-Host $healthRaw
+  } else {
+    Write-Host "    最后一次 /api/health：无响应（120s 内 curl 没拿到任何 JSON）" -ForegroundColor Yellow
+  }
+  if ($timerActive) {
+    Write-Host "    提示：secagent-redeploy.timer 处于 active，可能已把容器滚回旧镜像；先 stop timer 再重试。" -ForegroundColor Yellow
+  }
+  Fail "部署后核对超时（120s）：未达到 status=ok 且 embeddedGitCommit=$sha"
+}
+Write-Host "    $healthRaw"
 
 if ("$($j.embeddedGitCommit)" -ne $sha) {
   Fail "线上 embeddedGitCommit=$($j.embeddedGitCommit) ≠ 目标 commit=$sha（jar 内固化值与目标版本不一致）"
@@ -188,3 +270,8 @@ if ("$($j.status)" -ne 'ok') {
   Fail "线上 status=$($j.status)（期望 ok）：$($j.fingerprintIssues -join ' / ')"
 }
 Write-Host "[OK] 部署完成：embeddedGitCommit = buildSha = $sha，fingerprintMismatch=false，status=ok"
+if ($timerActive) {
+  Write-Host ""
+  Write-Host "  [!!] 提醒：secagent-redeploy.timer 仍为 active —— 它随时可能按 ACR digest 把容器滚回旧镜像。" -ForegroundColor Yellow
+  Write-Host "       若要让本次手工部署保持，请执行：sudo systemctl stop secagent-redeploy.timer" -ForegroundColor Yellow
+}
