@@ -343,10 +343,12 @@ public class PublicStreamService {
     }
 
     /**
-     * 聚合项 → 实时帧载荷（六字段）。
+     * 聚合项 → 实时帧载荷（七字段）。
      *
      * <p>只做"改名 + 脱敏"，不改语义：{@code time} 取 endTime（聚合窗口结束时间），
      * {@code count} 是这簇事件条数；{@code kind}/{@code sev} 用枚举名，和列表页一致。
+     * {@code cc} 是来源国家二字码，与 {@code /api/public/alerts} 的 {@code list[].cc}
+     * 共用 {@code PublicAlertSource#countryCode}，取不到为 {@code null}。
      */
     Map<String, Object> toStreamItem(Map<String, Object> agg) {
         Map<String, Object> item = new LinkedHashMap<>();
@@ -356,6 +358,8 @@ public class PublicStreamService {
         item.put("rule", text(agg.get("ruleName")));
         item.put("sev", enumName(agg.get("severity")));
         item.put("count", count(agg.get("count")));
+        // 来源国家码：与 REST 列表同一个解析入口（srcGeo 首段优先，缺了才查离线库），null=取不到。
+        item.put("cc", source.countryCode(agg));
         return item;
     }
 

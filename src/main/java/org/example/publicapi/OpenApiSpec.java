@@ -203,7 +203,8 @@ public class OpenApiSpec {
         base(paths, "get", "/api/public/alerts", "publicAlerts", "告警聚合（窗口内告警 + 来源 + severity）",
                 "给的是**聚合**，不是原始日志：同一份响应里 `rawTotal` 是原始条数、`aggregated` 才是聚合成几条"
                         + "（实测 200 → 26），行数对不上不是 bug。`list[]` 每条给 "
-                        + "`aggId, count, startTime, endTime, title, ruleName, srcIp, srcGeo, severity, status, hitCount`，"
+                        + "`aggId, count, startTime, endTime, title, ruleName, srcIp, srcGeo, severity, status, hitCount, cc`，"
+                        + "`cc` 是来源国 ISO-3166-1 alpha-2 二字码（如 `NL`/`FR`/`US`），取不到为 `null` —— 不写 `\"\"`/`\"XX\"`/`\"未知\"`；"
                         + "`stats24h.trend[]` 给 24h 趋势。`srcIp` 在接口里可能仍是原文，展示层统一掩码。",
                 List.of(), null, null, true);
 

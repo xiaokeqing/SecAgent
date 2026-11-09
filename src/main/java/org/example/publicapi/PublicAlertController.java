@@ -594,6 +594,10 @@ public class PublicAlertController {
         // 键名保留、值保持空 —— 这正是本轮改造前它对真实告警的取值（内置样本不进公开面），
         // 所以不是语义变更，而是"不让新富化的数据从这条缝里漏出去"。测试：PublicApiGeoLeakTest。
         m.put("srcGeo", null);
+        // 来源国家二字码（新增字段，既有键一个不动）：只给 ISO-3166-1 alpha-2 大写二字码，
+        // 取不到就 null（前端据此不在地图上打点），绝不写 ""/"XX"/"未知"。
+        // 与 SSE 的 alert 帧共用 PublicAlertSource#countryCode —— 同一个聚合项两处取值必然一致。
+        m.put("cc", support.source == null ? null : support.source.countryCode(src));
         m.put("occurredAt", src.get("occurredAt"));
         m.put("status", src.get("status"));
         m.put("hitCount", src.get("hitCount"));

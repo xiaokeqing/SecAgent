@@ -2,6 +2,7 @@ package org.example.publicapi;
 
 import org.example.aggregation.AlertAggregationService;
 import org.example.core.model.SecurityAlert;
+import org.example.geoip.GeoIpService;
 import org.example.integration.WazuhGateway;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -51,6 +52,31 @@ public class PublicAlertSource {
 
     @Autowired
     private AlertAggregationService aggregator;
+
+    /**
+     * 离线 GeoIP 库 —— 与 {@code /api/public/geo} 用的<b>同一个 Bean</b>
+     * （{@link GeoIpService}，DB-IP Lite，进程内查询、绝不联网）。
+     *
+     * <p>{@code required = false}：裁剪部署、单元测试里可能没有这个 Bean。
+     * 此时只有自带 {@code srcGeo} 的聚合能给出国家码，回落查询直接跳过 ——
+     * 不因为缺库让别人注入一个必须存在的依赖，也不把 null 当"未知国家"的假值。
+     */
+    @Autowired(required = false)
+    private GeoIpService geoIpService;
+
+    /** 国家码解析（含按 IP 的 LRU 缓存）：REST 列表项与 SSE 帧共用这一个实例。 */
+    private final PublicAlertGeo alertGeo = new PublicAlertGeo();
+
+    /**
+     * 聚合项的来源国家二字码（ISO-3166-1 alpha-2 大写），取不到返回 {@code null}。
+     *
+     * <p>这是公开面唯一的国家码出口：{@code PublicAlertController#publicAggregate}
+     * 与 {@code PublicStreamService#toStreamItem} 都调它，同一个聚合项在两处取值必然一致。
+     * 只读 {@code srcGeo} 的第一段；缺 {@code srcGeo} 时回落到离线库查 {@code srcIp}（带缓存）。
+     */
+    public String countryCode(Map<String, Object> aggregate) {
+        return alertGeo.countryCode(aggregate, geoIpService);
+    }
 
     /** 数据源当前模式（REAL / MOCK / OFF），取不到时按 MOCK 处理（不乐观假设） */
     public String mode() {

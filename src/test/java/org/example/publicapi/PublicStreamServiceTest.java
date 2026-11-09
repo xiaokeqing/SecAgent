@@ -173,11 +173,18 @@ class PublicStreamServiceTest {
 
     private static Map<String, Object> alert(String aggId, String endTime, String srcIp, AlertType type,
                                              String rule, AlertSeverity severity, int count) {
+        return alert(aggId, endTime, srcIp, null, type, rule, severity, count);
+    }
+
+    /** 带内部 srcGeo（{@code 国家|省|城市|ASN|机构}）的聚合项；用于验证 cc 只取首段。 */
+    private static Map<String, Object> alert(String aggId, String endTime, String srcIp, String srcGeo,
+                                             AlertType type, String rule, AlertSeverity severity, int count) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("aggId", aggId);
         m.put("endTime", endTime);
         m.put("startTime", endTime);
         m.put("srcIp", srcIp);
+        m.put("srcGeo", srcGeo);
         m.put("type", type);
         m.put("severity", severity);
         m.put("ruleName", rule);
@@ -233,10 +240,11 @@ class PublicStreamServiceTest {
     // ==================== ② alert 帧 ====================
 
     @Test
-    @DisplayName("【核心】alert 帧六字段与 /api/public/alerts 的 list[] 同名同义，src 已脱敏")
+    @DisplayName("【核心】alert 帧七字段与 /api/public/alerts 的 list[] 同名同义，src 已脱敏，cc 只取国家码")
     void alertFrameCarriesContractFields() throws Exception {
         StubSource source = new StubSource();
         source.items = List.of(alert("agg-1", "2026-11-07 11:59:30", "203.0.113.7",
+                "US|California|Mountain View|15169|Google LLC",
                 AlertType.BRUTE_FORCE, "sshd：疑似暴力破解", AlertSeverity.HIGH, 3));
         PublicStreamService service = service(source, clock(), 10);
         RecordingEmitter emitter = new RecordingEmitter();
@@ -259,7 +267,31 @@ class PublicStreamServiceTest {
         assertEquals("sshd：疑似暴力破解", data.get("rule").asText(), "rule ← ruleName");
         assertEquals("HIGH", data.get("sev").asText(), "sev ← 严重度枚举名");
         assertEquals(3, data.get("count").asInt(), "count 是聚合条数");
-        assertEquals(6, data.size(), "对外只暴露六个字段，防止把内部字段带出去");
+        assertEquals("US", data.get("cc").asText(), "cc ← srcGeo 首段（ISO-3166 alpha-2）");
+        assertEquals(7, data.size(), "对外只暴露七个字段，防止把内部字段带出去");
+        assertFalse(frame.contains("California"), "cc 只出国家码，省/市不得进帧");
+        assertFalse(frame.contains("15169"), "ASN 是内部字段，不得进帧");
+    }
+
+    @Test
+    @DisplayName("cc 取不到时为 null：键仍在、值为 null，绝不写 \"\" / \"XX\" / \"未知\"")
+    void alertFrameWithoutCountryHasNullCc() throws Exception {
+        StubSource source = new StubSource();
+        source.items = List.of(alert("agg-2", "2026-11-07 11:59:40", "198.51.100.9",
+                AlertType.SCAN, "扫描", AlertSeverity.MEDIUM, 1));
+        PublicStreamService service = service(source, clock(), 10);
+        RecordingEmitter emitter = new RecordingEmitter();
+        service.attach(emitter);
+
+        service.tick();
+
+        JsonNode data = dataOf(emitter.frames.stream()
+                .filter(f -> f.startsWith("event: alert"))
+                .findFirst()
+                .orElseThrow());
+        assertTrue(data.has("cc"), "契约字段 cc 必须始终出现（值可为 null）");
+        assertTrue(data.get("cc").isNull(), "取不到国家必须是 null，不能是空串或未知占位");
+        assertEquals(7, data.size(), "字段数仍是七个");
     }
 
     @Test
