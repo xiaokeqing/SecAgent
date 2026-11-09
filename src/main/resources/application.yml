@@ -618,6 +618,21 @@ app:
     # 自动处置（策略派生）时长的上限。必须比人工上限大：
     # 利用类按策略封 7 天(10080)，若拿人工上限 1440 去卡，长封禁会被静默截成 1 天。
     policy-max-duration-minutes: 10080
+    # ===== 自动封禁（AutoResponder：检测 → 自动封禁 的调度器）=====
+    # 【默认关闭】enabled=false 时 AutoResponder 这个 Bean 根本不创建，
+    # /api/sec/auto-response/state 仍可查（返回 enabled=false + 当前阈值）。
+    # 【默认演练】即使打开了 enabled，dry-run=true 也只记录"本应封谁"，不碰防火墙。
+    # 上线顺序：AUTO_RESPONSE_ENABLED=true + AUTO_RESPONSE_DRY_RUN=true 先观察一轮，
+    # 确认决策正确后再把 dry-run 切成 false 真封。
+    auto:
+      enabled: ${AUTO_RESPONSE_ENABLED:false}
+      dry-run: ${AUTO_RESPONSE_DRY_RUN:true}
+      # 同一 IP 在最近 5 分钟内 HIGH+CRITICAL 的命中次数之和达到该值 → 封禁
+      min-high: 30
+      # 同一 IP 在最近 5 分钟内 CRITICAL 达到该值 → 封禁（独立于 min-high 的更严格路径）
+      min-critical: 3
+      # 自动封禁时长（分钟，受 app.response.max-duration-minutes 上限约束）
+      duration-minutes: 60
   # 跨域：默认只允许本机来源，不再使用通配符 "*"
   cors:
     allowed-origins: http://localhost:9900,http://127.0.0.1:9900
