@@ -1,6 +1,0 @@
-﻿feat(response): 蜜罐登录成功即封 + 阈值可配 + 决策带 matched 说明
-
-- AutoResponder: 5 分钟窗口内某 srcIp 出现蜜罐「登录成功」直接成为候选（不看条数/等级），reason=自动封禁：蜜罐登录成功（攻击者已进入）；仍先过 ResponseGuard + 30 分钟冷却
-- 阈值改可配：AUTO_RESPONSE_MIN_HIGH / MIN_CRITICAL / BLOCK_ON_HONEYPOT_LOGIN / HONEYPOT_LOGIN_COOLDOWN_MINUTES（yml 与 @Value 同默认值）
-- windows 每条补 matched: high-threshold | critical-threshold | honeypot-login（skip-cooldown/skip-guard/dry-run/block/error 都带）
-- 测试 927 -> 933（新增 6 个：登录成功即封、开关可关、噪音不误封、30 分钟冷却、dry-run 演练、matched 三来源）
