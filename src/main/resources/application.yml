@@ -628,9 +628,15 @@ app:
       enabled: ${AUTO_RESPONSE_ENABLED:false}
       dry-run: ${AUTO_RESPONSE_DRY_RUN:true}
       # 同一 IP 在最近 5 分钟内 HIGH+CRITICAL 的命中次数之和达到该值 → 封禁
-      min-high: 30
+      min-high: ${AUTO_RESPONSE_MIN_HIGH:30}
       # 同一 IP 在最近 5 分钟内 CRITICAL 达到该值 → 封禁（独立于 min-high 的更严格路径）
-      min-critical: 3
+      min-critical: ${AUTO_RESPONSE_MIN_CRITICAL:3}
+      # 蜜罐「登录成功」= 攻击者已穿过认证层，无视条数直接处置（默认开）。
+      # 关掉它等于要求"攻进蜜罐的人先刷够 30 条"——真实入侵者恰恰不会刷够。
+      block-on-honeypot-login: ${AUTO_RESPONSE_BLOCK_ON_HONEYPOT_LOGIN:true}
+      # 蜜罐登录成功的处置冷却（分钟）。比阈值路径的 10 分钟长：
+      # 同一台蜜罐被反复"登录成功"是同一事件，但冷却太长会吞掉下一次真实入侵。
+      honeypot-login-cooldown-minutes: ${AUTO_RESPONSE_HONEYPOT_LOGIN_COOLDOWN_MINUTES:30}
       # 自动封禁时长（分钟，受 app.response.max-duration-minutes 上限约束）
       duration-minutes: 60
   # 跨域：默认只允许本机来源，不再使用通配符 "*"

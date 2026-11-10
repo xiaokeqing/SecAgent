@@ -46,6 +46,12 @@ public class AutoResponseController {
     @Value("${app.response.auto.min-critical:3}")
     private int minCritical = 3;
 
+    @Value("${app.response.auto.block-on-honeypot-login:true}")
+    private boolean blockOnHoneypotLogin = true;
+
+    @Value("${app.response.auto.honeypot-login-cooldown-minutes:30}")
+    private int honeypotLoginCooldownMinutes = 30;
+
     @Value("${app.response.auto.duration-minutes:60}")
     private int durationMinutes = 60;
 
@@ -76,6 +82,10 @@ public class AutoResponseController {
             data.put("dryRun", dryRun);
             data.put("minHigh", minHigh);
             data.put("minCritical", minCritical);
+            // 与 Bean 存在时同名字段，否则"没开"和"开了"两份 JSON 的形状不一致，
+            // 页面拿不到 blockOnHoneypotLogin 就没法解释"为什么蜜罐登录没封"
+            data.put("blockOnHoneypotLogin", blockOnHoneypotLogin);
+            data.put("honeypotLoginCooldownMinutes", honeypotLoginCooldownMinutes);
             data.put("durationMinutes", durationMinutes);
             data.put("windows", List.of());
         }

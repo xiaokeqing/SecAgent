@@ -292,6 +292,131 @@ class AutoResponderTest {
         assertThat(responder.recentWindows(50)).hasSize(12);
     }
 
+    // ---------------------------------------------------------------- 蜜罐登录（真实入侵信号）
+
+    @Test
+    @DisplayName("蜜罐「登录成功」1 条即封（无视 min-high=30）：reason 写清\"攻击者已进入\"，matched=honeypot-login")
+    void honeypotLoginBlocksRegardlessOfThreshold() {
+        ReflectionTestUtils.setField(responder, "dryRun", false);
+        // 刻意给 LOW：Cowrie 100102 的 level 不高，按等级过滤就会漏掉真实入侵
+        SecurityAlert login = honeypotAlert(ATTACKER, "蜜罐: 攻击者\"登录成功\" (SSH)", AlertSeverity.LOW);
+        alerts.list = List.of(login);
+
+        responder.runOnce();
+
+        assertThat(actions.calls).hasSize(1);
+        ActionCall call = actions.calls.get(0);
+        assertThat(call.ip).isEqualTo(ATTACKER);
+        assertThat(call.durationMinutes).isEqualTo(60);
+        assertThat(call.reason).isEqualTo("自动封禁：蜜罐登录成功（攻击者已进入）");
+        assertThat(lastAction()).isEqualTo("block");
+        assertThat(lastMatched()).isEqualTo("honeypot-login");
+    }
+
+    @Test
+    @DisplayName("开关关闭（block-on-honeypot-login=false）→ 蜜罐登录不再单独成案，回到纯条数判定")
+    void honeypotLoginRuleCanBeDisabled() {
+        ReflectionTestUtils.setField(responder, "dryRun", false);
+        ReflectionTestUtils.setField(responder, "blockOnHoneypotLogin", false);
+        alerts.list = List.of(honeypotAlert(ATTACKER, "蜜罐: 攻击者\"登录成功\" (SSH)", AlertSeverity.LOW));
+
+        responder.runOnce();
+
+        assertThat(actions.calls).isEmpty();
+        assertThat(responder.recentWindows(50)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("蜜罐来源的「连接尝试」「登录失败」不算登录成功：只认来源不认动作会误封扫描噪音")
+    void honeypotNoiseWithoutSuccessfulLoginDoesNotBlock() {
+        ReflectionTestUtils.setField(responder, "dryRun", false);
+        List<SecurityAlert> list = new ArrayList<>();
+        list.add(honeypotAlert(ATTACKER, "蜜罐: 连接尝试 cowrie ssh", AlertSeverity.LOW));
+        list.add(honeypotAlert(ATTACKER, "蜜罐: 攻击者登录失败 (SSH)", AlertSeverity.LOW));
+        alerts.list = list;
+
+        responder.runOnce();
+
+        assertThat(actions.calls).isEmpty();
+        assertThat(responder.recentWindows(50)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("蜜罐登录的冷却按 30 分钟算：11 分钟时仍跳过，31 分钟才允许再封")
+    void honeypotLoginCooldownIsThirtyMinutes() {
+        ReflectionTestUtils.setField(responder, "dryRun", false);
+        LocalDateTime t0 = LocalDateTime.now().withNano(0);
+        setClock(t0);
+        alerts.list = List.of(honeypotLoginAlert(ATTACKER, t0.minusMinutes(1)));
+
+        responder.runOnce();
+        assertThat(actions.calls).hasSize(1);
+
+        // 11 分钟后：阈值路径的 10 分钟冷却已过期，但蜜罐路径是 30 分钟 → 必须还在冷却
+        LocalDateTime t1 = t0.plusMinutes(11);
+        setClock(t1);
+        alerts.list = List.of(honeypotLoginAlert(ATTACKER, t1.minusMinutes(1)));
+        responder.runOnce();
+
+        assertThat(actions.calls).hasSize(1);
+        assertThat(lastAction()).isEqualTo("skip-cooldown");
+        assertThat(lastReason()).contains("30 分钟内");
+        assertThat(lastMatched()).isEqualTo("honeypot-login");
+
+        // 31 分钟后冷却真的过期：同一台蜜罐再次被登录成功，必须能再封（不能把下一次入侵吞掉）
+        LocalDateTime t2 = t0.plusMinutes(31);
+        setClock(t2);
+        alerts.list = List.of(honeypotLoginAlert(ATTACKER, t2.minusMinutes(1)));
+        responder.runOnce();
+
+        assertThat(actions.calls).hasSize(2);
+        assertThat(lastAction()).isEqualTo("block");
+    }
+
+    @Test
+    @DisplayName("dry-run 下蜜罐登录同样只演练：不下发，审计 detail 里能看出是 honeypot-login 命中的")
+    void dryRunStillSimulatesHoneypotLogin() {
+        // dryRun 默认 true，刻意不 setField
+        alerts.list = List.of(honeypotLoginAlert(ATTACKER, LocalDateTime.now().minusMinutes(1)));
+
+        responder.runOnce();
+
+        assertThat(actions.calls).isEmpty();
+        assertThat(audits.appended).hasSize(1);
+        ResponseAudit audit = audits.appended.get(0);
+        assertThat(audit.getAction()).isEqualTo("block-ip-dryrun");
+        assertThat(audit.getTarget()).isEqualTo(ATTACKER);
+        assertThat(audit.getMode()).isEqualTo("DRY_RUN");
+        assertThat(audit.getDetail()).contains("honeypot-login");
+        assertThat(lastAction()).isEqualTo("dry-run");
+        assertThat(lastMatched()).isEqualTo("honeypot-login");
+    }
+
+    @Test
+    @DisplayName("windows 的 matched 能区分三种命中：high-threshold / critical-threshold / honeypot-login")
+    void matchedFieldExplainsWhyEachIpWasChosen() {
+        ReflectionTestUtils.setField(responder, "dryRun", false);
+        LocalDateTime at = LocalDateTime.now().minusMinutes(1);
+        String criticalIp = "45.33.32.157";
+        String honeypotIp = "45.33.32.158";
+        List<SecurityAlert> list = new ArrayList<>();
+        list.addAll(alertsOf(ATTACKER, AlertSeverity.HIGH, 30, at));
+        list.addAll(alertsOf(criticalIp, AlertSeverity.CRITICAL, 3, at));
+        list.add(honeypotLoginAlert(honeypotIp, at));
+        alerts.list = list;
+
+        responder.runOnce();
+
+        assertThat(actions.calls).hasSize(3);
+        Map<String, String> matchedByIp = new java.util.HashMap<>();
+        for (Map<String, Object> w : responder.recentWindows(50)) {
+            matchedByIp.put(String.valueOf(w.get("ip")), String.valueOf(w.get("matched")));
+        }
+        assertThat(matchedByIp.get(ATTACKER)).isEqualTo("high-threshold");
+        assertThat(matchedByIp.get(criticalIp)).isEqualTo("critical-threshold");
+        assertThat(matchedByIp.get(honeypotIp)).isEqualTo("honeypot-login");
+    }
+
     // ---------------------------------------------------------------- 测试替身
 
     private static SecurityAlert alert(String ip, AlertSeverity severity, LocalDateTime at) {
@@ -300,6 +425,24 @@ class AutoResponderTest {
         a.setSrcIp(ip);
         a.setOccurredAt(at.format(FMT));
         a.setCount(1);
+        return a;
+    }
+
+    /** 蜜罐类告警：type 常被 guess 成 OTHER，来源只体现在文本里（Wazuh 的 description 以"蜜罐"开头） */
+    private static SecurityAlert honeypotAlert(String ip, String title, AlertSeverity severity) {
+        SecurityAlert a = new SecurityAlert("hp-" + System.nanoTime(), title, severity,
+                AlertType.OTHER, AlertSource.WAZUH);
+        a.setSrcIp(ip);
+        a.setRuleName(title);
+        a.setService("ssh");
+        a.setOccurredAt(LocalDateTime.now().withNano(0).format(FMT));
+        a.setCount(1);
+        return a;
+    }
+
+    private static SecurityAlert honeypotLoginAlert(String ip, LocalDateTime at) {
+        SecurityAlert a = honeypotAlert(ip, "蜜罐: 攻击者\"登录成功\" (SSH)", AlertSeverity.LOW);
+        a.setOccurredAt(at.format(FMT));
         return a;
     }
 
@@ -325,6 +468,11 @@ class AutoResponderTest {
     private String lastReason() {
         List<Map<String, Object>> w = responder.recentWindows(1);
         return w.isEmpty() ? null : String.valueOf(w.get(0).get("reason"));
+    }
+
+    private String lastMatched() {
+        List<Map<String, Object>> w = responder.recentWindows(1);
+        return w.isEmpty() ? null : String.valueOf(w.get(0).get("matched"));
     }
 
     /** 真实护栏：只留 127/8 与 10/8 两条，其余保护段由内置默认值兜住 */

@@ -1,6 +1,7 @@
 package org.example.response;
 
 import org.example.core.model.AlertSeverity;
+import org.example.core.model.AlertType;
 import org.example.core.model.SecurityAlert;
 import org.example.publicapi.PublicAlertSource;
 import org.example.security.ResponseGuard;
@@ -41,8 +42,10 @@ import java.util.Set;
  * <h3>执行顺序（与 ResponseActionService 的分工）</h3>
  * <ol>
  *   <li>读最近 5 分钟告警（{@link PublicAlertSource#readAlerts()}，REAL 才返回数据）</li>
- *   <li>按 {@code srcIp} 聚合 HIGH+CRITICAL 的命中次数；按阈值挑出候选 IP</li>
- *   <li>冷却检查：已封禁中 / 10 分钟内刚处置过 → 跳过</li>
+ *   <li>按 {@code srcIp} 聚合 HIGH+CRITICAL 的命中次数；按阈值挑出候选 IP。
+ *       另有<b>一条独立规则</b>：窗口内出现蜜罐「登录成功」——攻击者已经穿过认证层——
+ *       无视条数直接进入处置（{@code block-on-honeypot-login}，默认开）</li>
+ *   <li>冷却检查：已封禁中 / 冷却期内刚处置过 → 跳过（阈值路径 10 分钟，蜜罐登录 30 分钟）</li>
  *   <li><b>先自己过一遍 {@link ResponseGuard}</b>：空 IP / 非法 IP / 白名单 / 健康检查源命中
  *       → 只 log.info + 记一条决策，<b>不写 BLOCKED 审计</b>。
  *       这一步是刻意重复的 —— {@code blockIp} 内部也会过护栏，但那会在
@@ -88,6 +91,17 @@ public class AutoResponder {
     static final String ACTOR = "auto-responder";
     static final String SOURCE = "自动处置";
 
+    /** 决策里 {@code matched} 的取值：这个 IP 是被哪条规则挑出来的 */
+    static final String MATCH_HIGH = "high-threshold";
+    static final String MATCH_CRITICAL = "critical-threshold";
+    static final String MATCH_HONEYPOT_LOGIN = "honeypot-login";
+
+    /** 蜜罐登录成功的固定处置原因：攻击者已经穿过认证层，不能等 30 条 */
+    static final String REASON_HONEYPOT_LOGIN = "自动封禁：蜜罐登录成功（攻击者已进入）";
+
+    /** 蜜罐来源的识别关键词（Wazuh 侧 Cowrie/Dionaea 的规则描述都用中文"蜜罐"开头） */
+    private static final String[] HONEYPOT_MARKERS = {"蜜罐", "cowrie", "dionaea", "honeypot"};
+
     private final PublicAlertSource alertSource;
     private final ResponseActionService actionService;
     private final ResponseGuard guard;
@@ -108,6 +122,24 @@ public class AutoResponder {
     /** 同一 IP 5 分钟内 CRITICAL 命中次数达到该值 → 封（独立于 min-high 的更严格路径） */
     @Value("${app.response.auto.min-critical:3}")
     private int minCritical = 3;
+
+    /**
+     * 蜜罐「登录成功」是否无视条数直接进入处置（默认 true）。
+     *
+     * <p>为什么单独一条规则：蜜罐是诱饵，正常业务不会在上面"登录成功"。
+     * 出现即"攻击者已经穿过认证层"，是真实入侵，等 30 条高危才封等于等攻击者打完收工。
+     */
+    @Value("${app.response.auto.block-on-honeypot-login:true}")
+    private boolean blockOnHoneypotLogin = true;
+
+    /**
+     * 蜜罐登录成功触发的处置冷却（分钟，默认 30）。
+     *
+     * <p>比阈值路径的 10 分钟更长：窗口内反复命中同一台蜜罐的直接封禁是同一事件，
+     * 但也不能因为"上一轮刚演练过"就把下一次真实登录吞掉 —— 冷却只压重复处置的抖动。
+     */
+    @Value("${app.response.auto.honeypot-login-cooldown-minutes:30}")
+    private int honeypotLoginCooldownMinutes = 30;
 
     /** 自动封禁时长（分钟） */
     @Value("${app.response.auto.duration-minutes:60}")
@@ -200,6 +232,11 @@ public class AutoResponder {
             } else if (a.getSeverity() == AlertSeverity.HIGH) {
                 c.high += weight;
             }
+            // 蜜罐「登录成功」独立于条数：一条就够。这里不看 severity，
+            // 因为 Cowrie 规则 100102 的 level 常常不高，按等级过滤会把它漏掉。
+            if (blockOnHoneypotLogin && isHoneypotLogin(a)) {
+                c.honeypotLogin = true;
+            }
         }
 
         int highThreshold = Math.max(1, minHigh);
@@ -207,18 +244,21 @@ public class AutoResponder {
         List<Map.Entry<String, Counts>> candidates = new ArrayList<>();
         for (Map.Entry<String, Counts> e : counts.entrySet()) {
             Counts c = e.getValue();
-            if (c.high >= highThreshold || c.critical >= criticalThreshold) {
+            if (c.honeypotLogin || c.high >= highThreshold || c.critical >= criticalThreshold) {
                 candidates.add(e);
             }
         }
         if (candidates.isEmpty()) {
-            log.debug("[AutoResponder] 本轮 {} 个来源 IP 均未达阈值（min-high={} / min-critical={}）",
-                    counts.size(), highThreshold, criticalThreshold);
+            log.debug("[AutoResponder] 本轮 {} 个来源 IP 均未达阈值（min-high={} / min-critical={} / block-on-honeypot-login={}）",
+                    counts.size(), highThreshold, criticalThreshold, blockOnHoneypotLogin);
             return;
         }
-        // 严重的先处置；同分按 IP 排序只为让日志与单测结果稳定
+        // 严重的先处置；同分按 IP 排序只为让日志与单测结果稳定。
+        // 蜜罐登录排最前：它是"攻击者已进入"，比"刷了很多条"更该先封。
         candidates.sort(Comparator
-                .comparingInt((Map.Entry<String, Counts> e) -> e.getValue().critical).reversed()
+                .comparingInt((Map.Entry<String, Counts> e) -> e.getValue().honeypotLogin ? 0 : 1)
+                .thenComparing(Comparator
+                        .comparingInt((Map.Entry<String, Counts> e) -> e.getValue().critical).reversed())
                 .thenComparing(Comparator.comparingInt(
                         (Map.Entry<String, Counts> e) -> e.getValue().high).reversed())
                 .thenComparing(Map.Entry::getKey));
@@ -230,35 +270,44 @@ public class AutoResponder {
         for (Map.Entry<String, Counts> e : candidates) {
             String ip = e.getKey();
             Counts c = e.getValue();
-            String reason = String.format("自动封禁：5 分钟内 %d 条高危（含 %d 条严重）", c.high, c.critical);
+            // matched 是给页面/日志看的"为什么封"：蜜罐登录最具体，优先于条数阈值
+            String matched = matchedOf(c, criticalThreshold);
+            boolean honeypotLogin = MATCH_HONEYPOT_LOGIN.equals(matched);
+            String reason = honeypotLogin
+                    ? REASON_HONEYPOT_LOGIN
+                    : String.format("自动封禁：5 分钟内 %d 条高危（含 %d 条严重）", c.high, c.critical);
+            int cooldownMinutes = honeypotLogin
+                    ? Math.max(COOLDOWN_MINUTES, Math.max(1, honeypotLoginCooldownMinutes))
+                    : COOLDOWN_MINUTES;
 
             if (active.contains(ip)) {
                 String why = "已封禁中（生效记录里已有该 IP），不重复封";
                 log.info("[AutoResponder] 跳过 {}：{}；{}", ip, why, reason);
-                record(now, ip, "skip-cooldown", why);
+                record(now, ip, "skip-cooldown", why, matched);
                 continue;
             }
-            if (inCooldown(ip, now)) {
-                String why = "冷却期内（" + COOLDOWN_MINUTES + " 分钟内已处置过），不重复封";
+            if (inCooldown(ip, now, cooldownMinutes)) {
+                String why = "冷却期内（" + cooldownMinutes + " 分钟内已处置过），不重复封";
                 log.info("[AutoResponder] 跳过 {}：{}；{}", ip, why, reason);
-                record(now, ip, "skip-cooldown", why);
+                record(now, ip, "skip-cooldown", why, matched);
                 continue;
             }
 
             // 提前过护栏：blockIp 内部还会再判一次，但那时被拒会写一条 BLOCKED 审计，
             // 正是这次要止住的"空目标垃圾"。这里拒掉的只留日志 + 决策，不留审计。
+            // 蜜罐登录同样要过这一关：诱饵上的"成功"不构成封自己人的理由。
             String guardReason = guard == null ? null : guard.validateBlock(ip, duration);
             if (guardReason != null) {
                 log.info("[AutoResponder] 跳过 {}：{}（命中阈值但护栏拒绝）", ip, guardReason);
-                record(now, ip, "skip-guard", guardReason);
+                record(now, ip, "skip-guard", guardReason, matched);
                 continue;
             }
 
             markCooldown(ip, now);
             if (dryRun) {
                 log.info("[AutoResponder] DRY-RUN 本应封禁 {} {}", ip, reason);
-                auditDryRun(ip, reason, c);
-                record(now, ip, "dry-run", reason);
+                auditDryRun(ip, reason, c, matched);
+                record(now, ip, "dry-run", reason, matched);
                 continue;
             }
 
@@ -267,12 +316,12 @@ public class AutoResponder {
                         actionService.blockIp(ip, duration, reason, ACTOR, SOURCE);
                 log.info("[AutoResponder] 已下发封禁 {}（{} 分钟，mode={}）：{}", ip, duration,
                         result == null ? "UNKNOWN" : result.getMode(), reason);
-                record(now, ip, "block", reason);
+                record(now, ip, "block", reason, matched);
             } catch (Exception ex) {
                 // 一个 IP 下发异常不能带走本轮其它候选，也不能炸掉调度
                 log.warn("[AutoResponder] 封禁下发异常，已跳过该 IP：ip={} err={}", ip, ex.getMessage());
                 record(now, ip, "error",
-                        ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage());
+                        ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage(), matched);
             }
         }
     }
@@ -284,6 +333,8 @@ public class AutoResponder {
         m.put("dryRun", dryRun);
         m.put("minHigh", minHigh);
         m.put("minCritical", minCritical);
+        m.put("blockOnHoneypotLogin", blockOnHoneypotLogin);
+        m.put("honeypotLoginCooldownMinutes", honeypotLoginCooldownMinutes);
         m.put("durationMinutes", durationMinutes);
         m.put("windows", recentWindows(STATE_WINDOWS));
         return m;
@@ -303,12 +354,20 @@ public class AutoResponder {
 
     // ---------------------------------------------------------------- 内部
 
-    private void record(LocalDateTime now, String ip, String action, String reason) {
+    /**
+     * 写一条决策。
+     *
+     * <p>{@code matched} 是"为什么封"：{@code high-threshold} / {@code critical-threshold} /
+     * {@code honeypot-login}。审计与页面都靠它区分"刷够条数"和"蜜罐被登录"，
+     * 否则两类完全不同的处置在日志里长得一模一样。
+     */
+    private void record(LocalDateTime now, String ip, String action, String reason, String matched) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("time", now.format(FMT));
         m.put("ip", ip);
         m.put("action", action);
         m.put("reason", reason);
+        m.put("matched", matched);
         synchronized (decisionsLock) {
             decisions.addLast(m);
             while (decisions.size() > MAX_WINDOWS) {
@@ -317,7 +376,7 @@ public class AutoResponder {
         }
     }
 
-    private void auditDryRun(String ip, String reason, Counts c) {
+    private void auditDryRun(String ip, String reason, Counts c, String matched) {
         if (auditService == null) {
             return;
         }
@@ -326,11 +385,84 @@ public class AutoResponder {
                     "HIGH", "DRY_RUN", true,
                     "自动处置演练：未下发；5 分钟内 HIGH+CRITICAL=" + c.high
                             + "，CRITICAL=" + c.critical
-                            + "；阈值 min-high=" + minHigh + " / min-critical=" + minCritical));
+                            + "；阈值 min-high=" + minHigh + " / min-critical=" + minCritical
+                            + "；matched=" + matched
+                            + (c.honeypotLogin ? "（蜜罐登录成功，无视条数）" : "")));
         } catch (Exception e) {
             // 审计失败不能改变"这一轮是否该封"的判定
             log.warn("[AutoResponder] 写演练审计失败（不影响决策）：{}", e.getMessage());
         }
+    }
+
+    /**
+     * 这个 IP 是被哪条规则挑出来的。
+     *
+     * <p>优先报蜜罐登录：它是更具体的"攻击者已进入"，条数在它面前只是噪音。
+     */
+    static String matchedOf(Counts c, int criticalThreshold) {
+        if (c == null) {
+            return MATCH_HIGH;
+        }
+        if (c.honeypotLogin) {
+            return MATCH_HONEYPOT_LOGIN;
+        }
+        if (c.critical >= Math.max(1, criticalThreshold)) {
+            return MATCH_CRITICAL;
+        }
+        return MATCH_HIGH;
+    }
+
+    /**
+     * 是否"蜜罐登录成功"。
+     *
+     * <p>为什么不用 severity 判：Cowrie 的 100102 规则 level 往往不高，按等级过滤就会漏。
+     * 为什么兜底要排除「登录失败」：蜜罐的连接/指纹/爆破事件同样常被猜成 {@link AlertType#OTHER}，
+     * 只认来源不认动作的话，日常扫描噪音也会直接封人 —— 那不是警报，是误伤。
+     */
+    static boolean isHoneypotLogin(SecurityAlert a) {
+        if (a == null) {
+            return false;
+        }
+        String text = joinText(a.getTitle(), a.getRuleName(), a.getDescription(), a.getService());
+        if (text.contains("登录成功")) {
+            return true;
+        }
+        if (a.getType() != AlertType.OTHER) {
+            return false;
+        }
+        if (!isHoneypotSourced(text)) {
+            return false;
+        }
+        // 兜底认英文写法（cowrie.login.success 一类）：只认"成功"这一个动作，
+        // 不用泛化的"登录"——那会把"尝试登录/连接尝试"也算成入侵。
+        // 并且显式排除失败事件：蜜罐上每天成百上千次"登录失败"，那是噪音不是入侵。
+        boolean success = text.contains("login success")
+                || text.contains("login.success") || text.contains("logged in");
+        boolean failure = text.contains("登录失败") || text.contains("login failed")
+                || text.contains("login.failed") || text.contains("failed login");
+        return success && !failure;
+    }
+
+    private static boolean isHoneypotSourced(String lowerText) {
+        if (lowerText == null) {
+            return false;
+        }
+        for (String marker : HONEYPOT_MARKERS) {
+            if (lowerText.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static String joinText(String... parts) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : parts) {
+            if (p != null && !p.isBlank()) {
+                sb.append(p).append(' ');
+            }
+        }
+        return sb.toString().toLowerCase(java.util.Locale.ROOT);
     }
 
     /** 生效中的封禁记录里的 IP（blockActive 的对应物是 BlockRecordStore#listActive） */
@@ -375,10 +507,10 @@ public class AutoResponder {
         return d;
     }
 
-    private boolean inCooldown(String ip, LocalDateTime now) {
+    private boolean inCooldown(String ip, LocalDateTime now, int minutes) {
         synchronized (cooldownLock) {
             LocalDateTime at = cooldown.get(ip);
-            return at != null && at.plusMinutes(COOLDOWN_MINUTES).isAfter(now);
+            return at != null && at.plusMinutes(Math.max(1, minutes)).isAfter(now);
         }
     }
 
@@ -389,8 +521,10 @@ public class AutoResponder {
     }
 
     private void pruneCooldown(LocalDateTime now) {
+        // 按两条路径里更长的冷却保留：蜜罐登录的 30 分钟不能因为阈值路径只记 10 分钟被提前清掉
+        int keep = Math.max(COOLDOWN_MINUTES, Math.max(1, honeypotLoginCooldownMinutes));
         synchronized (cooldownLock) {
-            cooldown.entrySet().removeIf(e -> !e.getValue().plusMinutes(COOLDOWN_MINUTES).isAfter(now));
+            cooldown.entrySet().removeIf(e -> !e.getValue().plusMinutes(keep).isAfter(now));
         }
     }
 
@@ -428,5 +562,7 @@ public class AutoResponder {
     static final class Counts {
         int high;
         int critical;
+        /** 窗口内出现过蜜罐「登录成功」——这是独立于条数的直接处置信号 */
+        boolean honeypotLogin;
     }
 }
